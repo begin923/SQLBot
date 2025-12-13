@@ -37,10 +37,11 @@ from apps.datasource.crud.datasource import get_table_schema
 from apps.datasource.crud.permission import get_row_permission_filters, is_normal_user
 from apps.datasource.embedding.ds_embedding import get_ds_embedding
 from apps.datasource.models.datasource import CoreDatasource
-from apps.db.db import exec_sql, get_version, check_connection
+from apps.db.db import exec_sql, get_version, check_connection, get_fields
 from apps.system.crud.assistant import AssistantOutDs, AssistantOutDsFactory, get_assistant_ds
 from apps.system.schemas.system_schema import AssistantOutDsSchema
 from apps.terminology.curd.terminology import get_terminology_template
+import xml.etree.ElementTree as ET
 from common.core.config import settings
 from common.core.db import engine
 from common.core.deps import CurrentAssistant, CurrentUser
@@ -424,6 +425,7 @@ class LLMService:
                                                                                          msg in datasource_msg])
 
             token_usage = {}
+            print('datasource_msg:', datasource_msg)
             res = process_stream(self.llm.stream(datasource_msg), token_usage)
             for chunk in res:
                 if chunk.get('content'):
@@ -530,6 +532,8 @@ class LLMService:
         self.sql_message.append(HumanMessage(
             self.chat_question.sql_user_question(current_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                                  change_title=self.change_title)))
+
+        print('sql_message:', self.sql_message)
 
         self.current_logs[OperationEnum.GENERATE_SQL] = start_log(session=_session,
                                                                   ai_modal_id=self.chat_question.ai_modal_id,
@@ -695,6 +699,7 @@ class LLMService:
         full_thinking_text = ''
         full_chart_text = ''
         token_usage = {}
+        print(f"chart_message: {self.chart_message}")
         res = process_stream(self.llm.stream(self.chart_message), token_usage)
         for chunk in res:
             if chunk.get('content'):
@@ -938,10 +943,16 @@ class LLMService:
                 else:
                     self.chat_question.data_training = get_training_template(_session, self.chat_question.question,
                                                                              oid, ds_id)
+
+                print(f"self.chat_question:{self.chat_question}")
                 if SQLBotLicenseUtil.valid():
                     self.chat_question.custom_prompt = find_custom_prompts(_session,
                                                                            CustomPromptTypeEnum.GENERATE_SQL,
                                                                            oid, ds_id)
+                
+                # 处理下钻分析的特殊逻辑
+                self.handle_drilldown_analysis(_session)
+                
                 self.init_messages()
 
             # return id
@@ -1310,6 +1321,141 @@ class LLMService:
                     raise SingleMessageError(msg)
             except Exception as e:
                 raise SingleMessageError(f"ds is invalid [{str(e)}]")
+
+    def extract_drilldown_tables(self, terminologies_xml: str) -> list:
+        """
+        从术语配置中提取下钻表名
+        """
+        if not terminologies_xml:
+            return []
+            
+        # 解析XML
+        root = ET.fromstring(f"<root>{terminologies_xml}</root>")
+        tables = []
+        
+        # 查找所有术语描述中的表名
+        for terminology in root.findall('.//terminology'):
+            description_elem = terminology.find('description')
+            if description_elem is not None and description_elem.text:
+                text = description_elem.text
+                print("description_elem:", text)
+
+                # 直接尝试解析JSON
+                import json
+                
+                try:
+                    # 解析JSON并提取target_table字段
+                    config = json.loads(text)
+                    target_table = config.get("target_table")
+                    if target_table:
+                        tables.append(target_table)
+                except json.JSONDecodeError:
+                    # 如果解析失败，说明不是JSON格式的配置，跳过
+                    pass
+                
+        # 去重并返回
+        return list(set(tables))
+
+
+    def get_actual_table_schemas(self, table_names: list) -> dict:
+        """
+        获取实际表结构信息
+        """
+        if not table_names or not self.ds:
+            return {}
+            
+        try:
+            actual_schemas = {}
+            for table_name in table_names:
+                # 处理带数据库前缀的表名
+                if '.' in table_name:
+                    parts = table_name.split('.')
+                    if len(parts) == 2:
+                        schema_name, table_part = parts
+                    else:
+                        table_part = table_name
+                else:
+                    table_part = table_name
+                    
+                SQLBotLogUtil.info(f"Getting fields for table: {table_part}")
+                # 获取字段信息
+                fields = get_fields(self.ds, table_part)
+                if fields:
+                    # 构建表结构描述
+                    schema_info = f"# Table: {table_name}\n[\n"
+                    field_descriptions = []
+                    for field in fields:
+                        # 使用 ColumnSchema 的属性名
+                        field_desc = f"({field.fieldName}:{field.fieldType}"
+                        if field.fieldComment and field.fieldComment.strip():
+                            field_desc += f", {field.fieldComment.strip()}"
+                        field_desc += ")"
+                        field_descriptions.append(field_desc)
+                    schema_info += ",\n".join(field_descriptions)
+                    schema_info += "\n]\n"
+                    actual_schemas[table_name] = schema_info
+                    SQLBotLogUtil.info(f"Retrieved schema for table {table_name}")
+                else:
+                    SQLBotLogUtil.warning(f"No fields found for table: {table_part}")
+                    
+            return actual_schemas
+        except Exception as e:
+            SQLBotLogUtil.error(f"Failed to get actual table schemas: {str(e)}")
+            traceback.print_exc()
+            return {}
+
+    def build_drilldown_prompt(self, actual_schemas: dict) -> str:
+        """
+        构建专门用于下钻分析的提示词片段
+        """
+        if not actual_schemas:
+            SQLBotLogUtil.info("No actual schemas provided for drilldown prompt")
+            return ""
+            
+        prompt = "\n<drilldown-table-structures>\n"
+        prompt += "<note>以下是在术语描述中提到的下钻表的实际表结构信息，请严格基于这些真实的表结构生成SQL，不要引用不存在的字段：</note>\n"
+        for table_name, schema_info in actual_schemas.items():
+            prompt += f"<table-structure name='{table_name}'>\n{schema_info}\n</table-structure>\n"
+        prompt += "</drilldown-table-structures>\n"
+        
+        SQLBotLogUtil.info(f"Built drilldown prompt with {len(actual_schemas)} tables")
+        return prompt
+
+    def handle_drilldown_analysis(self, session):
+        """
+        处理下钻分析的特殊逻辑
+        """
+        # 检查问题是否涉及下钻分析
+        question_lower = self.chat_question.question.lower()
+        if "下钻" in self.chat_question.question or "钻取" in self.chat_question.question or "drill" in question_lower:
+            SQLBotLogUtil.info("Detected drilldown analysis request, applying special handling")
+            SQLBotLogUtil.info(f"Terminologies content: {self.chat_question.terminologies}")
+            
+            # 从术语配置中提取表名
+            drilldown_tables = self.extract_drilldown_tables(self.chat_question.terminologies)
+            SQLBotLogUtil.info(f"Extracted drilldown tables: {drilldown_tables}")
+            
+            if drilldown_tables:
+                # 获取这些表的实际结构
+                actual_schemas = self.get_actual_table_schemas(drilldown_tables)
+                SQLBotLogUtil.info(f"Retrieved actual schemas for {len(actual_schemas)} tables")
+                
+                # 构建下钻分析专用提示词
+                drilldown_prompt = self.build_drilldown_prompt(actual_schemas)
+                SQLBotLogUtil.info(f"Drilldown prompt: {drilldown_prompt}")
+                
+                # 将下钻提示词添加到自定义提示中
+                if self.chat_question.custom_prompt:
+                    self.chat_question.custom_prompt += drilldown_prompt
+                else:
+                    self.chat_question.custom_prompt = drilldown_prompt
+                    
+                SQLBotLogUtil.info("Added drilldown table structures to prompt")
+                
+                # 特别处理：移除 db_schema 中可能引起误导的表结构信息
+                # 这样可以确保 LLM 只依赖我们提供的实际表结构
+                self.chat_question.db_schema = ""
+
 
 
 def execute_sql_with_db(db: SQLDatabase, sql: str) -> str:
