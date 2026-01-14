@@ -27,6 +27,11 @@ template:
     <rule>百分比显示为：CONCAT(ROUND(x*100,2),'%')</rule>
     <rule>避免与Doris关键字冲突（如`rank`/`partition`/`values`）</rule>
     <rule>分区查询需使用PARTITION语句明确指定</rule>
+    <rule>在涉及多表关联的情况，部分表需要分组聚合时，请使用子查询的方式实现</rule>
+    <rule>严格根据提供的表结构生成SQL，不要添加不存在的字段，特别是常见的系统字段如create_time、update_time、created_at、updated_at等</rule>
+    <rule>在生成任何字段之前，必须确认该字段确实存在于提供的表结构中</rule>
+    <rule>如果存在<drilldown-table-structures>块，请务必严格基于其中提供的表结构信息生成SQL，不要引用其中未提及的字段</rule>
+    <rule>当处理下钻分析请求时，应完全忽略<m-schema>中的表结构信息，只依据<drilldown-table-structures>中提供的实际表结构生成SQL</rule>
 
   basic_example: |
     <basic-examples>
@@ -84,6 +89,8 @@ template:
   example_answer_2_with_limit: |
     {"success":true,"sql":"SELECT `country` AS `country_name`, `gdp` AS `gdp_usd` FROM `Sample_Database`.`sample_country_gdp` WHERE `year` = '2024' ORDER BY `gdp` DESC LIMIT 1000","tables":["sample_country_gdp"],"chart-type":"pie"}
   example_answer_3: |
-    {"success":true,"sql":"SELECT `country` AS `country_name`, `gdp` AS `gdp_usd` FROM `Sample_Database`.`sample_country_gdp` WHERE `year` = '2025' AND `country` = '中国'","tables":["sample_country_gdp"],"chart-type":"table"}
+    {"success":true,"sql":"SELECT forage_agg.org_name, forage_agg.group_code, forage_agg.dt_date, forage_agg.yz_id, forage_agg.total_forage_weight_kg, (weight.last_day_weight_new - weight.pre_weight) / 1000.0 AS daily_gain_kg, CASE WHEN (weight.last_day_weight_new - weight.pre_weight) != 0 THEN forage_agg.total_forage_weight_kg / ((weight.last_day_weight_new - weight.pre_weight) / 1000.0) ELSE NULL END AS feed_to_gain_ratio FROM ( SELECT org_name, group_code, dt_date, yz_id, org_id, SUM(forage_weight_kg) AS total_forage_weight_kg FROM `yz_datawarehouse_dwd`.`dwd_fpf_porker_forage_record_detail` GROUP BY org_name, group_code, dt_date, yz_id, org_id ) AS forage_agg JOIN `yz_datawarehouse_dwd`.`dwd_fpf_feed_sorter_weight_record` AS weight ON forage_agg.org_id = weight.org_id AND forage_agg.dt_date = weight.dt_date AND forage_agg.group_code = weight.group_code AND forage_agg.yz_id = weight.yz_id ORDER BY forage_agg.org_name, forage_agg.group_code, forage_agg.dt_date, forage_agg.yz_id LIMIT 1000
+                           ","tables":["dwd_fpf_porker_forage_record_detail","dwd_fpf_feed_sorter_weight_record"],"chart-type":"table"}
   example_answer_3_with_limit: |
-    {"success":true,"sql":"SELECT `country` AS `country_name`, `gdp` AS `gdp_usd` FROM `Sample_Database`.`sample_country_gdp` WHERE `year` = '2025' AND `country` = '中国' LIMIT 1000","tables":["sample_country_gdp"],"chart-type":"table"}
+    {"success":true,"sql":"SELECT forage_agg.org_name, forage_agg.group_code, forage_agg.dt_date, forage_agg.yz_id, forage_agg.total_forage_weight_kg, (weight.last_day_weight_new - weight.pre_weight) / 1000.0 AS daily_gain_kg, CASE WHEN (weight.last_day_weight_new - weight.pre_weight) != 0 THEN forage_agg.total_forage_weight_kg / ((weight.last_day_weight_new - weight.pre_weight) / 1000.0) ELSE NULL END AS feed_to_gain_ratio FROM ( SELECT org_name, group_code, dt_date, yz_id, org_id, SUM(forage_weight_kg) AS total_forage_weight_kg FROM `yz_datawarehouse_dwd`.`dwd_fpf_porker_forage_record_detail` GROUP BY org_name, group_code, dt_date, yz_id, org_id ) AS forage_agg JOIN `yz_datawarehouse_dwd`.`dwd_fpf_feed_sorter_weight_record` AS weight ON forage_agg.org_id = weight.org_id AND forage_agg.dt_date = weight.dt_date AND forage_agg.group_code = weight.group_code AND forage_agg.yz_id = weight.yz_id ORDER BY forage_agg.org_name, forage_agg.group_code, forage_agg.dt_date, forage_agg.yz_id LIMIT 1000
+                           ","tables":["dwd_fpf_porker_forage_record_detail","dwd_fpf_feed_sorter_weight_record"],"chart-type":"table"}
