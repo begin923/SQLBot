@@ -12,6 +12,7 @@ from sqlmodel import SQLModel, Field
 from apps.db.constant import DB
 from apps.template.filter.generator import get_permissions_template
 from apps.template.generate_analysis.generator import get_analysis_template
+from apps.template.generate_static_sql.generator import get_static_sql_template
 from apps.template.generate_chart.generator import get_chart_template
 from apps.template.generate_dynamic.generator import get_dynamic_template
 from apps.template.generate_guess_question.generator import get_guess_question_template
@@ -261,6 +262,23 @@ class AiModelQuestion(BaseModel):
 
     def dynamic_user_question(self):
         return get_dynamic_template()['user'].format(sql=self.sql, sub_query=self.sub_query)
+
+    def static_sql_sys_question(self, enable_query_limit: bool = True):
+        """生成静态SQL执行的系统提示词"""
+        template = get_static_sql_template()
+        return template['system'].format(
+            engine=self.engine,
+            lang=self.lang
+        )
+
+    def static_sql_user_question(self, provided_sql: str, change_title: bool):
+        """生成静态SQL执行的用户提示词"""
+        template = get_static_sql_template()
+        return template['user'].format(
+            provided_sql=provided_sql,
+            question=self.question,
+            change_title=change_title
+        )
 
 
 class ChatQuestion(AiModelQuestion):
