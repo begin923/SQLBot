@@ -12,7 +12,7 @@ from sqlmodel import SQLModel, Field
 from apps.db.constant import DB
 from apps.template.filter.generator import get_permissions_template
 from apps.template.generate_analysis.generator import get_analysis_template
-from apps.template.generate_static_sql.generator import get_static_sql_template
+from apps.template.generate_sql.generator import get_static_sql_template
 from apps.template.generate_chart.generator import get_chart_template
 from apps.template.generate_dynamic.generator import get_dynamic_template
 from apps.template.generate_guess_question.generator import get_guess_question_template
