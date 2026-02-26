@@ -138,13 +138,14 @@ def get_table_sql(ds: CoreDatasource, conf: DatasourceConf, db_version: str = ''
     elif equals_ignore_case(ds.type, "doris", "starrocks"):
         return """
                 SELECT 
-                    TABLE_NAME, 
+                    CONCAT(TABLE_SCHEMA, '.', TABLE_NAME) AS TABLE_NAME, 
                     TABLE_COMMENT
                 FROM 
                     information_schema.TABLES
                 WHERE 
-                    TABLE_SCHEMA = %s
-                """, conf.database
+                    TABLE_SCHEMA IN ('yz_datawarehouse_ads', 'yz_datawarehouse_dws', 'yz_datawarehouse_dwd', 'yz_datawarehouse_dim', 'yz_datawarehouse_ods')
+                ORDER BY TABLE_SCHEMA, TABLE_NAME
+                """, None
     elif equals_ignore_case(ds.type, "kingbase"):
         return """
               SELECT c.relname                                       AS TABLE_NAME,
@@ -283,7 +284,12 @@ def get_field_sql(ds: CoreDatasource, conf: DatasourceConf, table_name: str = No
         sql2 = " AND c.TABLE_NAME = :param2" if table_name is not None and table_name != "" else ""
         return sql1 + sql2, conf.dbSchema, table_name
     elif equals_ignore_case(ds.type, "doris", "starrocks"):
-        sql1 = """
+        # 对于带schema的表名，需要同时过滤schema和表名
+        if table_name is not None and table_name != "":
+            if '.' in table_name:
+                # schema.table格式，分别提取schema和表名
+                schema_part, table_part = table_name.split('.', 1)
+                sql = f"""
                 SELECT 
                     COLUMN_NAME,
                     DATA_TYPE,
@@ -291,10 +297,35 @@ def get_field_sql(ds: CoreDatasource, conf: DatasourceConf, table_name: str = No
                 FROM 
                     INFORMATION_SCHEMA.COLUMNS
                 WHERE 
-                    TABLE_SCHEMA = %s
+                    TABLE_SCHEMA = '{schema_part}'
+                    AND TABLE_NAME = '{table_part}'
                 """
-        sql2 = " AND TABLE_NAME = %s" if table_name is not None and table_name != "" else ""
-        return sql1 + sql2, conf.database, table_name
+            else:
+                # 只有表名，使用默认的schema列表
+                sql = f"""
+                SELECT 
+                    COLUMN_NAME,
+                    DATA_TYPE,
+                    COLUMN_COMMENT
+                FROM 
+                    INFORMATION_SCHEMA.COLUMNS
+                WHERE 
+                    TABLE_SCHEMA IN ('yz_datawarehouse_ads', 'yz_datawarehouse_dws', 'yz_datawarehouse_dwd', 'yz_datawarehouse_dim', 'yz_datawarehouse_ods')
+                    AND TABLE_NAME = '{table_name}'
+                """
+        else:
+            # 没有指定表名，返回所有schema中的表字段
+            sql = """
+                SELECT 
+                    COLUMN_NAME,
+                    DATA_TYPE,
+                    COLUMN_COMMENT
+                FROM 
+                    INFORMATION_SCHEMA.COLUMNS
+                WHERE 
+                    TABLE_SCHEMA IN ('yz_datawarehouse_ads', 'yz_datawarehouse_dws', 'yz_datawarehouse_dwd', 'yz_datawarehouse_dim', 'yz_datawarehouse_ods')
+                """
+        return sql, None, table_name
     elif equals_ignore_case(ds.type, "kingbase"):
         sql1 = """
                        SELECT a.attname                                       AS COLUMN_NAME,

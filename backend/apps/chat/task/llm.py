@@ -1056,25 +1056,7 @@ class LLMService:
             # 处理静态SQL执行模式
             if self.is_static_sql and self.provided_sql:
                 # 直接执行模式：直接使用用户提供的SQL，跳过大模型调用
-                full_sql_text = self.provided_sql  # 设置full_sql_text为用户提供的SQL
-                SQLBotLogUtil.info(f"Direct execute mode: using provided SQL directly: {self.provided_sql}")
-                sql = self.provided_sql
-                save_sql(session=_session, sql=sql, record_id=self.record.id)
-                self.chat_question.sql = sql
-                
-                # 从用户提供的SQL中提取表名
-                tables = self.extract_tables_from_sql(sql)
-                SQLBotLogUtil.info(f"Extracted tables from provided SQL: {tables}")
-                
-                # 直接执行模式下不需要图表类型
-                chart_type = 'table'
-                
-                # 直接返回结果，模拟大模型响应
-                if in_chat:
-                    yield 'data:' + orjson.dumps(
-                        {'content': f'{{"success":true,"sql":"{sql}","tables":{json.dumps(tables)},"chart-type":"{chart_type}"}}', 
-                         'type': 'sql-result'}).decode() + '\n\n'
-                    yield 'data:' + orjson.dumps({'type': 'info', 'msg': 'sql generated'}).decode() + '\n\n'
+                chart_type, full_sql_text, sql = yield from self.exe_static_sql(_session, in_chat)
             else:
                 # 常规模式：调用大模型生成SQL
                 sql_res = self.generate_sql(_session)
@@ -1313,6 +1295,111 @@ class LLMService:
         finally:
             self.finish(_session)
             session_maker.remove()
+
+    def exe_static_sql(self, _session, in_chat):
+        # 直接执行模式：直接使用用户提供的SQL，跳过大模型调用
+        full_sql_text = self.provided_sql  # 设置full_sql_text为用户提供的SQL
+        SQLBotLogUtil.info(f"Direct execute mode: using provided SQL directly: {self.provided_sql}")
+        sql = self.provided_sql
+        save_sql(session=_session, sql=sql, record_id=self.record.id)
+        self.chat_question.sql = sql
+        # 从用户提供的SQL中提取表名
+        tables = self.extract_tables_from_sql(sql)
+        SQLBotLogUtil.info(f"Extracted tables from provided SQL: {tables}")
+        # 如果有数据源且提取到表名，则调用标准接口添加表到指定数据源中
+        if self.ds and tables:
+            try:
+                from apps.datasource.crud.datasource import chooseTables
+                from apps.datasource.models.datasource import CoreTable
+                from common.core.deps import get_session
+                from common.core.deps import Trans
+
+                # 获取数据库会话 - 使用正确的会话获取方式
+                from sqlalchemy.orm import sessionmaker
+                from common.core.db import engine
+                from sqlmodel import Session
+
+                local_session_maker = sessionmaker(bind=engine, class_=Session)
+                session = local_session_maker()
+
+                # 创建事务对象
+                trans = Trans()
+
+                # 获取数据源的所有表信息，用于获取真实表注释
+                from apps.datasource.crud.datasource import getTablesByDs
+
+                # 构造临时的CoreDatasource对象用于查询
+                temp_ds = CoreDatasource(
+                    id=self.ds.id,
+                    type=self.ds.type,
+                    configuration=self.ds.configuration
+                )
+
+                # 获取所有表信息
+                all_tables_info = getTablesByDs(session, temp_ds)
+
+                table_comment_map = {}
+                for table_info in all_tables_info:
+                    # 修复属性名称：使用tableComment而不是table_comment
+                    table_comment_map[table_info.tableName.lower()] = table_info.tableComment
+
+                # 构造表对象列表，格式为 [schema.table, schema.table]
+                table_objects = []
+                for table_name in tables:
+                    # 从映射中获取真实表注释，如果没有则使用空字符串
+                    table_comment = table_comment_map.get(table_name.lower(), "")
+
+                    table_obj = CoreTable(
+                        ds_id=self.ds.id,
+                        checked=True,
+                        table_name=table_name,  # 保持完整的schema.table格式
+                        table_comment=table_comment,  # 使用真实的表注释
+                        custom_comment=table_comment  # 自定义注释也使用真实注释
+                    )
+                    table_objects.append(table_obj)
+
+                # 直接调用后端的chooseTables函数
+                chooseTables(session, trans, self.ds.id, table_objects)
+
+                # 强制提交事务确保数据持久化
+                session.commit()
+
+                # 验证表是否真正添加成功
+                added_tables = session.query(CoreTable).filter(
+                    and_(CoreTable.ds_id == self.ds.id,
+                         CoreTable.table_name.in_(tables))
+                ).all()
+
+                # 关闭会话
+                session.close()
+            except Exception as e:
+                # 即使添加失败也继续执行，不影响主要功能
+                pass
+        # 直接执行模式下不需要图表类型
+        chart_type = 'table'
+        # 直接执行模式下不需要图表类型
+        chart_type = 'table'
+        # 直接返回结果，模拟大模型响应
+        response_data = {
+            "success": True,
+            "sql": sql,
+            "tables": tables,
+            "chart-type": chart_type
+        }
+        # 添加数据源信息
+        if self.ds:
+            response_data["datasource"] = {
+                "id": self.ds.id,
+                "name": self.ds.name,
+                "type": self.ds.type,
+                "description": self.ds.description
+            }
+        if in_chat:
+            yield 'data:' + orjson.dumps(
+                {'content': json.dumps(response_data, ensure_ascii=False),
+                 'type': 'sql-result'}).decode() + '\n\n'
+            yield 'data:' + orjson.dumps({'type': 'info', 'msg': 'sql generated'}).decode() + '\n\n'
+        return chart_type, full_sql_text, sql
 
     def run_recommend_questions_task_async(self):
         self.future = executor.submit(self.run_recommend_questions_task_cache)

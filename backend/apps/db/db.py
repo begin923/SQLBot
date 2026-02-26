@@ -369,7 +369,11 @@ def get_tables(ds: CoreDatasource):
             with pymysql.connect(user=conf.username, passwd=conf.password, host=conf.host,
                                  port=conf.port, db=conf.database, connect_timeout=conf.timeout,
                                  read_timeout=conf.timeout, **extra_config_dict) as conn, conn.cursor() as cursor:
-                cursor.execute(sql, (sql_param,))
+                # 对于Doris/StarRocks，当sql_param为None时，直接执行SQL而不传递参数
+                if sql_param is None:
+                    cursor.execute(sql)
+                else:
+                    cursor.execute(sql, (sql_param,))
                 res = cursor.fetchall()
                 res_list = [TableSchema(*item) for item in res]
                 return res_list
@@ -420,7 +424,8 @@ def get_fields(ds: CoreDatasource, table_name: str = None):
             with pymysql.connect(user=conf.username, passwd=conf.password, host=conf.host,
                                  port=conf.port, db=conf.database, connect_timeout=conf.timeout,
                                  read_timeout=conf.timeout, **extra_config_dict) as conn, conn.cursor() as cursor:
-                cursor.execute(sql, (p1, p2))
+                # 对于Doris/StarRocks，直接执行SQL（已经在get_field_sql中构建了完整SQL）
+                cursor.execute(sql)
                 res = cursor.fetchall()
                 res_list = [ColumnSchema(*item) for item in res]
                 return res_list

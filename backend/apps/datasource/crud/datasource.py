@@ -90,7 +90,35 @@ def create_ds(session: SessionDep, trans: Trans, user: CurrentUser, create_ds: C
 def chooseTables(session: SessionDep, trans: Trans, id: int, tables: List[CoreTable]):
     ds = session.query(CoreDatasource).filter(CoreDatasource.id == id).first()
     check_status(session, trans, ds, True)
-    sync_table(session, ds, tables)
+    
+    # 处理schema.table格式的表名
+    enhanced_tables = []
+    for table in tables:
+        # 解析可能的schema.table格式
+        table_name = table.table_name
+        schema_name = None
+        
+        if '.' in table_name and table_name.count('.') == 1:
+            # 分割schema和表名
+            parts = table_name.split('.', 1)
+            schema_name = parts[0]
+            base_table_name = parts[1]
+            
+            # 构造完整的表对象，保持原有的其他属性
+            enhanced_table = CoreTable(
+                ds_id=table.ds_id,
+                checked=table.checked,
+                table_name=table_name,  # 保持完整的schema.table格式
+                table_comment=table.table_comment,
+                custom_comment=table.custom_comment
+            )
+            enhanced_tables.append(enhanced_table)
+
+        else:
+            # 普通表名，直接添加
+            enhanced_tables.append(table)
+    
+    sync_table(session, ds, enhanced_tables)
     updateNum(session, ds)
 
 
@@ -166,7 +194,11 @@ def execSql(session: SessionDep, id: int, sql: str):
 def sync_table(session: SessionDep, ds: CoreDatasource, tables: List[CoreTable]):
     id_list = []
     for item in tables:
-        statement = select(CoreTable).where(and_(CoreTable.ds_id == ds.id, CoreTable.table_name == item.table_name))
+        # 对于schema.table格式的表名，需要特殊处理查询逻辑
+        table_name = item.table_name
+        
+        # 构建查询条件 - 支持精确匹配完整的表名（包括schema部分）
+        statement = select(CoreTable).where(and_(CoreTable.ds_id == ds.id, CoreTable.table_name == table_name))
         record = session.exec(statement).first()
         # update exist table, only update table_comment
         if record is not None:
@@ -177,8 +209,8 @@ def sync_table(session: SessionDep, ds: CoreDatasource, tables: List[CoreTable])
             session.add(record)
             session.commit()
         else:
-            # save new table
-            table = CoreTable(ds_id=ds.id, checked=True, table_name=item.table_name, table_comment=item.table_comment,
+            # save new table - 保持完整的表名（包括schema部分）
+            table = CoreTable(ds_id=ds.id, checked=True, table_name=table_name, table_comment=item.table_comment,
                               custom_comment=item.table_comment)
             session.add(table)
             session.flush()
@@ -192,15 +224,38 @@ def sync_table(session: SessionDep, ds: CoreDatasource, tables: List[CoreTable])
         sync_fields(session, ds, item, fields)
 
     if len(id_list) > 0:
-        session.query(CoreTable).filter(and_(CoreTable.ds_id == ds.id, CoreTable.id.not_in(id_list))).delete(
-            synchronize_session=False)
-        session.query(CoreField).filter(and_(CoreField.ds_id == ds.id, CoreField.table_id.not_in(id_list))).delete(
-            synchronize_session=False)
+        # 删除未选中的表
+        session.query(CoreTable).filter(
+            and_(
+                CoreTable.ds_id == ds.id, 
+                CoreTable.id.not_in(id_list)
+            )
+        ).delete(synchronize_session=False)
+        # 删除对应的字段
+        manual_table_ids = session.query(CoreTable.id).filter(
+            and_(
+                CoreTable.ds_id == ds.id,
+                CoreTable.id.not_in(id_list)
+            )
+        ).all()
+        manual_table_id_list = [t[0] for t in manual_table_ids if t[0] not in id_list]
+        if manual_table_id_list:
+            session.query(CoreField).filter(
+                and_(
+                    CoreField.ds_id == ds.id, 
+                    CoreField.table_id.in_(manual_table_id_list)
+                )
+            ).delete(synchronize_session=False)
         session.commit()
-    else:  # delete all tables and fields in this ds
-        session.query(CoreTable).filter(CoreTable.ds_id == ds.id).delete(synchronize_session=False)
-        session.query(CoreField).filter(CoreField.ds_id == ds.id).delete(synchronize_session=False)
-        session.commit()
+    else:  # 如果没有选中任何表，删除所有表
+        manual_tables = session.query(CoreTable).filter(
+            CoreTable.ds_id == ds.id
+        ).all()
+        manual_table_ids = [t.id for t in manual_tables]
+        if manual_table_ids:
+            session.query(CoreTable).filter(CoreTable.id.in_(manual_table_ids)).delete(synchronize_session=False)
+            session.query(CoreField).filter(CoreField.table_id.in_(manual_table_ids)).delete(synchronize_session=False)
+            session.commit()
 
     # do table embedding
     run_save_table_embeddings(id_list)
@@ -294,9 +349,28 @@ def preview(session: SessionDep, current_user: CurrentUser, id: int, data: Table
         return {"fields": [], "data": [], "sql": ''}
 
     conf = DatasourceConf(**json.loads(aes_decrypt(ds.configuration))) if ds.type != "excel" else get_engine_config()
+
+    # 解析表名，支持带schema的表名 (schema.table格式)
+    table_name = data.table.table_name
+    schema_name = None
+
+    if '.' in table_name:
+        # 表名包含schema，分割获取schema和表名
+        parts = table_name.split('.', 1)
+        schema_name = parts[0]
+        table_name = parts[1]
+    else:
+        # 使用数据源配置的默认schema
+        schema_name = conf.dbSchema if conf.dbSchema else ''
+
     sql: str = ""
     if ds.type == "mysql" or ds.type == "doris" or ds.type == "starrocks":
-        sql = f"""SELECT `{"`, `".join(fields)}` FROM `{data.table.table_name}` 
+        # MySQL等数据库，schema在表名前
+        if schema_name:
+            full_table_name = f"`{schema_name}`.`{table_name}`"
+        else:
+            full_table_name = f"`{table_name}`"
+        sql = f"""SELECT `{"`, `".join(fields)}` FROM {full_table_name}
             {where} 
             LIMIT 100"""
     elif ds.type == "sqlServer":
@@ -344,8 +418,38 @@ def fieldEnum(session: SessionDep, id: int):
     if ds is None:
         return []
 
+    # 解析表名，支持带schema的表名 (schema.table格式)
+    table_name = table.table_name
+    schema_name = None
+    
+    if '.' in table_name:
+        # 表名包含schema，分割获取schema和表名
+        parts = table_name.split('.', 1)
+        schema_name = parts[0]
+        table_name = parts[1]
+
+    else:
+        # 使用数据源配置的默认schema
+        conf = DatasourceConf(**json.loads(aes_decrypt(ds.configuration))) if ds.type != "excel" else get_engine_config()
+        schema_name = conf.dbSchema if conf.dbSchema else ''
+    
+    # 构建完整的表名引用
     db = DB.get_db(ds.type)
-    sql = f"""SELECT DISTINCT {db.prefix}{field.field_name}{db.suffix} FROM {db.prefix}{table.table_name}{db.suffix}"""
+    if schema_name:
+        # 根据不同数据库类型构建带schema的表名
+        if ds.type == "mysql" or ds.type == "doris" or ds.type == "starrocks":
+            full_table_name = f"`{schema_name}`.`{table_name}`"
+        elif ds.type == "sqlServer":
+            full_table_name = f"[{schema_name}].[{table_name}]"
+        elif ds.type in ["pg", "excel", "redshift", "kingbase", "oracle", "ck", "dm"]:
+            full_table_name = f"\"{schema_name}\".\"{table_name}\""
+        else:
+            full_table_name = f"{db.prefix}{schema_name}{db.suffix}.{db.prefix}{table_name}{db.suffix}"
+    else:
+        full_table_name = f"{db.prefix}{table_name}{db.suffix}"
+    
+    sql = f"""SELECT DISTINCT {db.prefix}{field.field_name}{db.suffix} FROM {full_table_name}"""
+
     res = exec_sql(ds, sql, True)
     return [item.get(res.get('fields')[0]) for item in res.get('data')]
 
