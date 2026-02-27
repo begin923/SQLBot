@@ -163,8 +163,21 @@ class LLMService:
         
         if match:
             self.is_static_sql = True
-            self.provided_sql = match.group(1).strip()
-            SQLBotLogUtil.info(f"Detected static SQL mode with #sql# tag, SQL: {self.provided_sql}")
+            extracted_content = match.group(1).strip()
+            
+            # 尝试解析JSON格式的SQL
+            sql_data = json.loads(extracted_content, strict=False)
+            base_sql = sql_data.get('sql', '')
+            in_parm = sql_data.get('in_parm', {})
+
+            # 如果有参数，则进行参数替换
+            if in_parm and isinstance(in_parm, dict):
+                self.provided_sql = self._substitute_parameters(base_sql, in_parm)
+                SQLBotLogUtil.info(f"Detected static SQL mode with JSON format and parameters, original SQL: {base_sql}, parameters: {in_parm}, final SQL: {self.provided_sql}")
+            else:
+                # 没有参数，直接使用sql字段的内容
+                self.provided_sql = base_sql
+                SQLBotLogUtil.info(f"Detected static SQL mode with JSON format, SQL: {self.provided_sql}")
         else:
             # 检查是否有明显的SQL语句开头
             sql_indicators = ['select ', 'with ', 'insert ', 'update ', 'delete ']
@@ -1154,6 +1167,8 @@ class LLMService:
                     yield json_result
                 return
 
+
+            SQLBotLogUtil.info('execute sql: ' + real_execute_sql)
             result = self.execute_sql(sql=real_execute_sql)
 
             _data = DataFormat.convert_large_numbers_in_object_array(result.get('data'))
@@ -1335,17 +1350,34 @@ class LLMService:
                     configuration=self.ds.configuration
                 )
 
-                # 获取所有表信息
+                # 获取数据源中已有的所有表
+                existing_tables = session.query(CoreTable).filter(
+                    CoreTable.ds_id == self.ds.id
+                ).all()
+                
+                # 创建已有表名集合，用于快速查找
+                existing_table_names = {table.table_name for table in existing_tables}
+                
+                # 获取所有表信息（用于获取表注释）
                 all_tables_info = getTablesByDs(session, temp_ds)
-
                 table_comment_map = {}
                 for table_info in all_tables_info:
                     # 修复属性名称：使用tableComment而不是table_comment
                     table_comment_map[table_info.tableName.lower()] = table_info.tableComment
 
-                # 构造表对象列表，格式为 [schema.table, schema.table]
+                # 构造表对象列表：包含已有的所有表 + 新提取的表
                 table_objects = []
+                
+                # 先添加已有的表
+                for existing_table in existing_tables:
+                    table_objects.append(existing_table)
+                
+                # 再添加新提取的表（避免重复）
                 for table_name in tables:
+                    # 如果表已经存在，跳过
+                    if table_name in existing_table_names:
+                        continue
+                        
                     # 从映射中获取真实表注释，如果没有则使用空字符串
                     table_comment = table_comment_map.get(table_name.lower(), "")
 
@@ -1700,6 +1732,33 @@ class LLMService:
                         break
         
         return list(fields)
+
+    def _substitute_parameters(self, sql_template: str, parameters: dict) -> str:
+        """替换SQL模板中的参数
+        
+        Args:
+            sql_template: SQL模板字符串，包含${paramName}格式的占位符
+            parameters: 参数字典 {"paramName": "paramValue"}
+            
+        Returns:
+            替换参数后的SQL字符串
+        """
+        if not sql_template or not parameters:
+            return sql_template
+        
+        result_sql = sql_template
+        
+        # 直接替换每个参数，保持原始SQL意图
+        # SQL模板中已经根据字段类型添加了适当的引号和NULL处理
+        for param_name, param_value in parameters.items():
+            placeholder = f"${{{param_name}}}"
+            # 直接转换为字符串进行替换，不进行任何额外处理
+            replacement = str(param_value)
+            
+            result_sql = result_sql.replace(placeholder, replacement)
+            SQLBotLogUtil.debug(f"Replaced parameter {placeholder} with {replacement}")
+        
+        return result_sql
 
     def extract_tables_from_sql(self, sql_query: str) -> List[str]:
         """
