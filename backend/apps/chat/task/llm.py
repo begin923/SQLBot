@@ -61,6 +61,8 @@ dynamic_subsql_prefix = 'select * from sqlbot_dynamic_temp_table_'
 
 session_maker = scoped_session(sessionmaker(bind=engine, class_=Session))
 
+from apps.extend.metric_drilldown import MetricDrilldownAnalyzer
+
 
 class LLMService:
     ds: CoreDatasource
@@ -153,18 +155,17 @@ class LLMService:
             self.chat_question.error_msg = ''
 
         # 检查是否为静态SQL执行模式（在这里调用，确保chat_question已初始化）
-        self.check_static_sql_mode()
+        # self.check_static_sql_mode()
 
     def check_static_sql_mode(self):
         """检查是否为静态SQL执行模式"""
-        # 检查问题中是否包含#sql#标记
-        sql_pattern = r'#sql#(.*?)#sql#'  # 匹配#sql#之间的内容
+        sql_pattern = r'#FIXED_SQL_START#([\s\S]*?)#FIXED_SQL_END#'  # 匹配#FIXED_SQL_START# - #FIXED_SQL_END#之间的内容
         match = re.search(sql_pattern, self.chat_question.question, re.DOTALL | re.IGNORECASE)
-        
+
         if match:
             self.is_static_sql = True
             extracted_content = match.group(1).strip()
-            
+
             # 尝试解析JSON格式的SQL
             sql_data = json.loads(extracted_content, strict=False)
             base_sql = sql_data.get('sql', '')
@@ -182,11 +183,11 @@ class LLMService:
             # 检查是否有明显的SQL语句开头
             sql_indicators = ['select ', 'with ', 'insert ', 'update ', 'delete ']
             question_lower = self.chat_question.question.lower()
-            
+
             # 检查是否包含执行相关的关键词和SQL语句
             execute_keywords = ['执行', '运行', '查询']
             has_execute_keyword = any(keyword in question_lower for keyword in execute_keywords)
-            
+
             # 查找SQL语句的位置
             sql_start_pos = -1
             found_indicator = None
@@ -195,7 +196,7 @@ class LLMService:
                 if pos != -1 and (sql_start_pos == -1 or pos < sql_start_pos):
                     sql_start_pos = pos
                     found_indicator = indicator
-            
+
             if has_execute_keyword and sql_start_pos != -1:
                 self.is_static_sql = True
                 # 提取SQL语句（从SQL关键词开始到结尾，去除前后空格）
@@ -596,6 +597,17 @@ class LLMService:
                     change_title=self.change_title
                 )
             ))
+        # elif self.chat_question.question.__contains__('下钻') or self.chat_question.question.__contains__('多维分析'):
+        #     # 下钻场景：此时 custom_prompt 已经包含血缘信息（由 handle_drilldown_analysis 添加）
+        #     # 使用常规提示词生成 SQL
+        #     self.sql_message.append(SystemMessage(
+        #         self.chat_question.sql_sys_question(self.ds.type, settings.GENERATE_SQL_QUERY_LIMIT_ENABLED)
+        #     ))
+        #     # append current question
+        #     self.sql_message.append(HumanMessage(
+        #         self.chat_question.sql_user_question(current_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        #                                              change_title=self.change_title)
+        #     ))
         else:
             # 常规模式
             self.sql_message.append(SystemMessage(
@@ -1026,8 +1038,6 @@ class LLMService:
                                                                            CustomPromptTypeEnum.GENERATE_SQL,
                                                                            oid, ds_id)
 
-                # 处理下钻分析的特殊逻辑
-                self.handle_drilldown_analysis(_session)
 
                 self.init_messages()
 
@@ -1066,13 +1076,32 @@ class LLMService:
             if not connected:
                 raise SQLBotDBConnectionError('Connect DB failed')
 
-            # 处理静态SQL执行模式
-            if self.is_static_sql and self.provided_sql:
-                # 直接执行模式：直接使用用户提供的SQL，跳过大模型调用
+            # ========== 下钻查询分析和处理 ==========
+            # 检测是否包含下钻关键词
+            question_lower = self.chat_question.question.lower()
+            has_drilldown_keyword = "下钻" in self.chat_question.question or \
+                                   "钻取" in self.chat_question.question or \
+                                   "drill" in question_lower
+            
+            if has_drilldown_keyword:
+                metric_drill = MetricDrilldownAnalyzer()
+                extract_result = metric_drill.decide_table_scope(self.llm, self.chat_question.question)
+
+                table_name = extract_result.get("table_name")
+                # 添加表到数据源并返回表结构
+                table_fields = self.add_table_to_ds(table_name)
+                metric_blood = metric_drill.extract_blood_from_md(table_name)
+
+            # 执行静态sql
+            static_sql_keyword = "#FIXED_SQL_START#" in self.chat_question.question
+            if static_sql_keyword:
+                self.check_static_sql_mode()
                 chart_type, full_sql_text, sql = yield from self.exe_static_sql(_session, in_chat)
             else:
-                # 常规模式：调用大模型生成SQL
+                # 常规 LLM 生成
+                SQLBotLogUtil.info("Regular query, using LLM to generate SQL")
                 sql_res = self.generate_sql(_session)
+                SQLBotLogUtil.info(f"sql_res:{sql_res}")
                 full_sql_text = ''
                 for chunk in sql_res:
                     full_sql_text += chunk.get('content')
@@ -1087,7 +1116,7 @@ class LLMService:
                 SQLBotLogUtil.info(f"full_sql_text: {full_sql_text}")
 
                 chart_type = self.get_chart_type_from_sql_answer(full_sql_text)
-                
+
                 # 常规处理流程
                 sql, tables = self.check_sql(res=full_sql_text)
 
@@ -1432,6 +1461,115 @@ class LLMService:
                  'type': 'sql-result'}).decode() + '\n\n'
             yield 'data:' + orjson.dumps({'type': 'info', 'msg': 'sql generated'}).decode() + '\n\n'
         return chart_type, full_sql_text, sql
+    
+    def add_table_to_ds(self, table_name: str):
+        """
+        添加表到当前数据源
+        
+        参考 exe_static_sql 函数的逻辑，使用项目原有接口:
+        1. 如果表不存在则添加到数据源
+        2. 如果已存在则跳过
+        
+        Args:
+            table_name: 表名 (如："ads_sales_summary" 或 "schema.table_name")
+            
+        Returns:
+            bool: 是否成功添加或已存在
+        """
+        from apps.datasource.crud.datasource import chooseTables, getTablesByDs
+        from apps.datasource.models.datasource import CoreTable
+        from sqlalchemy.orm import sessionmaker
+        from common.core.db import engine
+        from sqlmodel import Session
+        from common.core.deps import Trans
+        from common.utils.utils import SQLBotLogUtil
+        
+        if not self.ds or not table_name:
+            SQLBotLogUtil.warning("No datasource or table name provided")
+            return False
+        
+        try:
+            # 获取数据库会话
+            local_session_maker = sessionmaker(bind=engine, class_=Session)
+            session = local_session_maker()
+            
+            # 创建事务对象
+            trans = Trans()
+            
+            # 构造临时的 CoreDatasource 对象用于查询
+            from apps.datasource.models.datasource import CoreDatasource
+            temp_ds = CoreDatasource(
+                id=self.ds.id,
+                type=self.ds.type,
+                configuration=self.ds.configuration
+            )
+            
+            # 获取数据源中已有的所有表
+            existing_tables = session.query(CoreTable).filter(
+                CoreTable.ds_id == self.ds.id
+            ).all()
+            
+            # 创建已有表名集合，用于快速查找
+            existing_table_names = {table.table_name for table in existing_tables}
+            
+            # 获取所有表信息 (用于获取表注释)
+            all_tables_info = getTablesByDs(session, temp_ds)
+            table_comment_map = {}
+            for table_info in all_tables_info:
+                table_comment_map[table_info.tableName.lower()] = table_info.tableComment
+            
+            # 构造表对象列表
+            table_objects = []
+            
+            # 先添加已有的表
+            for existing_table in existing_tables:
+                table_objects.append(existing_table)
+            
+            # 再添加新表 (如果不存在)
+            if table_name not in existing_table_names:
+                # 从映射中获取真实表注释
+                table_comment = table_comment_map.get(table_name.lower(), "")
+                
+                table_obj = CoreTable(
+                    ds_id=self.ds.id,
+                    checked=True,
+                    table_name=table_name,
+                    table_comment=table_comment,
+                    custom_comment=table_comment
+                )
+                table_objects.append(table_obj)
+                SQLBotLogUtil.info(f"Adding new table: {table_name}")
+            else:
+                SQLBotLogUtil.info(f"Table {table_name} already exists")
+            
+            # 调用后端的 chooseTables 函数
+            chooseTables(session, trans, self.ds.id, table_objects)
+            
+            # 强制提交事务确保数据持久化
+            session.commit()
+            
+            # 验证表是否真正添加成功
+            added_table = session.query(CoreTable).filter(
+                and_(CoreTable.ds_id == self.ds.id,
+                     CoreTable.table_name == table_name)
+            ).first()
+            
+            if added_table:
+                SQLBotLogUtil.info(f"Successfully added/verified table: {table_name}")
+                session.close()
+                return True
+            else:
+                SQLBotLogUtil.warning(f"Failed to verify table: {table_name}")
+                session.close()
+                return False
+                
+        except Exception as e:
+            SQLBotLogUtil.error(f"Error adding table: {str(e)}")
+            try:
+                session.close()
+            except:
+                pass
+            return False
 
     def run_recommend_questions_task_async(self):
         self.future = executor.submit(self.run_recommend_questions_task_cache)
@@ -1648,7 +1786,7 @@ class LLMService:
         if self.is_static_sql:
             SQLBotLogUtil.info("Skipping drilldown analysis in direct execute mode")
             return
-            
+
         # 检查问题是否涉及下钻分析
         question_lower = self.chat_question.question.lower()
         if "下钻" in self.chat_question.question or "钻取" in self.chat_question.question or "drill" in question_lower:
@@ -1683,23 +1821,23 @@ class LLMService:
     def extract_fields_from_sql(self, sql_query: str) -> List[str]:
         """
         从SQL查询语句中提取涉及的字段名
-        
+
         Args:
             sql_query: SQL查询语句
-            
+
         Returns:
             List[str]: 字段名列表
         """
         if not sql_query:
             return []
-        
+
         # 使用sqlparse库解析SQL
         parsed = sqlparse.parse(sql_query)
         if not parsed:
             return []
-        
+
         fields = set()
-        
+
         # 遍历解析后的SQL语句
         for statement in parsed:
             # 查找SELECT子句
@@ -1708,7 +1846,7 @@ class LLMService:
                 if token.ttype is sqlparse.tokens.DML and token.value.upper() == 'SELECT':
                     select_seen = True
                     continue
-                
+
                 if select_seen:
                     # 处理字段名
                     if isinstance(token, sqlparse.sql.Identifier):
@@ -1726,38 +1864,38 @@ class LLMService:
                         # 简单的字段名
                         if token.value != '*':
                             fields.add(token.value)
-                    
+
                     # 遇到FROM关键字时停止字段提取
                     if token.ttype is sqlparse.tokens.Keyword and token.value.upper() == 'FROM':
                         break
-        
+
         return list(fields)
 
     def _substitute_parameters(self, sql_template: str, parameters: dict) -> str:
         """替换SQL模板中的参数
-        
+
         Args:
             sql_template: SQL模板字符串，包含${paramName}格式的占位符
             parameters: 参数字典 {"paramName": "paramValue"}
-            
+
         Returns:
             替换参数后的SQL字符串
         """
         if not sql_template or not parameters:
             return sql_template
-        
+
         result_sql = sql_template
-        
+
         # 直接替换每个参数，保持原始SQL意图
         # SQL模板中已经根据字段类型添加了适当的引号和NULL处理
         for param_name, param_value in parameters.items():
             placeholder = f"${{{param_name}}}"
             # 直接转换为字符串进行替换，不进行任何额外处理
             replacement = str(param_value)
-            
+
             result_sql = result_sql.replace(placeholder, replacement)
             SQLBotLogUtil.debug(f"Replaced parameter {placeholder} with {replacement}")
-        
+
         return result_sql
 
     def extract_tables_from_sql(self, sql_query: str) -> List[str]:
@@ -2110,7 +2248,7 @@ class LLMService:
             'inner', 'left', 'right', 'full', 'update', 'insert', 'into', 'delete',
             'set', 'values', 'case', 'when', 'then', 'else', 'end', 'u', 'd', 'a', 'b'
         }
-    
+
 
 
 
