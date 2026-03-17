@@ -510,7 +510,7 @@ def get_table_schema(session: SessionDep, current_user: CurrentUser, ds: CoreDat
     all_tables = []  # temp save all tables
     for obj in table_objs:
         schema_table = ''
-        schema_table += f"# Table: {db_name}.{obj.table.table_name}" if ds.type != "mysql" and ds.type != "es" else f"# Table: {obj.table.table_name}"
+        schema_table += f"# Table: {db_name}.{obj.table.table_name}" if ds.type not in ["mysql", "es","doris"] else f"# Table: {obj.table.table_name}"
         table_comment = ''
         if obj.table.custom_comment:
             table_comment = obj.table.custom_comment.strip()
