@@ -284,7 +284,7 @@ class StaticSQLHandler:
         
         return response_data
 
-    def add_table_to_ds(self, ds, table_name: str):
+    def add_table_to_ds(self, ds, table_name: str) -> bool:
         """
         添加表到当前数据源
 
@@ -398,7 +398,5 @@ class StaticSQLHandler:
         # 如果有数据源且提取到表名，则调用标准接口添加表到指定数据源中
         for table in tables:
             self.add_table_to_ds(ds,table)
-        # 直接执行模式下不需要图表类型
-        chart_type = 'table'
         # 直接返回结果，不发送响应，由调用方处理
-        return chart_type, full_sql_text, sql
+        return full_sql_text, sql

@@ -16,6 +16,18 @@ def get_static_sql_template():
     return template['template']['static_sql']
 
 
+def get_drill_down_template():
+    """获取静态SQL执行的模板"""
+    template = get_base_template()
+    return template['template']['drill_down']
+
+
+def get_view_details_template():
+    """获取静态SQL执行的模板"""
+    template = get_base_template()
+    return template['template']['view_details']
+
+
 def get_sql_example_template(db_type: Union[str, DB]):
     """获取特定数据库类型的SQL示例模板"""
     template = get_base_sql_template(db_type)
