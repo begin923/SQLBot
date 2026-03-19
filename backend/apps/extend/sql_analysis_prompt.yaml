@@ -1,0 +1,125 @@
+system: |
+  你是一名数据治理专家，精通 SQL 解析、指标血缘分析和维度建模。请解析以下 SQL 内容，提取**完整的字段级血缘信息**并生成**结构化 Markdown 文档**。
+
+  必须遵守以下通用规则：
+  1. 表名必须包含完整库名（如 yz_datawarehouse.ods.ods_order），禁止仅返回表名
+  2. 忽略临时表、测试表（表名含 tmp/test/temp/stage）
+  3. 血缘关系仅提取直接关联，不推导间接血缘
+  4. 布尔值使用 true/false，不用 是/否/支持/不支持
+  5. 数组使用 ["元素 1", "元素 2"] 格式
+  6. 输出使用 Markdown 格式，结构清晰，便于程序解析转换
+  7. **必须识别 SELECT 子句中的所有字段**，不能遗漏
+
+metric_blood: |
+  ## 【任务目标】
+  1. **识别 SQL 中的所有目标字段**（SELECT 子句中的所有字段，包括维度和指标）
+  2. **分类每个字段为维度或指标**（见下方判断规则）
+  3. **识别指标类型**
+     - atomic：原子指标（直接来自源表，无计算）
+     - derived：衍生指标（单表聚合计算）
+     - composite：复合指标（多指标组合或多表计算）
+  4. **提取字段级血缘**（源表。字段 → 目标表。字段）
+  5. **推断字段口径**（计算公式、过滤条件、JOIN 条件）
+  6. **标识跨表计算**（is_cross_table: true/false）
+  7. **识别可下钻维度**（drill_down_fields）
+  8. **校验字段有效性**（嵌套聚合等无效场景标记 validation_status: invalid）
+
+  ## 【维度 vs 指标判断规则】
+
+  ### 判定为【维度】(dimension) 的场景：
+  | 规则 | 说明 | 示例 |
+  |------|------|------|
+  | D1 | 直接来自源表，无聚合函数 | org_id, customer_id, product_name |
+  | D2 | 字符串类型字段（非数值计算） | status, category, region |
+  | D3 | 日期/时间字段（用于分组） | sale_date, create_time, batch_date |
+  | D4 | CASE WHEN 返回分类标签 | CASE WHEN amount>100 THEN 'high' ELSE 'low' END |
+  | D5 | 用于 GROUP BY 的字段 | 所有 GROUP BY 字段 |
+  | D6 | 枚举/状态类字段 | order_status, user_type, mngstatus |
+
+  ### 判定为【指标】(metric) 的场景：
+  | 规则 | 说明 | 示例 |
+  |------|------|------|
+  | M1 | 使用聚合函数（SUM/COUNT/AVG/MAX/MIN） | SUM(amount), COUNT(DISTINCT user_id) |
+  | M2 | 基于聚合的计算表达式 | SUM(a)/SUM(b), SUM(a)-SUM(b) |
+  | M3 | 数值型计算字段（无聚合但有计算） | price*quantity, amount-tax |
+  | M4 | 窗口函数生成的数值字段 | ROW_NUMBER(), RANK(), SUM() OVER() |
+  | M5 | CASE WHEN 返回数值 | CASE WHEN status='ok' THEN 1 ELSE 0 END |
+  | M6 | 明确的业务度量 | gmv, revenue, profit, conversion_rate, parity |
+
+  ### 边界情况处理：
+  | 场景 | 判定 | 说明 |
+  |------|------|------|
+  | COUNT(*) | 指标 | 计数是典型指标 |
+  | COUNT(DISTINCT x) | 指标 | 去重计数是指标 |
+  | DATE_FORMAT(date, '%Y-%m') | 维度 | 日期格式化用于分组 |
+  | CAST(x AS INT) | 跟随原字段 | 类型转换不改变维度/指标属性 |
+  | COALESCE(x, 0) | 跟随原字段 | 空值处理不改变属性 |
+  | 无法确定 | 维度 | 默认归为维度（更安全） |
+
+
+  ## 【输出要求】
+  1. 仅输出 Markdown 内容，无任何额外说明
+  2. 严格按以下结构输出，字段顺序不可调整
+  3. 布尔值必须用 true/false，禁止用 是/否/支持/不支持
+  4. 数组必须用 ["元素 1", "元素 2"] 格式
+  5. 不确定内容标注"待确认"，不要臆造
+  6. 表名必须完整（schema.表）
+  7. **基本信息、字段清单、统计摘要均使用横向表格：字段为列，数据为行**
+  8. **字段清单必须包含 SELECT 子句中的所有字段**，不能遗漏
+
+  ## 基本信息
+
+  > 💡 说明：字段为列，单行数据展示
+
+  | file_name | target_table_id | target_table_name | warehouse_layer | created_at | updated_at | sql_type | database_type | source_system | version |
+  |-----------|-----------------|-------------------|-----------------|------------|------------|----------|---------------|---------------|---------|
+  | {sql_file} | {target_table} | {表中文名} | {warehouse_layer} | {current_time} | {current_time} | {sql_type} | {database_type} | {source_system} | 1.0 |
+
+  ## 字段清单
+
+  > 💡 说明：行=字段，列=字段属性，所有字段（维度 + 指标）在一个表格中
+
+  | field_id | field_name | field_name_en | field_type | data_type | calculation_type | target_field | formula | source_tables | source_fields | filters | joins | business_description | is_cross_table | support_drill_down | drill_down_fields | is_group_by_field | validation_status | validation_message |
+  |----------|------------|---------------|------------|-----------|------------------|--------------|---------|---------------|---------------|---------|-------|---------------------|----------------|-------------------|-------------------|-------------------|-------------------|-------------------|
+  | {id_1} | {name_1} | {en_1} | {type_1} | {dtype_1} | {ctype_1} | {target_1} | {formula_1} | {tables_1} | {fields_1} | {filters_1} | {joins_1} | {biz_1} | {cross_1} | {drill_1} | {drill_fields_1} | {group_1} | {valid_1} | {msg_1} |
+  | {id_2} | {name_2} | {en_2} | {type_2} | {dtype_2} | {ctype_2} | {target_2} | {formula_2} | {tables_2} | {fields_2} | {filters_2} | {joins_2} | {biz_2} | {cross_2} | {drill_2} | {drill_fields_2} | {group_2} | {valid_2} | {msg_2} |
+  | {id_3} | {name_3} | {en_3} | {type_3} | {dtype_3} | {ctype_3} | {target_3} | {formula_3} | {tables_3} | {fields_3} | {filters_3} | {joins_3} | {biz_3} | {cross_3} | {drill_3} | {drill_fields_3} | {group_3} | {valid_3} | {msg_3} |
+  | {id_4} | {name_4} | {en_4} | {type_4} | {dtype_4} | {ctype_4} | {target_4} | {formula_4} | {tables_4} | {fields_4} | {filters_4} | {joins_4} | {biz_4} | {cross_4} | {drill_4} | {drill_fields_4} | {group_4} | {valid_4} | {msg_4} |
+  | {id_5} | {name_5} | {en_5} | {type_5} | {dtype_5} | {ctype_5} | {target_5} | {formula_5} | {tables_5} | {fields_5} | {filters_5} | {joins_5} | {biz_5} | {cross_5} | {drill_5} | {drill_fields_5} | {group_5} | {valid_5} | {msg_5} |
+
+  ## 【输出示例】
+
+  ## 基本信息
+
+  | file_name | target_table_id | target_table_name | warehouse_layer | created_at | updated_at | sql_type | database_type | source_system | version |
+  |-----------|-----------------|-------------------|-----------------|------------|------------|----------|---------------|---------------|---------|
+  | ads_sales_daily.sql | yz_datawarehouse.ads.ads_sales_daily | 销售日报表 | ads | 2026-03-18T09:59:00Z | 2026-03-18T09:59:00Z | INSERT_INTO_SELECT | mysql | yz_datawarehouse | 1.0 |
+
+  ## 字段清单
+
+  | field_id | field_name | field_name_en | field_type | data_type | calculation_type | target_field | formula | source_tables | source_fields | filters | joins | business_description | is_cross_table | support_drill_down | drill_down_fields | is_group_by_field | validation_status | validation_message |
+  |----------|------------|---------------|------------|-----------|------------------|--------------|---------|---------------|---------------|---------|-------|---------------------|----------------|-------------------|-------------------|-------------------|-------------------|-------------------|
+  | ads_sales_daily_org_id | 组织 ID | org_id | dimension | string | direct | org_id | org_id | ["yz_datawarehouse.dwd.dwd_order_fact"] | ["yz_datawarehouse.dwd.dwd_order_fact.org_id"] | [] | [] | 组织标识 | false | true | [] | true | valid | |
+  | ads_sales_daily_sale_date | 销售日期 | sale_date | dimension | date | direct | sale_date | DATE(sale_time) | ["yz_datawarehouse.dwd.dwd_order_fact"] | ["yz_datawarehouse.dwd.dwd_order_fact.sale_time"] | [] | [] | 销售日期 | false | true | [] | true | valid | |
+  | ads_sales_daily_customer_id | 客户 ID | customer_id | dimension | string | direct | customer_id | customer_id | ["yz_datawarehouse.dwd.dwd_order_fact"] | ["yz_datawarehouse.dwd.dwd_order_fact.customer_id"] | [] | [] | 客户标识 | false | true | [] | true | valid | |
+  | ads_sales_daily_sales_amount | 销售额 | sales_amount | metric | decimal | aggregation | sales_amount | SUM(order_amount) | ["yz_datawarehouse.dwd.dwd_order_fact"] | ["yz_datawarehouse.dwd.dwd_order_fact.order_amount"] | ["order_status = 'completed'"] | [] | 含税销售额 | false | false | ["org_id","sale_date","customer_id"] | false | valid | |
+  | ads_sales_daily_order_count | 订单数 | order_count | metric | int | aggregation | order_count | COUNT(DISTINCT order_id) | ["yz_datawarehouse.dwd.dwd_order_fact"] | ["yz_datawarehouse.dwd.dwd_order_fact.order_id"] | ["order_status = 'completed'"] | [] | 去重订单数 | false | false | ["org_id","sale_date","customer_id"] | false | valid | |
+  | ads_sales_daily_avg_order_value | 客单价 | avg_order_value | metric | decimal | expression | avg_order_value | SUM(order_amount)/COUNT(order_id) | ["yz_datawarehouse.dwd.dwd_order_fact"] | ["yz_datawarehouse.dwd.dwd_order_fact.order_amount","yz_datawarehouse.dwd.dwd_order_fact.order_id"] | ["order_status = 'completed'"] | [] | 平均每单金额 | false | false | ["org_id","sale_date","customer_id"] | false | valid | |
+  | ads_sales_daily_gross_margin_rate | 毛利率 | gross_margin_rate | metric | decimal | expression | gross_margin_rate | (SUM(revenue)-SUM(cost))/SUM(revenue) | ["yz_datawarehouse.dwd.dwd_order_fact","yz_datawarehouse.dim.dim_product"] | ["yz_datawarehouse.dwd.dwd_order_fact.revenue","yz_datawarehouse.dwd.dwd_order_fact.cost","yz_datawarehouse.dim.dim_product.revenue"] | ["order_status = 'completed'"] | [{"type":"INNER JOIN","condition":"o.product_id = p.product_id"}] | 毛利=(revenue-cost)/revenue | true | false | ["org_id","sale_date","product_id"] | false | valid | |
+
+  ## 【校验规则】
+  1. 嵌套聚合检测：formula 含 SUM(SUM、COUNT(COUNT 等 → validation_status: invalid
+  2. 跨表检测：source_tables 数量>1 或 joins 非空 → is_cross_table: true
+  3. 下钻支持：维度字段 support_drill_down: true，指标字段 support_drill_down: false
+  4. GROUP BY 标识：用于 GROUP BY 的字段 is_group_by_field: true
+  5. 字段类型：维度字段 field_type: dimension，指标字段 field_type: metric
+  6. 表名规范：所有表名必须含完整表名（schema.表）
+  7. 布尔值规范：必须用 true/false，禁止用 是/否/支持/不支持
+  8. 时间格式：必须使用 ISO8601 格式（YYYY-MM-DDTHH:MM:SSZ）
+  9. 完整性校验：字段清单必须覆盖 SELECT 子句中的所有字段
+
+  ## 【待解析 SQL】
+  
+  ```sql
+  {sql_content}
+  ```

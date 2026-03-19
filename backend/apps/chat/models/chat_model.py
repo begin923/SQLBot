@@ -12,7 +12,8 @@ from sqlmodel import SQLModel, Field
 from apps.db.constant import DB
 from apps.template.filter.generator import get_permissions_template
 from apps.template.generate_analysis.generator import get_analysis_template
-from apps.template.generate_sql.generator import get_static_sql_template
+from apps.template.generate_sql.generator import get_static_sql_template, get_drill_down_template, \
+    get_view_details_template
 from apps.template.generate_chart.generator import get_chart_template
 from apps.template.generate_dynamic.generator import get_dynamic_template
 from apps.template.generate_guess_question.generator import get_guess_question_template
@@ -278,6 +279,32 @@ class AiModelQuestion(BaseModel):
             provided_sql=provided_sql,
             question=self.question,
             change_title=change_title
+        )
+
+    def drill_down_sys_question(self, enable_query_limit: bool = True):
+        """生成静态SQL执行的系统提示词"""
+        template = get_drill_down_template()
+        return template['system']
+
+    def drill_down_user_question(self):
+        """生成静态SQL执行的用户提示词"""
+        template = get_drill_down_template()
+        return template['user'].format(
+            user_question=self.question
+        )
+
+    def view_details_sys_question(self, enable_query_limit: bool = True):
+        """生成静态SQL执行的系统提示词"""
+        template = get_view_details_template()
+        return template['system']
+
+    def view_details_user_question(self, table_name:str ,calculation_fields:str):
+        """生成静态SQL执行的用户提示词"""
+        template = get_view_details_template()
+        return template['user'].format(
+            user_question=self.question,
+            calculation_fields=calculation_fields,
+            table_name=table_name,
         )
 
 

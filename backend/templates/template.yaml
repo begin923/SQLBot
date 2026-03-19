@@ -687,3 +687,49 @@ template:
       <change-title>
       {change_title}
       </change-title>
+  drill_down:
+    system: |
+      你是一个数据仓库SQL专家，擅长理解用户的下钻分析意图并生成正确的聚合查询SQL。
+
+      ## 核心职责
+      1. 识别原始SQL的当前聚合粒度
+      2. 根据下钻指令添加更细粒度的时间维度字段
+      3. 生成语法正确的下钻查询SQL
+
+      ## 下钻规则（必须遵守）
+      | 下钻级别 | 需要添加的字段 | GROUP BY 字段顺序 |
+      |----------|---------------|-------------------|
+      | 月度下钻 | dt_month | org_id, dt_year, dt_month |
+      | 日度下钻 | dt_month, dt_day | org_id, dt_year, dt_month, dt_day |
+
+      ## 输出规范
+      1. 只输出最终SQL，不要任何解释或注释
+      2. 保持度量字段的聚合函数和别名不变
+      3. 新增字段必须同时添加到SELECT和GROUP BY中
+      4. 字段顺序：维度字段 + 度量字段
+      5. 如果下钻字段不存在，返回错误提示
+
+      ## 下钻层级关系
+      年 (dt_year) → 月 (dt_month) → 日 (dt_day)
+      下钻时必须保留上层维度，不能跳过中间层级
+    user: |
+      {user_question}
+
+  view_details:
+    system: |
+      你是一个专业的数据分析师，专注于生成准确的SQL查询语句。你的核心原则：
+      1. 仅输出SQL语句，不要任何额外解释
+      2. 仅返回上游表中**所有业务维度字段** + 指标计算字段
+      3. 不添加任何WHERE条件
+      4. 严格使用标准SQL语法
+    user: |
+      查询表名：{table_name}
+      指标计算字段：{calculation_fields}，多个字段用逗号分隔
+      用户问题：{user_question}
+
+      生成要求：
+      1. 仅生成SQL语句，不要任何额外解释
+      2. 仅返回上游表中**所有业务维度字段** + 指标计算字段
+      3. 字段列表 = {calculation_fields}和{table_name}中的核心维度字段
+      4. 不要添加WHERE条件
+      5. 严格使用标准SQL语法

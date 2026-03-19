@@ -61,6 +61,9 @@ dynamic_subsql_prefix = 'select * from sqlbot_dynamic_temp_table_'
 
 session_maker = scoped_session(sessionmaker(bind=engine, class_=Session))
 
+from apps.extend.metric_drilldown_handler import MetricDrilldownHandler
+from apps.extend.static_sql_handler import StaticSQLHandler
+
 
 class LLMService:
     ds: CoreDatasource
@@ -89,6 +92,10 @@ class LLMService:
     articles_number: int = 4
     is_static_sql: bool = False
     provided_sql: str = None
+    is_drill_down: bool = False
+    metric_drill_down_info = {}
+    is_view_details: bool = False
+    view_details_dependencies = {}
 
     def __init__(self, session: Session, current_user: CurrentUser, chat_question: ChatQuestion,
                  current_assistant: Optional[CurrentAssistant] = None, no_reasoning: bool = False,
@@ -152,55 +159,11 @@ class LLMService:
         else:
             self.chat_question.error_msg = ''
 
-        # 检查是否为静态SQL执行模式（在这里调用，确保chat_question已初始化）
-        self.check_static_sql_mode()
+        # 初始化静态SQL处理对象
+        self.static_sql_handler = StaticSQLHandler()
 
-    def check_static_sql_mode(self):
-        """检查是否为静态SQL执行模式"""
-        # 检查问题中是否包含#sql#标记
-        sql_pattern = r'#sql#(.*?)#sql#'  # 匹配#sql#之间的内容
-        match = re.search(sql_pattern, self.chat_question.question, re.DOTALL | re.IGNORECASE)
-        
-        if match:
-            self.is_static_sql = True
-            extracted_content = match.group(1).strip()
-            
-            # 尝试解析JSON格式的SQL
-            sql_data = json.loads(extracted_content, strict=False)
-            base_sql = sql_data.get('sql', '')
-            in_parm = sql_data.get('in_parm', {})
-
-            # 如果有参数，则进行参数替换
-            if in_parm and isinstance(in_parm, dict):
-                self.provided_sql = self._substitute_parameters(base_sql, in_parm)
-                SQLBotLogUtil.info(f"Detected static SQL mode with JSON format and parameters, original SQL: {base_sql}, parameters: {in_parm}, final SQL: {self.provided_sql}")
-            else:
-                # 没有参数，直接使用sql字段的内容
-                self.provided_sql = base_sql
-                SQLBotLogUtil.info(f"Detected static SQL mode with JSON format, SQL: {self.provided_sql}")
-        else:
-            # 检查是否有明显的SQL语句开头
-            sql_indicators = ['select ', 'with ', 'insert ', 'update ', 'delete ']
-            question_lower = self.chat_question.question.lower()
-            
-            # 检查是否包含执行相关的关键词和SQL语句
-            execute_keywords = ['执行', '运行', '查询']
-            has_execute_keyword = any(keyword in question_lower for keyword in execute_keywords)
-            
-            # 查找SQL语句的位置
-            sql_start_pos = -1
-            found_indicator = None
-            for indicator in sql_indicators:
-                pos = question_lower.find(indicator)
-                if pos != -1 and (sql_start_pos == -1 or pos < sql_start_pos):
-                    sql_start_pos = pos
-                    found_indicator = indicator
-            
-            if has_execute_keyword and sql_start_pos != -1:
-                self.is_static_sql = True
-                # 提取SQL语句（从SQL关键词开始到结尾，去除前后空格）
-                self.provided_sql = self.chat_question.question[sql_start_pos:].strip()
-                SQLBotLogUtil.info(f"Detected static SQL mode from natural language, SQL: {self.provided_sql}")
+        # 初始化指标钻取分析对象
+        self.metric_drilldown = MetricDrilldownHandler()
 
     @classmethod
     async def create(cls, *args, **kwargs):
@@ -594,6 +557,32 @@ class LLMService:
                 self.chat_question.static_sql_user_question(
                     provided_sql=self.provided_sql,
                     change_title=self.change_title
+                )
+            ))
+        elif self.is_drill_down:
+            self.sql_message.append(SystemMessage(
+                self.chat_question.drill_down_sys_question(
+                    settings.GENERATE_SQL_QUERY_LIMIT_ENABLED
+                )
+            ))
+            self.sql_message.append(HumanMessage(
+                self.chat_question.drill_down_user_question()
+            ))
+        elif self.is_view_details :
+            # 查询明细执行模式：使用专门的提示词
+            self.sql_message.append(SystemMessage(
+                self.chat_question.view_details_sys_question(
+                    settings.GENERATE_SQL_QUERY_LIMIT_ENABLED
+                )
+            ))
+
+            fields = self.view_details_dependencies.get('fields')
+            SQLBotLogUtil.info(f"view_details_dependencies fields: {fields}")
+            fields_str = ','.join(fields)
+            self.sql_message.append(HumanMessage(
+                self.chat_question.view_details_user_question(
+                    table_name=self.view_details_dependencies.get('table'),
+                    calculation_fields=fields_str
                 )
             ))
         else:
@@ -1026,8 +1015,6 @@ class LLMService:
                                                                            CustomPromptTypeEnum.GENERATE_SQL,
                                                                            oid, ds_id)
 
-                # 处理下钻分析的特殊逻辑
-                self.handle_drilldown_analysis(_session)
 
                 self.init_messages()
 
@@ -1037,7 +1024,7 @@ class LLMService:
             if not stream:
                 json_result['record_id'] = self.get_record().id
 
-                # select datasource if datasource is none
+            # select datasource if datasource is none
             if not self.ds:
                 ds_res = self.select_datasource(_session)
 
@@ -1066,13 +1053,65 @@ class LLMService:
             if not connected:
                 raise SQLBotDBConnectionError('Connect DB failed')
 
-            # 处理静态SQL执行模式
-            if self.is_static_sql and self.provided_sql:
-                # 直接执行模式：直接使用用户提供的SQL，跳过大模型调用
-                chart_type, full_sql_text, sql = yield from self.exe_static_sql(_session, in_chat)
+            # ========== 下钻查询分析和处理 ==========
+            # 检测是否包含下钻关键词
+            question_lower = self.chat_question.question.lower()
+            has_drilldown_keyword = "下钻" in self.chat_question.question or \
+                                   "钻取" in self.chat_question.question or \
+                                   "drill" in question_lower
+
+            # 下钻分析&明细查询
+            if has_drilldown_keyword:
+                extract_result = self.metric_drilldown.get_user_intent_and_table_scope(self.llm, self.chat_question.question)
+                is_current_table = extract_result.get("is_current_table")
+                table_name = extract_result.get("table_name")
+                # TODO 默认第一个，后续优化
+                source_metrics = extract_result.get("metrics")[0]
+                metric_blood_data = self.metric_drilldown.extract_metric_blood_from_md(table_name)
+                metric_blood = metric_blood_data.get("data", {}).get("metrics", {})
+                metrics = extract_result.get("metrics")
+                SQLBotLogUtil.info(f"metrics: {metrics}")
+                metric_detail = metric_blood.get(source_metrics)
+                SQLBotLogUtil.info(f"metric_detail: {metric_detail}")
+                if is_current_table:
+                    # 添加表到数据源中，然后基于用户问题走常规流程即可
+                    SQLBotLogUtil.info(f"Drilldown table_name: {table_name}")
+                    # 添加表到数据源并返回表结构
+                    status = self.static_sql_handler.add_table_to_ds(self.ds, table_name)
+                    self.is_drill_down = True
+                    chart_type = 'table'  # 下钻场景默认使用表格
+                else:
+                    # 查询上游明细数据
+                    metric_detail_list = []
+                    depend_tables = set()  # 使用 set 去重
+                    if metric_detail:
+                        metric_detail_list.append(metric_detail)
+                        self.view_details_dependencies = metric_detail.get("calculation",{}).get("dependencies",[])[0]
+                        # for dependency in self.view_details_dependencies:
+                        table = self.view_details_dependencies.get("table")
+                        if table:  # 确保表名不为空
+                            depend_tables.add(table)  # 使用 add 添加到 set
+                    SQLBotLogUtil.info(f"metric_detail_list:{metric_detail_list}")
+                    SQLBotLogUtil.info(f"depend_tables:{depend_tables}")
+                    # 遍历 set 添加表到数据源
+                    for depend_table in depend_tables:
+                        status = self.static_sql_handler.add_table_to_ds(self.ds, depend_table)
+                        # TODO 根据状态重试或者其他操作 ，待定
+                    self.is_view_details = True
+
+            # 执行静态 sql
+            static_sql_keyword = "#FIXED_SQL_START#" in self.chat_question.question
+            if static_sql_keyword:
+                self.provided_sql = self.static_sql_handler.check_static_sql_mode(self.chat_question.question)
+                SQLBotLogUtil.info(f"static_sql:{self.provided_sql}")
+                self.is_static_sql = True
+                full_sql_text, sql = self.static_sql_handler.exe_static_sql(_session, in_chat , self.ds,self.provided_sql,self.record.id)
+                chart_type = self.get_chart_type_from_sql_answer(full_sql_text)
             else:
-                # 常规模式：调用大模型生成SQL
+                # 常规 LLM 生成
+                SQLBotLogUtil.info("Regular query, using LLM to generate SQL")
                 sql_res = self.generate_sql(_session)
+                SQLBotLogUtil.info(f"sql_res:{sql_res}")
                 full_sql_text = ''
                 for chunk in sql_res:
                     full_sql_text += chunk.get('content')
@@ -1087,7 +1126,7 @@ class LLMService:
                 SQLBotLogUtil.info(f"full_sql_text: {full_sql_text}")
 
                 chart_type = self.get_chart_type_from_sql_answer(full_sql_text)
-                
+
                 # 常规处理流程
                 sql, tables = self.check_sql(res=full_sql_text)
 
@@ -1311,128 +1350,6 @@ class LLMService:
             self.finish(_session)
             session_maker.remove()
 
-    def exe_static_sql(self, _session, in_chat):
-        # 直接执行模式：直接使用用户提供的SQL，跳过大模型调用
-        full_sql_text = self.provided_sql  # 设置full_sql_text为用户提供的SQL
-        SQLBotLogUtil.info(f"Direct execute mode: using provided SQL directly: {self.provided_sql}")
-        sql = self.provided_sql
-        save_sql(session=_session, sql=sql, record_id=self.record.id)
-        self.chat_question.sql = sql
-        # 从用户提供的SQL中提取表名
-        tables = self.extract_tables_from_sql(sql)
-        SQLBotLogUtil.info(f"Extracted tables from provided SQL: {tables}")
-        # 如果有数据源且提取到表名，则调用标准接口添加表到指定数据源中
-        if self.ds and tables:
-            try:
-                from apps.datasource.crud.datasource import chooseTables
-                from apps.datasource.models.datasource import CoreTable
-                from common.core.deps import get_session
-                from common.core.deps import Trans
-
-                # 获取数据库会话 - 使用正确的会话获取方式
-                from sqlalchemy.orm import sessionmaker
-                from common.core.db import engine
-                from sqlmodel import Session
-
-                local_session_maker = sessionmaker(bind=engine, class_=Session)
-                session = local_session_maker()
-
-                # 创建事务对象
-                trans = Trans()
-
-                # 获取数据源的所有表信息，用于获取真实表注释
-                from apps.datasource.crud.datasource import getTablesByDs
-
-                # 构造临时的CoreDatasource对象用于查询
-                temp_ds = CoreDatasource(
-                    id=self.ds.id,
-                    type=self.ds.type,
-                    configuration=self.ds.configuration
-                )
-
-                # 获取数据源中已有的所有表
-                existing_tables = session.query(CoreTable).filter(
-                    CoreTable.ds_id == self.ds.id
-                ).all()
-                
-                # 创建已有表名集合，用于快速查找
-                existing_table_names = {table.table_name for table in existing_tables}
-                
-                # 获取所有表信息（用于获取表注释）
-                all_tables_info = getTablesByDs(session, temp_ds)
-                table_comment_map = {}
-                for table_info in all_tables_info:
-                    # 修复属性名称：使用tableComment而不是table_comment
-                    table_comment_map[table_info.tableName.lower()] = table_info.tableComment
-
-                # 构造表对象列表：包含已有的所有表 + 新提取的表
-                table_objects = []
-                
-                # 先添加已有的表
-                for existing_table in existing_tables:
-                    table_objects.append(existing_table)
-                
-                # 再添加新提取的表（避免重复）
-                for table_name in tables:
-                    # 如果表已经存在，跳过
-                    if table_name in existing_table_names:
-                        continue
-                        
-                    # 从映射中获取真实表注释，如果没有则使用空字符串
-                    table_comment = table_comment_map.get(table_name.lower(), "")
-
-                    table_obj = CoreTable(
-                        ds_id=self.ds.id,
-                        checked=True,
-                        table_name=table_name,  # 保持完整的schema.table格式
-                        table_comment=table_comment,  # 使用真实的表注释
-                        custom_comment=table_comment  # 自定义注释也使用真实注释
-                    )
-                    table_objects.append(table_obj)
-
-                # 直接调用后端的chooseTables函数
-                chooseTables(session, trans, self.ds.id, table_objects)
-
-                # 强制提交事务确保数据持久化
-                session.commit()
-
-                # 验证表是否真正添加成功
-                added_tables = session.query(CoreTable).filter(
-                    and_(CoreTable.ds_id == self.ds.id,
-                         CoreTable.table_name.in_(tables))
-                ).all()
-
-                # 关闭会话
-                session.close()
-            except Exception as e:
-                # 即使添加失败也继续执行，不影响主要功能
-                pass
-        # 直接执行模式下不需要图表类型
-        chart_type = 'table'
-        # 直接执行模式下不需要图表类型
-        chart_type = 'table'
-        # 直接返回结果，模拟大模型响应
-        response_data = {
-            "success": True,
-            "sql": sql,
-            "tables": tables,
-            "chart-type": chart_type
-        }
-        # 添加数据源信息
-        if self.ds:
-            response_data["datasource"] = {
-                "id": self.ds.id,
-                "name": self.ds.name,
-                "type": self.ds.type,
-                "description": self.ds.description
-            }
-        if in_chat:
-            yield 'data:' + orjson.dumps(
-                {'content': json.dumps(response_data, ensure_ascii=False),
-                 'type': 'sql-result'}).decode() + '\n\n'
-            yield 'data:' + orjson.dumps({'type': 'info', 'msg': 'sql generated'}).decode() + '\n\n'
-        return chart_type, full_sql_text, sql
-
     def run_recommend_questions_task_async(self):
         self.future = executor.submit(self.run_recommend_questions_task_cache)
 
@@ -1644,11 +1561,7 @@ class LLMService:
         """
         处理下钻分析的特殊逻辑
         """
-        # 静态SQL执行模式下跳过下钻分析处理
-        if self.is_static_sql:
-            SQLBotLogUtil.info("Skipping drilldown analysis in direct execute mode")
-            return
-            
+
         # 检查问题是否涉及下钻分析
         question_lower = self.chat_question.question.lower()
         if "下钻" in self.chat_question.question or "钻取" in self.chat_question.question or "drill" in question_lower:
@@ -1680,196 +1593,11 @@ class LLMService:
                 # 这样可以确保 LLM 只依赖我们提供的实际表结构
                 self.chat_question.db_schema = ""
 
-    def extract_fields_from_sql(self, sql_query: str) -> List[str]:
-        """
-        从SQL查询语句中提取涉及的字段名
-        
-        Args:
-            sql_query: SQL查询语句
-            
-        Returns:
-            List[str]: 字段名列表
-        """
-        if not sql_query:
-            return []
-        
-        # 使用sqlparse库解析SQL
-        parsed = sqlparse.parse(sql_query)
-        if not parsed:
-            return []
-        
-        fields = set()
-        
-        # 遍历解析后的SQL语句
-        for statement in parsed:
-            # 查找SELECT子句
-            select_seen = False
-            for token in statement.flatten():
-                if token.ttype is sqlparse.tokens.DML and token.value.upper() == 'SELECT':
-                    select_seen = True
-                    continue
-                
-                if select_seen:
-                    # 处理字段名
-                    if isinstance(token, sqlparse.sql.Identifier):
-                        # 直接的字段名
-                        field_name = token.get_real_name()
-                        if field_name and field_name != '*':
-                            fields.add(field_name)
-                    elif isinstance(token, sqlparse.sql.IdentifierList):
-                        # 多个字段名
-                        for identifier in token.get_identifiers():
-                            field_name = identifier.get_real_name()
-                            if field_name and field_name != '*':
-                                fields.add(field_name)
-                    elif token.ttype is sqlparse.tokens.Name:
-                        # 简单的字段名
-                        if token.value != '*':
-                            fields.add(token.value)
-                    
-                    # 遇到FROM关键字时停止字段提取
-                    if token.ttype is sqlparse.tokens.Keyword and token.value.upper() == 'FROM':
-                        break
-        
-        return list(fields)
-
-    def _substitute_parameters(self, sql_template: str, parameters: dict) -> str:
-        """替换SQL模板中的参数
-        
-        Args:
-            sql_template: SQL模板字符串，包含${paramName}格式的占位符
-            parameters: 参数字典 {"paramName": "paramValue"}
-            
-        Returns:
-            替换参数后的SQL字符串
-        """
-        if not sql_template or not parameters:
-            return sql_template
-        
-        result_sql = sql_template
-        
-        # 直接替换每个参数，保持原始SQL意图
-        # SQL模板中已经根据字段类型添加了适当的引号和NULL处理
-        for param_name, param_value in parameters.items():
-            placeholder = f"${{{param_name}}}"
-            # 直接转换为字符串进行替换，不进行任何额外处理
-            replacement = str(param_value)
-            
-            result_sql = result_sql.replace(placeholder, replacement)
-            SQLBotLogUtil.debug(f"Replaced parameter {placeholder} with {replacement}")
-        
-        return result_sql
-
-    def extract_tables_from_sql(self, sql_query: str) -> List[str]:
-        """
-        从SQL查询语句中提取涉及的完整表名（包含schema）
-        使用SQL语法树解析器(sqlglot)进行精确解析
-        注意：只提取实际的物理表名，排除CTE别名、单独的schema名称等
-        
-        Args:
-            sql_query: SQL查询语句
-            
-        Returns:
-            List[str]: 完整表名列表（格式：schema.table_name）
-            例如: ['yz_datawarehouse_dim.dim_fpf_spc_admin_detail', 'yz_datawarehouse_dws.dws_fpf_farrow_detail']
-        """
-        if not sql_query:
-            return []
-        
-        tables = set()
-        cte_aliases = set()  # 存储CTE别名，用于排除
-        
-        try:
-            # 使用sqlglot进行精确的SQL语法树解析
-            import sqlglot
-            from sqlglot import exp
-            
-            # 解析SQL语句
-            parsed_statements = sqlglot.parse(sql_query, dialect=None)
-            
-            for statement in parsed_statements:
-                if statement is None:
-                    continue
-                
-                # 首先收集所有CTE别名
-                for cte in statement.find_all(exp.CTE):
-                    if hasattr(cte, 'alias') and cte.alias:
-                        alias_name = str(cte.alias.this) if hasattr(cte.alias, 'this') else str(cte.alias)
-                        cte_aliases.add(alias_name.lower())
-                
-                # 递归遍历语法树，提取所有表名引用
-                for table_exp in statement.find_all(exp.Table):
-                    # 获取表名的各个部分
-                    catalog = table_exp.args.get('catalog')
-                    db = table_exp.args.get('db')
-                    table = table_exp.args.get('this')
-                    
-                    if table:
-                        table_name = str(table.this) if hasattr(table, 'this') else str(table)
-                        table_name_lower = table_name.lower()
-                        
-                        # 排除CTE别名
-                        if table_name_lower in cte_aliases:
-                            continue
-                        
-                        # 关键修复：只有当同时有db和table组件时才构成有效表名
-                        # 避免单独的schema名称被提取
-                        if db:
-                            db_name = str(db.this) if hasattr(db, 'this') else str(db)
-                            db_name_lower = db_name.lower()
-                            
-                            # 验证db和table都是有效的标识符
-                            if (self._is_valid_identifier(db_name_lower) and 
-                                self._is_valid_identifier(table_name_lower)):
-                                full_table_name = f"{db_name_lower}.{table_name_lower}"
-                                tables.add(full_table_name)
-                                SQLBotLogUtil.debug(f"提取完整表名: {full_table_name}")
-                        # 简单表名（没有schema前缀）
-                        elif self._is_valid_identifier(table_name_lower):
-                            tables.add(table_name_lower)
-                            SQLBotLogUtil.debug(f"提取简单表名: {table_name_lower}")
-                            
-        except Exception as e:
-            SQLBotLogUtil.warning(f"sqlglot解析失败，回退到正则表达式方法: {str(e)}")
-            # 回退到正则表达式方法作为备用方案
-            self._extract_tables_regex_backup(sql_query, tables)
-        
-        # 过滤掉可能的schema名称（单独出现的）
-        filtered_tables = set()
-        all_parts = set()
-        
-        # 收集所有表名的组成部分
-        for table_name in tables:
-            if '.' in table_name:
-                parts = table_name.split('.')
-                if len(parts) == 2:
-                    schema_part, table_part = parts
-                    all_parts.add(schema_part)
-                    all_parts.add(table_part)
-                    # 只有完整的schema.table格式才保留
-                    filtered_tables.add(table_name)
-            else:
-                # 简单表名直接保留
-                filtered_tables.add(table_name)
-                all_parts.add(table_name)
-        
-        # 最终过滤：移除那些只是schema名称的项
-        final_tables = set()
-        for table_name in filtered_tables:
-            if '.' in table_name:
-                final_tables.add(table_name)
-            else:
-                # 对于简单表名，确保它不是某个完整表名的schema部分
-                if table_name not in all_parts or any(table_name in t.split('.')[0] for t in filtered_tables if '.' in t):
-                    final_tables.add(table_name)
-        
-        return sorted(list(final_tables))
-    
     def _is_valid_identifier(self, name: str) -> bool:
         """验证是否为有效的SQL标识符"""
         if not name:
             return False
-        
+
         # 排除关键字
         exclude_words = {
             'as', 'on', 'and', 'or', 'by', 'in', 'is', 'not', 'null', 'true', 'false',
@@ -1877,25 +1605,25 @@ class LLMService:
             'inner', 'left', 'right', 'full', 'update', 'insert', 'into', 'delete',
             'set', 'values', 'case', 'when', 'then', 'else', 'end', 'u', 'd', 'a', 'b'
         }
-        
+
         if name in exclude_words:
             return False
-        
+
         # 排除数字
         if name.isdigit():
             return False
-        
+
         # 排除函数调用等
         if any(char in name for char in '()'):
             return False
-        
+
         # 必须以字母或下划线开头
         if not (name[0].isalpha() or name[0] == '_'):
             return False
-        
+
         # 只能包含字母、数字、下划线
         return all(c.isalnum() or c == '_' for c in name)
-    
+
     def _is_valid_table_structure_for_sqlglot(self, table_name: str) -> bool:
         """为sqlglot解析验证表名结构"""
         if not table_name:
@@ -1944,67 +1672,7 @@ class LLMService:
         
         # 只能包含字母、数字、下划线
         return all(c.isalnum() or c == '_' for c in part)
-    
-    def _extract_tables_regex_backup(self, sql_query: str, tables_set: set):
-        """正则表达式备份方法 - 修复schema单独提取问题"""
-        import re
-        
-        # 收集所有可能的表名组成部分，用于后续过滤
-        all_parts = set()
-        
-        # 更精确的正则表达式模式
-        patterns = [
-            # 匹配 FROM 和各种 JOIN 后面的标准 schema.table 格式（优先级最高）
-            r'(?:\bFROM\b|\bJOIN\b|\bLEFT\s+JOIN\b|\bRIGHT\s+JOIN\b|\bINNER\s+JOIN\b)\s+([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)',
-            
-            # 匹配带引号的 schema.table 格式
-            r'(?:\bFROM\b|\bJOIN\b|\bLEFT\s+JOIN\b|\bRIGHT\s+JOIN\b|\bINNER\s+JOIN\b)\s+"([^"]+)"\."([^"]+)"',
-            
-            # 匹配 UPDATE 和 DELETE FROM 的 schema.table 格式
-            r'(?:\bUPDATE\b|\bDELETE\s+FROM\b)\s+([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)',
-            
-            # 匹配 INSERT INTO 的 schema.table 格式
-            r'\bINSERT\s+INTO\b\s+([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)'
-        ]
-        
-        # 先处理完整的 schema.table 格式
-        for pattern in patterns:
-            matches = re.findall(pattern, sql_query, re.IGNORECASE)
-            for match in matches:
-                if isinstance(match, tuple) and len(match) == 2:
-                    # schema.table 格式
-                    schema, table = match
-                    full_name = f"{schema}.{table}".lower()
-                    if self._is_valid_table_structure_for_sqlglot(full_name):
-                        tables_set.add(full_name)
-                        # 记录组成部分，用于后续过滤
-                        all_parts.add(schema.lower())
-                        all_parts.add(table.lower())
-        
-        # 然后处理简单的表名，但要排除已经是完整表名组成部分的schema
-        simple_patterns = [
-            # 匹配 FROM 和各种 JOIN 后面的简单表名
-            r'(?:\bFROM\b|\bJOIN\b|\bLEFT\s+JOIN\b|\bRIGHT\s+JOIN\b|\bINNER\s+JOIN\b)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b',
-            
-            # 匹配 UPDATE 和 DELETE FROM 的简单表名
-            r'(?:\bUPDATE\b|\bDELETE\s+FROM\b)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b',
-            
-            # 匹配 INSERT INTO 的简单表名
-            r'\bINSERT\s+INTO\b\s+([a-zA-Z_][a-zA-Z0-9_]*)\b'
-        ]
-        
-        for pattern in simple_patterns:
-            matches = re.findall(pattern, sql_query, re.IGNORECASE)
-            for match in matches:
-                table_name = match.lower()
-                # 关键修复：只添加不是已有完整表名组成部分的简单表名
-                if (self._is_valid_table_structure_for_sqlglot(table_name) and 
-                    table_name not in all_parts):
-                    tables_set.add(table_name)
-    
 
-
-    
     def _get_full_table_name_from_identifier(self, identifier) -> str:
         """从Identifier节点中提取完整的表名（支持schema.table格式）"""
         if not isinstance(identifier, sqlparse.sql.Identifier):
@@ -2110,10 +1778,6 @@ class LLMService:
             'inner', 'left', 'right', 'full', 'update', 'insert', 'into', 'delete',
             'set', 'values', 'case', 'when', 'then', 'else', 'end', 'u', 'd', 'a', 'b'
         }
-    
-
-
-
 
 def execute_sql_with_db(db: SQLDatabase, sql: str) -> str:
     """Execute SQL query using SQLDatabase
