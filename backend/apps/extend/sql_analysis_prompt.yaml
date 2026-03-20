@@ -6,7 +6,7 @@ system: |
   2. 忽略临时表、测试表（表名含 tmp/test/temp/stage）
   3. 血缘关系仅提取直接关联，不推导间接血缘
   4. 布尔值使用 true/false，不用 是/否/支持/不支持
-  5. 数组使用 ["元素 1", "元素 2"] 格式
+  5. 多个元素使用逗号 + 换行符分隔（格式：元素 1, \n元素 2, \n元素 3）
   6. 输出使用 Markdown 格式，结构清晰，便于程序解析转换
   7. **必须识别 SELECT 子句中的所有字段**，不能遗漏
 
@@ -61,8 +61,8 @@ metric_blood: |
   1. 仅输出 Markdown 内容，无任何额外说明
   2. 严格按以下结构输出，字段顺序不可调整
   3. 布尔值必须用 true/false，禁止用 是/否/支持/不支持
-  4. 数组必须用 ["元素 1", "元素 2"] 格式
-  5. 不确定内容标注"待确认"，不要臆造
+  4. 多个元素使用逗号 + 换行符分隔（格式：元素 1, \n元素 2, \n元素 3）
+  5. 不确定内容标注“待确认”，不要臆造
   6. 表名必须完整（schema.表）
   7. **基本信息、字段清单、统计摘要均使用横向表格：字段为列，数据为行**
   8. **字段清单必须包含 SELECT 子句中的所有字段**，不能遗漏
@@ -99,13 +99,13 @@ metric_blood: |
 
   | field_id | field_name | field_name_en | field_type | data_type | calculation_type | target_field | formula | source_tables | source_fields | filters | joins | business_description | is_cross_table | support_drill_down | drill_down_fields | is_group_by_field | validation_status | validation_message |
   |----------|------------|---------------|------------|-----------|------------------|--------------|---------|---------------|---------------|---------|-------|---------------------|----------------|-------------------|-------------------|-------------------|-------------------|-------------------|
-  | ads_sales_daily_org_id | 组织 ID | org_id | dimension | string | direct | org_id | org_id | ["yz_datawarehouse.dwd.dwd_order_fact"] | ["yz_datawarehouse.dwd.dwd_order_fact.org_id"] | [] | [] | 组织标识 | false | true | [] | true | valid | |
-  | ads_sales_daily_sale_date | 销售日期 | sale_date | dimension | date | direct | sale_date | DATE(sale_time) | ["yz_datawarehouse.dwd.dwd_order_fact"] | ["yz_datawarehouse.dwd.dwd_order_fact.sale_time"] | [] | [] | 销售日期 | false | true | [] | true | valid | |
-  | ads_sales_daily_customer_id | 客户 ID | customer_id | dimension | string | direct | customer_id | customer_id | ["yz_datawarehouse.dwd.dwd_order_fact"] | ["yz_datawarehouse.dwd.dwd_order_fact.customer_id"] | [] | [] | 客户标识 | false | true | [] | true | valid | |
-  | ads_sales_daily_sales_amount | 销售额 | sales_amount | metric | decimal | aggregation | sales_amount | SUM(order_amount) | ["yz_datawarehouse.dwd.dwd_order_fact"] | ["yz_datawarehouse.dwd.dwd_order_fact.order_amount"] | ["order_status = 'completed'"] | [] | 含税销售额 | false | false | ["org_id","sale_date","customer_id"] | false | valid | |
-  | ads_sales_daily_order_count | 订单数 | order_count | metric | int | aggregation | order_count | COUNT(DISTINCT order_id) | ["yz_datawarehouse.dwd.dwd_order_fact"] | ["yz_datawarehouse.dwd.dwd_order_fact.order_id"] | ["order_status = 'completed'"] | [] | 去重订单数 | false | false | ["org_id","sale_date","customer_id"] | false | valid | |
-  | ads_sales_daily_avg_order_value | 客单价 | avg_order_value | metric | decimal | expression | avg_order_value | SUM(order_amount)/COUNT(order_id) | ["yz_datawarehouse.dwd.dwd_order_fact"] | ["yz_datawarehouse.dwd.dwd_order_fact.order_amount","yz_datawarehouse.dwd.dwd_order_fact.order_id"] | ["order_status = 'completed'"] | [] | 平均每单金额 | false | false | ["org_id","sale_date","customer_id"] | false | valid | |
-  | ads_sales_daily_gross_margin_rate | 毛利率 | gross_margin_rate | metric | decimal | expression | gross_margin_rate | (SUM(revenue)-SUM(cost))/SUM(revenue) | ["yz_datawarehouse.dwd.dwd_order_fact","yz_datawarehouse.dim.dim_product"] | ["yz_datawarehouse.dwd.dwd_order_fact.revenue","yz_datawarehouse.dwd.dwd_order_fact.cost","yz_datawarehouse.dim.dim_product.revenue"] | ["order_status = 'completed'"] | [{"type":"INNER JOIN","condition":"o.product_id = p.product_id"}] | 毛利=(revenue-cost)/revenue | true | false | ["org_id","sale_date","product_id"] | false | valid | |
+  | ads_sales_daily_org_id | 组织 ID | org_id | dimension | string | direct | org_id | org_id | yz_datawarehouse_dwd.dwd_order_fact | yz_datawarehouse_dwd.dwd_order_fact.org_id |  |  | 组织标识 | false | true |  | true | valid | |
+  | ads_sales_daily_sale_date | 销售日期 | sale_date | dimension | date | direct | sale_date | DATE(sale_time) | yz_datawarehouse_dwd.dwd_order_fact | yz_datawarehouse_dwd.dwd_order_fact.sale_time |  |  | 销售日期 | false | true |  | true | valid | |
+  | ads_sales_daily_customer_id | 客户 ID | customer_id | dimension | string | direct | customer_id | customer_id | yz_datawarehouse_dwd.dwd_order_fact | yz_datawarehouse_dwd.dwd_order_fact.customer_id |  |  | 客户标识 | false | true |  | true | valid | |
+  | ads_sales_daily_sales_amount | 销售额 | sales_amount | metric | decimal | aggregation | sales_amount | SUM(order_amount) | yz_datawarehouse_dwd.dwd_order_fact | yz_datawarehouse_dwd.dwd_order_fact.order_amount | order_status = 'completed' |  | 含税销售额 | false | false | org_id,\nsale_date,\ncustomer_id | false | valid | |
+  | ads_sales_daily_order_count | 订单数 | order_count | metric | int | aggregation | order_count | COUNT(DISTINCT order_id) | yz_datawarehouse_dwd.dwd_order_fact | yz_datawarehouse_dwd.dwd_order_fact.order_id | order_status = 'completed' |  | 去重订单数 | false | false | org_id,\nsale_date,\ncustomer_id | false | valid | |
+  | ads_sales_daily_avg_order_value | 客单价 | avg_order_value | metric | decimal | expression | avg_order_value | SUM(order_amount)/COUNT(order_id) | yz_datawarehouse_dwd.dwd_order_fact | yz_datawarehouse_dwd.dwd_order_fact.order_amount,\nyz_datawarehouse_dwd.dwd_order_fact.order_id | order_status = 'completed' |  | 平均每单金额 | false | false | org_id,\nsale_date,\ncustomer_id | false | valid | |
+  | ads_sales_daily_gross_margin_rate | 毛利率 | gross_margin_rate | metric | decimal | expression | gross_margin_rate | (SUM(revenue)-SUM(cost))/SUM(revenue) | yz_datawarehouse_dwd.dwd_order_fact, yz_datawarehouse.dim.dim_product | yz_datawarehouse_dwd.dwd_order_fact.revenue, yz_datawarehouse_dwd.dwd_order_fact.cost, yz_datawarehouse.dim.dim_product.revenue | order_status = 'completed' | type:INNER JOIN, condition:o.product_id = p.product_id | 毛利= (revenue-cost)/revenue | true | false | org_id, sale_date, product_id | false | valid | |
 
   ## 【校验规则】
   1. 嵌套聚合检测：formula 含 SUM(SUM、COUNT(COUNT 等 → validation_status: invalid

@@ -9,37 +9,30 @@ from openai import OpenAI
 # 添加 data_governance_agent 到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config.config import config
+from config import config
 
 logger = logging.getLogger("SQLToMDAnalyzer")
-logging.basicConfig(level=logging.DEBUG)
-
-
-def _init_openai_client():
-    """初始化 OpenAI 客户端（DashScope 兼容模式）"""
-    api_key = config.dashscope_api_key or os.getenv("DASHSCOPE_API_KEY")
-    base_url = config.dashscope_base_url or os.getenv("DASHSCOPE_BASE_URL")
-    
-    if api_key and base_url:
-        return OpenAI(
-            api_key=api_key,
-            base_url=base_url
-        )
-    else:
-        logger.warning("未设置 DashScope API 密钥或 base_url，AI 功能可能失败")
-        return None
+logging.basicConfig(level=logging.INFO)
 
 
 class ModelClient:
     """AI 模型客户端 - 简化版"""
     
     def __init__(self):
-        api_key = os.getenv("DASHSCOPE_API_KEY") or config.dashscope_api_key
-        base_url = os.getenv("DASHSCOPE_BASE_URL") or config.dashscope_base_url
-        model = os.getenv("DASHSCOPE_CODE_MODEL") or config.dashscope_code_model
+        # 统一从配置文件读取配置
+        self.api_key = config.dashscope_api_key or os.getenv("DASHSCOPE_API_KEY")
+        self.base_url = config.dashscope_base_url or os.getenv("DASHSCOPE_BASE_URL")
+        self.model = config.dashscope_code_model or os.getenv("DASHSCOPE_CODE_MODEL")
         
-        self.client = _init_openai_client()
-        self.model = model
+        # 初始化 OpenAI 客户端
+        if self.api_key and self.base_url:
+            self.client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url
+            )
+        else:
+            logger.warning("未设置 API 密钥或 base_url，AI 功能可能失败")
+            self.client = None
     
     def call_ai(self, template_name: str, sql_content: str, sql_file: str = "") -> str:
         """
@@ -113,26 +106,16 @@ class ModelClient:
 class SQLToMDAnalyzer:
     """SQL 到 MD文档分析器 - 简化版"""
 
-    def __init__(self, config: Dict[str, Any] = None):
+    def __init__(self, md_output_dir: str = 'metric_blood'):
         """
         初始化分析器
-        
+            
         Args:
-            config: 配置字典（可选）
-                - git_sql_dir: Git 数仓 SQL 文件本地目录
-                - md_output_dir: MD文档输出根目录（默认：当前脚本目录/metric_blood）
+            md_output_dir: MD 文档输出根目录（默认：当前脚本目录/metric_blood）
         """
-        config = config or {}
-        self.git_sql_dir = config.get('git_sql_dir', '')
-        
         # 简化输出目录：当前脚本目录/metric_blood
-        if config.get('md_output_dir'):
-            self.md_output_dir = config.get('md_output_dir')
-        else:
-            self.md_output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metric_blood")
-        
-        os.makedirs(self.md_output_dir, exist_ok=True)
-        
+        self.md_output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), md_output_dir)
+        os.makedirs(self.md_output_path, exist_ok=True)
         self.model_client = ModelClient()
 
     @staticmethod
@@ -237,10 +220,12 @@ class SQLToMDAnalyzer:
         
         # 使用表名作为文件名
         md_file_name = f"{table_name}.md" if table_name else f"{file_name}.md"
-        md_path = os.path.join(self.md_output_dir, md_file_name)
+        
+        # MD 文档输出路径：当前脚本路径/metric_blood
+        md_file_path = os.path.join(self.md_output_path, md_file_name)
         
         # 智能更新检测
-        is_new_file = not os.path.exists(md_path)
+        is_new_file = not os.path.exists(md_file_path)
         update_type = "新建" if is_new_file else "更新"
         
         # 生成版本信息头
@@ -251,27 +236,30 @@ class SQLToMDAnalyzer:
             version_info += f"<!-- 变更日志：文档于 {timestamp} 更新 -->\n"
         
         # 写入文件
-        with open(md_path, "w", encoding="utf-8") as f:
+        with open(md_file_path, "w", encoding="utf-8") as f:
             f.write(version_info + md_content)
         
-        logger.info(f"{update_type} MD文档：{md_path}")
-        return md_path
+        logger.info(f"{update_type} MD文档：{md_file_path}")
+        return md_file_path
 
-    def analyze_repository(self) -> Dict[str, str]:
+    def analyze_directory(self, sql_dir: str) -> Dict[str, str]:
         """
-        分析整个 Git 仓库中的 SQL 文件
+        分析整个目录中的 SQL 文件
         
+        Args:
+            sql_dir: SQL 文件目录路径
+            
         Returns:
             分析结果字典 {sql_path: md_path}
         """
         results = {}
         
-        if not os.path.exists(self.git_sql_dir):
-            logger.error(f"Git SQL 目录不存在：{self.git_sql_dir}")
+        if not os.path.exists(sql_dir):
+            logger.error(f"SQL 目录不存在：{sql_dir}")
             return results
         
         sql_file_count = 0
-        for root, _, files in os.walk(self.git_sql_dir):
+        for root, _, files in os.walk(sql_dir):
             for file in files:
                 if file.endswith(".sql"):
                     sql_file_count += 1
@@ -286,25 +274,60 @@ class SQLToMDAnalyzer:
         
         logger.info(f"\n分析完成！共处理{sql_file_count}个 SQL 文件")
         return results
+    
+    def analyze(self, dir_path: str,file_name: str = None) -> Dict[str, str]:
+        """
+        统一分析入口：自动判断是文件还是目录
+        
+        Args:
+            dir_path: SQL 文件路径或目录路径
+            
+        Returns:
+            分析结果字典 {sql_path: md_path}
+        """
+        if not os.path.exists(dir_path):
+            logger.error(f"路径不存在：{dir_path}")
+            return {}
+
+        file_path = dir_path.join(file_name)
+        if file_name and os.path.isfile(file_path):
+            # 单个文件
+            logger.info(f"开始分析文件：{file_path}")
+            analysis_result = self.analyze_sql_file(file_path)
+            md_path = self.generate_md_file(analysis_result)
+            return {dir_path: md_path} if md_path else {}
+        
+        elif os.path.isdir(dir_path):
+            # 目录
+            logger.info(f"开始批量分析目录：{dir_path}")
+            return self.analyze_directory(dir_path)
+        
+        else:
+            logger.error(f"不支持的路径类型：{dir_path}")
+            return {}
 
 
 def main():
     """主函数 - 测试用"""
-    config = {
-        "git_sql_dir": "D://codes//yingzi-data-datawarehouse-release//source//sql//doris//fpf//hour//ads",
-    }
-    
-    analyzer = SQLToMDAnalyzer(config)
+    analyzer = SQLToMDAnalyzer()
     
     # 测试单个文件
-    target_file = "D://codes//yingzi-data-datawarehouse-release//source//sql//doris//fpf//hour//ads//ads_pig_feed_sum_month.sql"
-    if os.path.exists(target_file):
-        print(f"开始分析：{target_file}")
-        analysis_result = analyzer.analyze_sql_file(target_file)
-        md_path = analyzer.generate_md_file(analysis_result)
-        print(f"MD文档：{md_path}")
-    else:
-        print(f"错误：文件不存在 {target_file}")
+    # target_file = "D://codes//yingzi-data-datawarehouse-release//source//sql//doris//fpf//hour//ads//ads_pig_feed_sum_month.sql"
+    # if os.path.exists(target_file):
+    #     print(f"\n=== 测试单个文件 ===")
+    #     results = analyzer.analyze(target_file)
+    #     print(f"MD 文档：{list(results.values())[0]}")
+    # else:
+    #     print(f"错误：文件不存在 {target_file}")
+    
+    # 测试目录批量处理
+    target_dir = "D://codes//yingzi-data-datawarehouse-release//source//sql//doris//fpf//hour//ads"
+    if os.path.exists(target_dir):
+        print(f"\n=== 测试目录批量处理 ===")
+        results = analyzer.analyze(target_dir)
+        print(f"\n批量处理完成！共生成 {len(results)} 个 MD 文档")
+        for sql_path, md_path in results.items():
+            print(f"  {os.path.basename(sql_path)} -> {os.path.basename(md_path)}")
 
 
 if __name__ == "__main__":
