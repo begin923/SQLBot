@@ -933,6 +933,74 @@ class LLMService:
                 err = traceback.format_exc(limit=1, chain=True)
                 raise SQLBotDBError(err)
 
+    def retry_generate_sql_with_error(self, session: Session, original_sql: str, error_info: str) -> Optional[str]:
+        """SQL 执行失败时，让大模型根据错误信息重新生成 SQL
+        
+        Args:
+            session: 数据库会话
+            original_sql: 原始执行的 SQL
+            error_info: 错误信息
+            
+        Returns:
+            修复后的 SQL，如果无法修复则返回 None
+        """
+        try:
+            # 构建错误修复提示词
+            retry_message = [
+                SystemMessage(content="""你是一个 SQL 专家，擅长修复执行失败的 SQL 语句。
+我会提供：
+1. 原始 SQL 语句
+2. 执行时的错误信息
+
+请你根据错误信息分析原因，并生成修复后的正确 SQL。
+
+要求：
+- 只返回修复后的 SQL 语句，不要任何解释
+- 如果无法修复，返回：FAILED
+- 保持原有查询意图不变
+- 确保语法符合数据库规范"""),
+                HumanMessage(content=f"""原始 SQL:
+```sql
+{original_sql}
+```
+
+执行错误:
+{error_info}
+
+请修复这个 SQL:""")
+            ]
+            
+            SQLBotLogUtil.info("开始重试生成 SQL...")
+            full_retry_text = ''
+            token_usage = {}
+            
+            res = process_stream(self.llm.stream(retry_message), token_usage)
+            for chunk in res:
+                if chunk.get('content'):
+                    full_retry_text += chunk.get('content')
+            
+            SQLBotLogUtil.info(f"重试生成结果：{full_retry_text}")
+            
+            # 提取 SQL（去除可能的 markdown 标记）
+            fixed_sql = full_retry_text.strip()
+            if fixed_sql.startswith('```sql'):
+                fixed_sql = fixed_sql[6:]
+            if fixed_sql.startswith('```'):
+                fixed_sql = fixed_sql[3:]
+            if fixed_sql.endswith('```'):
+                fixed_sql = fixed_sql[:-3]
+            fixed_sql = fixed_sql.strip()
+            
+            # 如果返回 FAILED 或空，说明无法修复
+            if not fixed_sql or fixed_sql.upper() == 'FAILED':
+                return None
+            
+            return fixed_sql
+            
+        except Exception as e:
+            SQLBotLogUtil.error(f"重试生成 SQL 失败：{e}")
+            return None
+
     def pop_chunk(self):
         try:
             chunk = self.chunk_list.pop(0)
@@ -1182,7 +1250,27 @@ class LLMService:
 
 
             SQLBotLogUtil.info('execute sql: ' + real_execute_sql)
-            result = self.execute_sql(sql=real_execute_sql)
+            
+            # 执行 SQL，捕获可能的 ParseSQLResultError 并尝试修复
+            try:
+                result = self.execute_sql(sql=real_execute_sql)
+            except ParseSQLResultError as e:
+                # SQL 执行失败（如聚合字段未参与 GROUP BY），尝试让大模型修复
+                error_info = str(e)
+                SQLBotLogUtil.info(f'SQL 执行失败，尝试让大模型修复：{error_info}')
+                # 通知用户正在重新生成
+                if in_chat:
+                    yield 'data:' + orjson.dumps({'type': 'info', 'msg': f'SQL 执行失败，正在重新生成...错误信息：{error_info}'}).decode() + '\n\n'
+                # 调用大模型重新生成 SQL
+                fixed_sql = self.retry_generate_sql_with_error(_session, real_execute_sql, error_info)
+                if fixed_sql and fixed_sql != real_execute_sql:
+                    SQLBotLogUtil.info(f'大模型已修复 SQL: {fixed_sql}')
+                    real_execute_sql = fixed_sql
+                    # 重新执行修复后的 SQL
+                    result = self.execute_sql(sql=real_execute_sql)
+                else:
+                    # 无法修复，重新抛出异常
+                    raise
 
 
             _data = DataFormat.convert_large_numbers_in_object_array(result.get('data'))
