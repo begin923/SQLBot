@@ -124,6 +124,7 @@ class LLMService:
                 chat_question.engine = (ds.type_name if ds.type != 'excel' else 'PostgreSQL') + get_version(ds)
                 chat_question.db_schema = get_table_schema(session=session, current_user=current_user, ds=ds,
                                                            question=chat_question.question, embedding=embedding)
+                print(f"chat_question.db_schema:{chat_question.db_schema}")
 
         self.generate_sql_logs = list_generate_sql_logs(session=session, chart_id=chat_id)
         self.generate_chart_logs = list_generate_chart_logs(session=session, chart_id=chat_id)
@@ -546,38 +547,15 @@ class LLMService:
 
     def generate_sql(self, _session: Session):
         # 检查是否为静态SQL执行模式
-        if self.is_static_sql and self.provided_sql:
-            # 静态SQL执行模式：使用专门的提示词
-            self.sql_message.append(SystemMessage(
-                self.chat_question.static_sql_sys_question(
-                    settings.GENERATE_SQL_QUERY_LIMIT_ENABLED
-                )
-            ))
-            self.sql_message.append(HumanMessage(
-                self.chat_question.static_sql_user_question(
-                    provided_sql=self.provided_sql,
-                    change_title=self.change_title
-                )
-            ))
-        elif self.is_drill_down:
-            self.sql_message.append(SystemMessage(
-                self.chat_question.drill_down_sys_question(
-                    settings.GENERATE_SQL_QUERY_LIMIT_ENABLED
-                )
-            ))
+        if self.is_drill_down:
+            SQLBotLogUtil.info("====== 当前表下钻查询模式")
             self.sql_message.append(HumanMessage(
                 self.chat_question.drill_down_user_question()
             ))
         elif self.is_view_details :
-            # 查询明细执行模式：使用专门的提示词
-            self.sql_message.append(SystemMessage(
-                self.chat_question.view_details_sys_question(
-                    settings.GENERATE_SQL_QUERY_LIMIT_ENABLED
-                )
-            ))
-
+            SQLBotLogUtil.info("====== 下钻查询上游表明细数据模式")
             fields = self.view_details_dependencies.get('fields')
-            SQLBotLogUtil.info(f"view_details_dependencies fields: {fields}")
+            # SQLBotLogUtil.info(f"view_details_dependencies fields: {fields}")
             fields_str = ','.join(fields)
             self.sql_message.append(HumanMessage(
                 self.chat_question.view_details_user_question(
@@ -587,9 +565,6 @@ class LLMService:
             ))
         else:
             # 常规模式
-            self.sql_message.append(SystemMessage(
-                self.chat_question.sql_sys_question(self.ds.type, settings.GENERATE_SQL_QUERY_LIMIT_ENABLED)
-            ))
             # append current question
             self.sql_message.append(HumanMessage(
                 self.chat_question.sql_user_question(current_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -751,7 +726,6 @@ class LLMService:
     def generate_chart(self, _session: Session, chart_type: Optional[str] = ''):
         # append current question
         self.chart_message.append(HumanMessage(self.chat_question.chart_user_question(chart_type)))
-        print(f"chart_message: {self.chart_message}")
 
         self.current_logs[OperationEnum.GENERATE_CHART] = start_log(session=_session,
                                                                     ai_modal_id=self.chat_question.ai_modal_id,
@@ -1009,7 +983,6 @@ class LLMService:
                     self.chat_question.data_training = get_training_template(_session, self.chat_question.question,
                                                                              oid, ds_id)
 
-                print(f"self.chat_question:{self.chat_question}")
                 if SQLBotLicenseUtil.valid():
                     self.chat_question.custom_prompt = find_custom_prompts(_session,
                                                                            CustomPromptTypeEnum.GENERATE_SQL,
@@ -1059,9 +1032,10 @@ class LLMService:
             has_drilldown_keyword = "下钻" in self.chat_question.question or \
                                    "钻取" in self.chat_question.question or \
                                    "drill" in question_lower
+            has_drilldown_pre_fix = "#EXE_SQL_START#" in self.chat_question.question
 
-            # 下钻分析&明细查询
-            if has_drilldown_keyword:
+            # 静态sql下钻分析&明细查询
+            if has_drilldown_keyword and has_drilldown_pre_fix:
                 extract_result = self.metric_drilldown.get_user_intent_and_table_scope(self.llm, self.chat_question.question)
                 is_current_table = extract_result.get("is_current_table")
                 table_name = extract_result.get("table_name")
@@ -1103,7 +1077,7 @@ class LLMService:
             static_sql_keyword = "#FIXED_SQL_START#" in self.chat_question.question
             if static_sql_keyword:
                 self.provided_sql = self.static_sql_handler.check_static_sql_mode(self.chat_question.question)
-                SQLBotLogUtil.info(f"static_sql:{self.provided_sql}")
+                SQLBotLogUtil.info(f"=== 静态sql执行模式，static_sql:{self.provided_sql}")
                 self.is_static_sql = True
                 full_sql_text, sql = self.static_sql_handler.exe_static_sql(_session, in_chat , self.ds,self.provided_sql,self.record.id)
                 chart_type = self.get_chart_type_from_sql_answer(full_sql_text)
@@ -1209,6 +1183,7 @@ class LLMService:
 
             SQLBotLogUtil.info('execute sql: ' + real_execute_sql)
             result = self.execute_sql(sql=real_execute_sql)
+
 
             _data = DataFormat.convert_large_numbers_in_object_array(result.get('data'))
             result["data"] = _data

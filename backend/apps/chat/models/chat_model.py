@@ -264,23 +264,6 @@ class AiModelQuestion(BaseModel):
     def dynamic_user_question(self):
         return get_dynamic_template()['user'].format(sql=self.sql, sub_query=self.sub_query)
 
-    def static_sql_sys_question(self, enable_query_limit: bool = True):
-        """生成静态SQL执行的系统提示词"""
-        template = get_static_sql_template()
-        return template['system'].format(
-            engine=self.engine,
-            lang=self.lang
-        )
-
-    def static_sql_user_question(self, provided_sql: str, change_title: bool):
-        """生成静态SQL执行的用户提示词"""
-        template = get_static_sql_template()
-        return template['user'].format(
-            provided_sql=provided_sql,
-            question=self.question,
-            change_title=change_title
-        )
-
     def drill_down_sys_question(self, enable_query_limit: bool = True):
         """生成静态SQL执行的系统提示词"""
         template = get_drill_down_template()

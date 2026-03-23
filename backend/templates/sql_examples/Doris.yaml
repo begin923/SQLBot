@@ -30,7 +30,6 @@ template:
     <rule>在涉及多表关联的情况，部分表需要分组聚合时，请使用子查询的方式实现</rule>
     <rule>严格根据提供的表结构生成SQL，不要添加不存在的字段，特别是常见的系统字段如create_time、update_time、created_at、updated_at等</rule>
     <rule>在生成任何字段之前，必须确认该字段确实存在于提供的表结构中</rule>
-    <rule>当用户问题中存在且能提取可执行的sql时，应完全忽略<m-schema>中的表结构信息，只依据提取的SQL</rule>
 
   basic_example: |
     <basic-examples>
