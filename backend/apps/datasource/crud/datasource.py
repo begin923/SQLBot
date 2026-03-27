@@ -468,8 +468,12 @@ def updateNum(session: SessionDep, ds: CoreDatasource):
     session.commit()
 
 
-def get_table_obj_by_ds(session: SessionDep, current_user: CurrentUser, ds: CoreDatasource) -> List[TableAndFields]:
+def get_table_obj_by_ds(session: SessionDep, current_user: CurrentUser, ds: CoreDatasource, table_name_list: List[str] = None) -> List[TableAndFields]:
     _list: List = []
+    if table_name_list:
+        tables = session.query(CoreTable).filter(and_(CoreTable.ds_id == ds.id, CoreTable.table_name.in_(table_name_list))).all()
+    else:
+        tables = session.query(CoreTable).filter(CoreTable.ds_id == ds.id).all()
     tables = session.query(CoreTable).filter(CoreTable.ds_id == ds.id).all()
     conf = DatasourceConf(**json.loads(aes_decrypt(ds.configuration))) if ds.type != "excel" else get_engine_config()
     schema = conf.dbSchema if conf.dbSchema is not None and conf.dbSchema != "" else conf.database
@@ -499,9 +503,9 @@ def get_table_obj_by_ds(session: SessionDep, current_user: CurrentUser, ds: Core
 
 
 def get_table_schema(session: SessionDep, current_user: CurrentUser, ds: CoreDatasource, question: str,
-                     embedding: bool = True) -> str:
+                     embedding: bool = True, table_name_list: List[str] = None) -> str:
     schema_str = ""
-    table_objs = get_table_obj_by_ds(session=session, current_user=current_user, ds=ds)
+    table_objs = get_table_obj_by_ds(session=session, current_user=current_user, ds=ds,table_name_list=table_name_list)
     if len(table_objs) == 0:
         return schema_str
     db_name = table_objs[0].schema
@@ -536,9 +540,11 @@ def get_table_schema(session: SessionDep, current_user: CurrentUser, ds: CoreDat
         tables.append(t_obj)
         all_tables.append(t_obj)
 
-    # do table embedding
-    if embedding and tables and settings.TABLE_EMBEDDING_ENABLED:
-        tables = calc_table_embedding(tables, question)
+    # 没有传入table_name_list，则进行embedding
+    if not table_name_list:
+        # do table embedding
+        if embedding and tables and settings.TABLE_EMBEDDING_ENABLED:
+            tables = calc_table_embedding(tables, question)
     # splice schema
     if tables:
         for s in tables:

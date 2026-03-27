@@ -12,13 +12,11 @@
     2. 调用 handle_drilldown_for_llm() 处理下钻逻辑
     3. 根据返回值决定后续操作
 """
-import os
-import re
 import json
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, Any, List
 
 from common.utils.utils import SQLBotLogUtil
-from apps.extend.parse_md_to_json import ParseMDToJson
+from apps.extend.format.parse_md_to_json import ParseMDToJson
 
 
 class MetricDrilldownHandler:
@@ -32,38 +30,94 @@ class MetricDrilldownHandler:
         """
         self.parser = ParseMDToJson()
 
-    # ========== 公共静态方法：llm.py 调用入口 ==========
-    
-    @staticmethod
-    def handle_drilldown_for_llm(llm_service, question: str, llm_client) -> bool:
+    def get_metric_from_question(self, llm_client, question: str) -> List[str]:
         """
-        为 llm.py 提供的下钻处理辅助方法 (主入口)
+        从用户问题中提取指标名称列表
         
-        流程:
-        1. 调用 decide_table_scope 判断意图并提取表名
-        2. 返回 False，让 llm.py 继续处理（添加表到数据源后由大模型生成 SQL）
+        功能：分析用户问题，提取其中提到的指标字段名
         
         Args:
-            llm_service: LLMService 实例 (用于设置 is_static_sql 和 provided_sql)
-            question: 用户问题
             llm_client: LLM 客户端实例
+            question: 用户问题
             
         Returns:
-            bool: 是否已处理下钻 (始终返回 False，因为只提取表名，不设置静态 SQL)
+            List[str]: 指标名称列表
+            
+        示例:
+            输入："查询 d7_sum 和 app_feed 的明细数据"
+            输出：["d7_sum", "app_feed"]
         """
+        from langchain_core.messages import HumanMessage
+        import json
+        
+        # 构建提示词：让 LLM 提取指标名称
+        prompt = f"""# 角色
+你是数据字段提取专家。
+
+# 任务
+从用户问题中提取所有提到的指标名称（字段名）。
+
+# 用户问题
+{question}
+
+# 提取规则
+1. **识别指标字段**：提取用户提到的具体指标名称（中文或英文）
+2. **排除非指标词汇**：
+   - 动词类：查询、统计、汇总、分析、查看、展示、显示
+   - 名词类：数据、指标、明细、维度、总和、平均值、最大值、最小值
+   - 时间类：年、月、日、季度、年度、月度（除非是字段名如 dt_year）
+   - 其他：按、的、和、与、及、等
+3. **保留原始名称**：
+   - 如果用户说的是中文字段名（如：销售额），就输出中文
+   - 如果用户说的是英文字段名（如：d7_sum），就输出英文
+   - 不要翻译或转换用户使用的名称
+4. **注意上下文**：
+   - 如果用户说"XX 指标"，XX 就是要提取的字段
+   - 如果用户说"XX 字段"，XX 就是要提取的字段
+   - 如果用户说"XX 的明细/汇总/统计"，XX 就是要提取的字段
+5. **返回纯指标名称列表**：不要包含其他信息
+
+# 输出格式
+严格按照以下 JSON 格式输出:
+{{
+    "metrics": ["指标 1", "指标 2", ...]
+}}
+
+# 示例（全部是纯中文提问）
+## 示例 1 - 中文指标名
+输入："查看销售额和销售量的趋势"
+输出：{{"metrics": ["销售额", "销售量"]}}
+
+## 示例 2 - 带维度的查询
+输入："按部门统计员工人数和平均工资"
+输出：{{"metrics": ["员工人数", "平均工资"]}}
+
+## 示例 3 - 单个指标
+输入："下钻指标销售额"
+输出：{{"metrics": ["销售额"]}}
+
+## 示例 4 - 泛指业务词汇
+输入："查看月度销售数据"
+输出：{{"metrics": ["销售"]}}
+
+请根据上述规则，从用户问题中提取指标名称。保留用户使用的原始名称（中文或英文）。"""
+        
+        # 调用 LLM 提取
+        response = llm_client.invoke([HumanMessage(content=prompt)])
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        SQLBotLogUtil.info(f"Metric extraction response: {response_text}")
+        
+        # 解析 JSON 结果
         try:
-            # 1. 调用 decide_table_scope LLM 判断当前表/上游表并提取表名
-            extract_result = MetricDrilldownHandler.get_user_intent_and_table_scope(llm_client, question)
-            
-            # 2. 返回 False，让 llm.py 继续处理（添加表到数据源后由大模型生成 SQL）
-            SQLBotLogUtil.info('Extracted table name from drilldown query, let llm.py handle SQL generation')
-            return False
-            
+            result = json.loads(response_text, strict=False)
+            metrics = result.get("metrics", [])
+            return metrics if isinstance(metrics, list) else []
         except Exception as e:
-            SQLBotLogUtil.error(f'Error in handle_drilldown_for_llm: {str(e)}')
-            return False
-    
-    # ========== 辅助工具方法 ==========
+            SQLBotLogUtil.error(f"Failed to parse LLM response: {str(e)}")
+            return []
+
+
+
     def get_user_intent_and_table_scope(self, llm_client, question: str) -> Dict[str, Any]:
         """
         分析用户意图和表范围
@@ -208,236 +262,10 @@ class MetricDrilldownHandler:
             SQLBotLogUtil.warning(f"Failed to parse MD for table {table_name}: {result.get('error')}")
         
         return result
-    
-    def _build_upstream_tables_info(self, field_blood: Dict) -> str:
-        """
-        构建上游表信息 XML
-        
-        Args:
-            field_blood: 血缘字段数据
-            
-        Returns:
-            上游表信息 XML 字符串
-        """
-        upstream_map = {}
-        
-        for target_field, blood_records in field_blood.items():
-            for record in blood_records:
-                source_field = record.get("源字段")
-                if not source_field:
-                    continue
-                
-                # 从源字段中提取表名
-                source_parts = source_field.split('.')
-                if len(source_parts) >= 2:
-                    source_table = '.'.join(source_parts[:-1])
-                else:
-                    continue
-                
-                # 只关注 ads/dws/dwd/ods 层的表 (上游表，更明细的数据)
-                if not any(prefix in source_table.lower() for prefix in ['ads','dws', 'dwd', 'dim', 'ods']):
-                    continue
-                
-                if source_table not in upstream_map:
-                    upstream_map[source_table] = {
-                        'table_name': source_table,
-                        'fields': [],
-                        'metrics': []
-                    }
-                
-                upstream_map[source_table]['fields'].append(source_field)
-                
-                # 判断是否是指标
-                field_type = record.get("字段类型", "")
-                if field_type == "指标":
-                    upstream_map[source_table]['metrics'].append({
-                        'field': source_field.split('.')[-1],
-                        'aggregation': record.get("聚合方式", "")
-                    })
-        
-        # 构建 XML
-        xml_lines = [f"<upstream-table-count>{len(upstream_map)}</upstream-table-count>"]
-        
-        for i, us_table in enumerate(upstream_map.values(), 1):
-            xml_lines.append(f"<upstream-table-{i}>")
-            xml_lines.append(f"  <table-name>{us_table['table_name']}</table-name>")
-            xml_lines.append(f"  <available-fields>{len(us_table['fields'])}</available-fields>")
-            if us_table['metrics']:
-                xml_lines.append(f"  <metrics-count>{len(us_table['metrics'])}</metrics-count>")
-            xml_lines.append(f"</upstream-table-{i}>")
-        
-        return "\n".join(xml_lines)
 
 
 
     # ========== 核心业务方法：下钻分析完整流程 ==========
-    
-    @staticmethod
-    def handle_drilldown_analysis(llm_service, session):
-        """
-        处理下钻分析的完整流程 (主入口)
-        
-        流程:
-        1. 检测"下钻/钻取/drill"关键词
-        2. 调用 handle_drilldown_for_llm() 判断意图
-        3. 如果返回 True → 已设置静态 SQL 模式，直接返回
-        4. 如果返回 False → 继续基于血缘生成 SQL
-        
-        Args:
-            llm_service: LLMService 实例
-            session: 数据库会话
-        """
-        from common.utils.utils import SQLBotLogUtil
-
-        # 使用新的静态方法处理下钻逻辑
-        handled = MetricDrilldownHandler.handle_drilldown_for_llm(
-            llm_service=llm_service,
-            question=llm_service.chat_question.question,
-            llm_client=llm_service.llm
-        )
-
-        extract_result = MetricDrilldownHandler.get_user_intent_and_table_scope(llm_service.llm, llm_service.chat_question.question)
-
-        if handled:
-            # 已处理下钻且提供了 SQL，直接返回
-            SQLBotLogUtil.info("Drilldown query handled by metric_drilldown module (static SQL mode set)")
-            return
-
-        # 未提供 SQL，需要继续处理 (基于血缘生成 SQL)
-        SQLBotLogUtil.info("No SQL provided for drilldown, generating SQL based on bloodline")
-
-        # 应用指标下钻技能，提取血缘信息
-        try:
-            parse_res = MetricDrilldownHandler._apply_metric_drilldown_skill(llm_service)
-            SQLBotLogUtil.info(f"Drilldown analysis completed - result: {parse_res}")
-
-            # 从解析结果中提取血缘信息
-            field_blood = parse_res.get('field_blood', {}) if isinstance(parse_res, dict) else {}
-
-            # 基于血缘信息调用 LLM 生成 SQL
-            if field_blood:
-                # 调用 LLM 生成 SQL
-                generated_sql = MetricDrilldownHandler.generate_drilldown_sql_by_llm(llm_service, field_blood)
-
-                if generated_sql:
-                    # 设置为静态 SQL 模式
-                    llm_service.is_static_sql = True
-                    llm_service.provided_sql = generated_sql
-                    SQLBotLogUtil.info(f"Generated SQL by LLM for drilldown: {generated_sql}")
-                    SQLBotLogUtil.info(f"Set is_static_sql={llm_service.is_static_sql}, provided_sql={llm_service.provided_sql}")
-                else:
-                    SQLBotLogUtil.warning("LLM failed to generate SQL, using fallback simple SQL")
-
-                    # 降级方案：使用简单的 SQL 拼接
-                    target_fields = list(field_blood.keys())
-                    source_tables = set()
-                    for field_name, blood_records in field_blood.items():
-                        for record in blood_records:
-                            source_table = record.get('源表', '')
-                            if source_table:
-                                source_tables.add(source_table)
-
-                    if source_tables and target_fields:
-                        source_table = list(source_tables)[0]
-                        sql = f"SELECT " + ", ".join(target_fields) + f" FROM {source_table}"
-                        llm_service.is_static_sql = True
-                        llm_service.provided_sql = sql
-                        SQLBotLogUtil.info(f"Built fallback SQL: {sql}")
-                    else:
-                        SQLBotLogUtil.warning("Cannot build fallback SQL due to missing source tables or fields")
-            elif not field_blood:
-                SQLBotLogUtil.warning("No field_blood found, cannot generate drilldown SQL")
-
-        except Exception as e:
-            SQLBotLogUtil.error(f"Failed to apply drilldown skill: {str(e)}")
-    
-    @staticmethod
-    def _apply_metric_drilldown_skill(llm_service):
-        """
-        应用指标下钻技能到当前查询
-        
-        流程:
-        1. 检测用户问题是否包含下钻需求
-        2. 使用 LLM 从问题中提取表名和指标
-        3. 解析血缘 MD 文档，找到字段血缘关系
-           血缘关系：ods(源数据) -> dwd(明细) -> dws(服务) -> ads(应用/汇总)
-        4. 将血缘信息添加到 custom_prompt 中，供后续 SQL 生成使用
-        
-        Args:
-            llm_service: LLMService 实例
-            
-        Returns:
-            dict: 与 parse_md_blood 相同的格式
-                  {
-                      "table_name": str,
-                      "field_blood": {}
-                  }
-        """
-        from common.utils.utils import SQLBotLogUtil
-        
-        try:
-            analyzer = MetricDrilldownHandler()
-
-            # 使用传入的 LLM 客户端进行分析
-            parse_res = MetricDrilldownHandler.get_user_intent_and_table_scope(
-                llm_client=llm_service.llm,  # 复用 LLMService 中的 llm 实例
-                question=llm_service.chat_question.question
-            )
-            SQLBotLogUtil.info(f"Metric drilldown result: {parse_res}")
-            
-            # 确保返回格式与 parse_md_blood 一致
-            if not parse_res:
-                SQLBotLogUtil.warning("Empty parse result from analyze_metric_and_table")
-                return {
-                    "table_name": "",
-                    "field_blood": {}
-                }
-            
-            if not isinstance(parse_res, dict):
-                SQLBotLogUtil.warning(f"Invalid parse result type: {type(parse_res)}, expected dict")
-                return {
-                    "table_name": "",
-                    "field_blood": {}
-                }
-            
-            # 提取血缘信息并构建提示词
-            field_blood = parse_res.get('field_blood', {})
-            table_name = parse_res.get('table_name', '')
-            
-            # 构建血缘关系描述
-            blood_desc_lines = []
-            if field_blood and table_name:
-                for target_field, blood_records in field_blood.items():
-                    for record in blood_records:
-                        source_field = record.get('源字段', '')
-                        conversion = record.get('转换逻辑', '')
-                        
-                        if source_field and conversion:
-                            blood_desc_lines.append(f"- {target_field} ← {source_field} ({conversion})")
-                
-                if blood_desc_lines:
-                    blood_desc = "\n【字段血缘关系】\n" + "\n".join(blood_desc_lines)
-                    # 将血缘信息添加到 custom_prompt 中
-                    if llm_service.chat_question.custom_prompt:
-                        llm_service.chat_question.custom_prompt += blood_desc
-                    else:
-                        llm_service.chat_question.custom_prompt = blood_desc
-                    SQLBotLogUtil.info(f"Added bloodline info to prompt")
-            
-            # 返回与 parse_md_blood 相同格式的结果
-            return {
-                "table_name": table_name,
-                "field_blood": field_blood
-            }
-            
-        except Exception as e:
-            # 下钻技能应用失败不影响主流程
-            SQLBotLogUtil.error(f"Error applying metric drilldown skill: {str(e)}")
-            return {
-                "table_name": "",
-                "field_blood": {}
-            }
-    
     @staticmethod
     def generate_drilldown_sql_by_llm(llm_service, field_blood: dict):
         """
@@ -664,7 +492,7 @@ if __name__ == "__main__":
     MD_BASE_DIR = r"D:\codes\AIDataEasy\data_governance_agent\sql_to_md\data_governance_md"
     
     # 创建分析器
-    analyzer = MetricDrilldownHandler(MD_BASE_DIR)
+    analyzer = MetricDrilldownHandler()
     
     # 测试表名
     test_table = "yz_datawarehouse_ads.ads_algo_female_batch_production"

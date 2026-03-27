@@ -63,7 +63,7 @@ class Config:
         """加载环境变量文件"""
         # 获取当前脚本所在目录
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        env_path = os.path.join(base_dir, '.env')
+        env_path = os.path.join(base_dir, '../.env')
         template_path = os.path.join(base_dir, '.env.template')
         
         # 优先加载.env，如果不存在则加载.env.template

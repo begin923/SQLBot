@@ -639,7 +639,7 @@ template:
       年 (dt_year) → 月 (dt_month) → 日 (dt_day)
       下钻时必须保留上层维度，不能跳过中间层级
     user: |
-      {user_question}
+      {question}
 
   view_details:
     system: |
@@ -651,7 +651,7 @@ template:
     user: |
       查询表名：{table_name}
       指标计算字段：{calculation_fields}，多个字段用逗号分隔
-      用户问题：{user_question}
+      用户问题：{question}
 
       生成要求：
       1. 仅生成SQL语句，不要任何额外解释

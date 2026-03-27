@@ -1,7 +1,6 @@
 import concurrent
 import json
 import os
-import re
 import traceback
 import urllib.parse
 import warnings
@@ -39,6 +38,7 @@ from apps.datasource.crud.permission import get_row_permission_filters, is_norma
 from apps.datasource.embedding.ds_embedding import get_ds_embedding
 from apps.datasource.models.datasource import CoreDatasource
 from apps.db.db import exec_sql, get_version, check_connection, get_fields
+from apps.extend.metric_metadata.curd.metric_metadata import get_metric_metadata_by_names
 from apps.system.crud.assistant import AssistantOutDs, AssistantOutDsFactory, get_assistant_ds
 from apps.system.schemas.system_schema import AssistantOutDsSchema
 from apps.terminology.curd.terminology import get_terminology_template
@@ -61,8 +61,8 @@ dynamic_subsql_prefix = 'select * from sqlbot_dynamic_temp_table_'
 
 session_maker = scoped_session(sessionmaker(bind=engine, class_=Session))
 
-from apps.extend.metric_drilldown_handler import MetricDrilldownHandler
-from apps.extend.static_sql_handler import StaticSQLHandler
+from apps.extend.drilldown.metric_drilldown_handler import MetricDrilldownHandler
+from apps.extend.static.static_sql_handler import StaticSQLHandler
 
 
 class LLMService:
@@ -547,29 +547,29 @@ class LLMService:
 
     def generate_sql(self, _session: Session):
         # 检查是否为静态SQL执行模式
-        if self.is_drill_down:
-            SQLBotLogUtil.info("====== 当前表下钻查询模式")
-            self.sql_message.append(HumanMessage(
-                self.chat_question.drill_down_user_question()
-            ))
-        elif self.is_view_details :
-            SQLBotLogUtil.info("====== 下钻查询上游表明细数据模式")
-            fields = self.view_details_dependencies.get('fields')
-            # SQLBotLogUtil.info(f"view_details_dependencies fields: {fields}")
-            fields_str = ','.join(fields)
-            self.sql_message.append(HumanMessage(
-                self.chat_question.view_details_user_question(
-                    table_name=self.view_details_dependencies.get('table'),
-                    calculation_fields=fields_str
-                )
-            ))
-        else:
+        # if self.is_drill_down:
+        #     SQLBotLogUtil.info("====== 当前表下钻查询模式")
+        #     self.sql_message.append(HumanMessage(
+        #         self.chat_question.drill_down_user_question()
+        #     ))
+        # elif self.is_view_details :
+        #     SQLBotLogUtil.info("====== 下钻查询上游表明细数据模式")
+        #     fields = self.view_details_dependencies.get('fields')
+        #     # SQLBotLogUtil.info(f"view_details_dependencies fields: {fields}")
+        #     fields_str = ','.join(fields)
+        #     self.sql_message.append(HumanMessage(
+        #         self.chat_question.view_details_user_question(
+        #             table_name=self.view_details_dependencies.get('table'),
+        #             calculation_fields=fields_str
+        #         )
+        #     ))
+        # else:
             # 常规模式
             # append current question
-            self.sql_message.append(HumanMessage(
-                self.chat_question.sql_user_question(current_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                                     change_title=self.change_title)
-            ))
+        self.sql_message.append(HumanMessage(
+            self.chat_question.sql_user_question(current_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                                 change_title=self.change_title)
+        ))
 
 
         self.current_logs[OperationEnum.GENERATE_SQL] = start_log(session=_session,
@@ -1102,44 +1102,60 @@ class LLMService:
                                    "drill" in question_lower
             has_drilldown_pre_fix = "#EXE_SQL_START#" in self.chat_question.question
 
+            # 从用户问题中提取指标
+            metrics = self.metric_drilldown.get_metric_from_question(self.llm, self.chat_question.question)
+            metric_info_list = get_metric_metadata_by_names(_session ,metrics)
+            print(f"metric_info_list:{metric_info_list}")
+            table_name_list = []
+            for metric in metric_info_list:
+                table_name_list.append(metric.table_name)
+                status = self.static_sql_handler.add_table_to_ds(self.ds, metric.table_name)
+
+            self.chat_question.db_schema = get_table_schema(session=_session,
+                                                            current_user=self.current_user, ds=self.ds,
+                                                            question=self.chat_question.question,
+                                                            table_name_list= table_name_list)
+            # 初始化，刷新最新表结构
+            self.init_messages()
+
             # 静态sql下钻分析&明细查询
-            if has_drilldown_keyword and has_drilldown_pre_fix:
-                extract_result = self.metric_drilldown.get_user_intent_and_table_scope(self.llm, self.chat_question.question)
-                is_current_table = extract_result.get("is_current_table")
-                table_name = extract_result.get("table_name")
-                # TODO 默认第一个，后续优化
-                source_metrics = extract_result.get("metrics")[0]
-                metric_blood_data = self.metric_drilldown.extract_metric_blood_from_md(table_name)
-                metric_blood = metric_blood_data.get("data", {}).get("metrics", {})
-                metrics = extract_result.get("metrics")
-                SQLBotLogUtil.info(f"metrics: {metrics}")
-                metric_detail = metric_blood.get(source_metrics)
-                SQLBotLogUtil.info(f"metric_detail: {metric_detail}")
-                if is_current_table:
-                    # 添加表到数据源中，然后基于用户问题走常规流程即可
-                    SQLBotLogUtil.info(f"Drilldown table_name: {table_name}")
-                    # 添加表到数据源并返回表结构
-                    status = self.static_sql_handler.add_table_to_ds(self.ds, table_name)
-                    self.is_drill_down = True
-                    chart_type = 'table'  # 下钻场景默认使用表格
-                else:
-                    # 查询上游明细数据
-                    metric_detail_list = []
-                    depend_tables = set()  # 使用 set 去重
-                    if metric_detail:
-                        metric_detail_list.append(metric_detail)
-                        self.view_details_dependencies = metric_detail.get("calculation",{}).get("dependencies",[])[0]
-                        # for dependency in self.view_details_dependencies:
-                        table = self.view_details_dependencies.get("table")
-                        if table:  # 确保表名不为空
-                            depend_tables.add(table)  # 使用 add 添加到 set
-                    SQLBotLogUtil.info(f"metric_detail_list:{metric_detail_list}")
-                    SQLBotLogUtil.info(f"depend_tables:{depend_tables}")
-                    # 遍历 set 添加表到数据源
-                    for depend_table in depend_tables:
-                        status = self.static_sql_handler.add_table_to_ds(self.ds, depend_table)
-                        # TODO 根据状态重试或者其他操作 ，待定
-                    self.is_view_details = True
+            # if has_drilldown_keyword and has_drilldown_pre_fix:
+            #     extract_result = self.metric_drilldown.get_user_intent_and_table_scope(self.llm, self.chat_question.question)
+            #     is_current_table = extract_result.get("is_current_table")
+            #     table_name = extract_result.get("table_name")
+            #     # TODO 默认第一个，后续优化
+            #     source_metrics = extract_result.get("metrics")[0]
+            #     metric_blood_data = self.metric_drilldown.extract_metric_blood_from_md(table_name)
+            #     metric_blood = metric_blood_data.get("data", {}).get("metrics", {})
+            #     metrics = extract_result.get("metrics")
+            #     SQLBotLogUtil.info(f"metrics: {metrics}")
+            #     metric_detail = metric_blood.get(source_metrics)
+            #     SQLBotLogUtil.info(f"metric_detail: {metric_detail}")
+            #     if is_current_table:
+            #         # 添加表到数据源中，然后基于用户问题走常规流程即可
+            #         SQLBotLogUtil.info(f"Drilldown table_name: {table_name}")
+            #         # 添加表到数据源并返回表结构
+            #         status = self.static_sql_handler.add_table_to_ds(self.ds, table_name)
+            #         self.is_drill_down = True
+            #         chart_type = 'table'  # 下钻场景默认使用表格
+            #     else:
+            #         # 查询上游明细数据
+            #         metric_detail_list = []
+            #         depend_tables = set()  # 使用 set 去重
+            #         if metric_detail:
+            #             metric_detail_list.append(metric_detail)
+            #             self.view_details_dependencies = metric_detail.get("calculation",{}).get("dependencies",[])[0]
+            #             # for dependency in self.view_details_dependencies:
+            #             table = self.view_details_dependencies.get("table")
+            #             if table:  # 确保表名不为空
+            #                 depend_tables.add(table)  # 使用 add 添加到 set
+            #         SQLBotLogUtil.info(f"metric_detail_list:{metric_detail_list}")
+            #         SQLBotLogUtil.info(f"depend_tables:{depend_tables}")
+            #         # 遍历 set 添加表到数据源
+            #         for depend_table in depend_tables:
+            #             status = self.static_sql_handler.add_table_to_ds(self.ds, depend_table)
+            #             # TODO 根据状态重试或者其他操作 ，待定
+            #         self.is_view_details = True
 
             # 执行静态 sql
             static_sql_keyword = "#FIXED_SQL_START#" in self.chat_question.question
@@ -1170,7 +1186,7 @@ class LLMService:
                 chart_type = self.get_chart_type_from_sql_answer(full_sql_text)
 
                 # 常规处理流程
-                sql, tables = self.check_sql(res=full_sql_text)
+                sql, table_name_list = self.check_sql(res=full_sql_text)
 
             # return title
             if self.change_title:
@@ -1198,16 +1214,16 @@ class LLMService:
                 # row permission
                 if ((not self.current_assistant or is_page_embedded) and is_normal_user(
                         self.current_user)) or use_dynamic_ds:
-                    sql, tables = self.check_sql(res=full_sql_text)
+                    sql, table_name_list = self.check_sql(res=full_sql_text)
                     sql_result = None
 
                     if use_dynamic_ds:
-                        dynamic_sql_result = self.generate_assistant_dynamic_sql(_session, sql, tables)
+                        dynamic_sql_result = self.generate_assistant_dynamic_sql(_session, sql, table_name_list)
                         sqlbot_temp_sql_text = dynamic_sql_result.get(
                             'sqlbot_temp_sql_text') if dynamic_sql_result else None
                         # sql_result = self.generate_assistant_filter(sql, tables)
                     else:
-                        sql_result = self.generate_filter(_session, sql, tables)  # maybe no sql and tables
+                        sql_result = self.generate_filter(_session, sql, table_name_list)  # maybe no sql and tables
 
                     if sql_result:
                         SQLBotLogUtil.info(sql_result)

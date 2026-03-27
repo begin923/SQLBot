@@ -273,7 +273,7 @@ class AiModelQuestion(BaseModel):
         """生成静态SQL执行的用户提示词"""
         template = get_drill_down_template()
         return template['user'].format(
-            user_question=self.question
+            question=self.question
         )
 
     def view_details_sys_question(self, enable_query_limit: bool = True):
@@ -285,7 +285,7 @@ class AiModelQuestion(BaseModel):
         """生成静态SQL执行的用户提示词"""
         template = get_view_details_template()
         return template['user'].format(
-            user_question=self.question,
+            question=self.question,
             calculation_fields=calculation_fields,
             table_name=table_name,
         )
