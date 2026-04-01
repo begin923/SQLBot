@@ -36,7 +36,7 @@ from apps.data_training.curd.data_training import get_training_template
 from apps.datasource.crud.datasource import get_table_schema
 from apps.datasource.crud.permission import get_row_permission_filters, is_normal_user
 from apps.datasource.embedding.ds_embedding import get_ds_embedding
-from apps.datasource.models.datasource import CoreDatasource
+from apps.datasource.models.datasource import CoreDatasource, CoreTable
 from apps.db.db import exec_sql, get_version, check_connection, get_fields
 from apps.extend.metric_metadata.curd.metric_metadata import get_metric_metadata_by_names
 from apps.system.crud.assistant import AssistantOutDs, AssistantOutDsFactory, get_assistant_ds
@@ -160,11 +160,64 @@ class LLMService:
         else:
             self.chat_question.error_msg = ''
 
-        # 初始化静态SQL处理对象
+        # 初始化静态 SQL 处理对象
         self.static_sql_handler = StaticSQLHandler()
-
+    
         # 初始化指标钻取分析对象
         self.metric_drilldown = MetricDrilldownHandler()
+        
+    def _batch_add_tables_to_ds(self, session, table_names: List[str]):
+        """
+        批量添加表到数据源，避免重复触发 embedding
+            
+        Args:
+            session: 数据库会话
+            table_names: 表名列表
+        """
+        if not table_names:
+            return
+            
+        try:
+            # 获取已有表
+            existing_tables = session.query(CoreTable).filter(
+                CoreTable.ds_id == self.ds.id
+            ).all()
+            existing_table_names = {table.table_name for table in existing_tables}
+                
+            # 过滤出新表
+            new_table_names = [name for name in table_names if name not in existing_table_names]
+                
+            if not new_table_names:
+                SQLBotLogUtil.info(f"所有表已存在于数据源中")
+                return
+                
+            # 构造新表对象
+            new_tables = []
+            for table_name in new_table_names:
+                table_obj = CoreTable(
+                    ds_id=self.ds.id,
+                    checked=True,
+                    table_name=table_name,
+                    table_comment="",
+                    custom_comment=""
+                )
+                new_tables.append(table_obj)
+                SQLBotLogUtil.info(f"准备添加新表：{table_name}")
+                
+            # 批量添加并触发一次 embedding
+            if new_tables:
+                from apps.datasource.crud.datasource import chooseTables
+                from common.core.deps import Trans
+                all_tables = existing_tables + new_tables
+                trans = Trans()
+                chooseTables(session, trans, self.ds.id, all_tables)
+                session.commit()
+                SQLBotLogUtil.info(f"批量添加 {len(new_tables)} 个表到数据源完成")
+            
+        except Exception as e:
+            SQLBotLogUtil.error(f"批量添加表失败：{e}")
+            import traceback
+            traceback.print_exc()
 
     @classmethod
     async def create(cls, *args, **kwargs):
@@ -1109,14 +1162,21 @@ class LLMService:
             table_name_list = []
             for metric in metric_info_list:
                 table_name_list.append(metric.table_name)
-                status = self.static_sql_handler.add_table_to_ds(self.ds, metric.table_name)
-
+            
+            # 批量添加指标表到数据源（避免重复触发 embedding）
+            if table_name_list:
+                self._batch_add_tables_to_ds(_session, table_name_list)
+            
             self.chat_question.db_schema = get_table_schema(session=_session,
                                                             current_user=self.current_user, ds=self.ds,
                                                             question=self.chat_question.question,
                                                             table_name_list= table_name_list)
             # 初始化，刷新最新表结构
             self.init_messages()
+
+            # 遍历 set 添加表到数据源（合并去重）
+            for depend_table in table_name_list:
+                status = self.static_sql_handler.add_table_to_ds(self.ds, depend_table)
 
             # 静态sql下钻分析&明细查询
             # if has_drilldown_keyword and has_drilldown_pre_fix:

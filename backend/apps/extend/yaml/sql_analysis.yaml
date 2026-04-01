@@ -71,7 +71,7 @@ metric_blood: |
 
   > 💡 说明：字段为列，单行数据展示
 
-  | file_name | target_table_id | target_table_name | warehouse_layer | created_at | updated_at | sql_type | database_type | source_system | version |
+  | file_name | table_name | table_desc | warehouse_layer | created_at | updated_at | sql_type | database_type | source_system | version |
   |-----------|-----------------|-------------------|-----------------|------------|------------|----------|---------------|---------------|---------|
   | {sql_file} | {target_table} | {表中文名} | {warehouse_layer} | {current_time} | {current_time} | {sql_type} | {database_type} | {source_system} | 1.0 |
 
@@ -91,7 +91,7 @@ metric_blood: |
 
   ## 基本信息
 
-  | file_name | target_table_id | target_table_name | warehouse_layer | created_at | updated_at | sql_type | database_type | source_system | version |
+  | file_name | table_name | table_desc | warehouse_layer | created_at | updated_at | sql_type | database_type | source_system | version |
   |-----------|-----------------|-------------------|-----------------|------------|------------|----------|---------------|---------------|---------|
   | ads_sales_daily.sql | yz_datawarehouse.ads.ads_sales_daily | 销售日报表 | ads | 2026-03-18T09:59:00Z | 2026-03-18T09:59:00Z | INSERT_INTO_SELECT | mysql | yz_datawarehouse | 1.0 |
 

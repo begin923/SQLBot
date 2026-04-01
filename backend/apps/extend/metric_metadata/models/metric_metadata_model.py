@@ -12,6 +12,7 @@ class MetricMetadata(SQLModel, table=True):
     
     id: Optional[int] = Field(sa_column=Column(BigInteger, Identity(always=True), primary_key=True))
     metric_name: str = Field(sa_column=Column(String(100), nullable=False))
+    metric_column: Optional[str] = Field(sa_column=Column(String(100), nullable=True))  # 指标字段名
     synonyms: Optional[str] = Field(sa_column=Column(Text, nullable=True))
     datasource_id: Optional[int] = Field(sa_column=Column(BigInteger, nullable=True))
     table_name: str = Field(sa_column=Column(String(100), nullable=False))
@@ -27,6 +28,7 @@ class MetricMetadataInfo(BaseModel):
     """指标元数据信息对象"""
     id: Optional[int] = None
     metric_name: Optional[str] = None
+    metric_column: Optional[str] = None  # 指标字段名
     synonyms: Optional[str] = None  # 逗号分隔的同义词
     datasource_id: Optional[int] = None
     table_name: Optional[str] = None

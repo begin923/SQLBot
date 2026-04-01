@@ -6,10 +6,14 @@ Converts structured Markdown documentation to standardized JSON format
 """
 
 import json
+import os
 import re
 import sys
 import ast
 from typing import Dict, List, Any, Optional
+
+# 导入指标元数据模型
+from apps.extend.metric_metadata.models.metric_metadata_model import MetricMetadataInfo
 
 
 class ParseMDToJson:
@@ -53,10 +57,10 @@ class ParseMDToJson:
                             if idx < len(cells):
                                 if header == 'file_name':
                                     result['file_name'] = cells[idx]
-                                elif header == 'target_table_id':
-                                    result['target_table_id'] = cells[idx]
-                                elif header == 'target_table_name':
+                                elif header == 'table_name':  # table_name 映射到 target_table_name
                                     result['target_table_name'] = cells[idx]
+                                elif header == 'table_desc':  # table_desc 映射到 target_table_desc
+                                    result['target_table_desc'] = cells[idx]
                                 elif header == 'warehouse_layer':
                                     result['warehouse_layer'] = cells[idx]
                                 elif header == 'updated_at':
@@ -243,7 +247,7 @@ class ParseMDToJson:
 
 
     def create_json_result(self,basic_info: Dict[str, str], metrics: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-        """创建最终的JSON结果"""
+        """创建最终的 JSON 结果"""
         return {
             "success": True,
             "data": {
@@ -253,8 +257,9 @@ class ParseMDToJson:
                     "source_system": "datawarehouse"
                 },
                 "target": {
-                    "table_id": basic_info['target_table_id'],
-                    "table_name": "母猪批次生产指标表",
+                    "table_id": "",
+                    "table_name": basic_info['target_table_name'],  # table_name
+                    "desc": basic_info['target_table_desc'],  # table_desc
                     "file_path": f"{basic_info['warehouse_layer']}/{basic_info['file_name']}"
                 },
                 "metrics": metrics
@@ -262,33 +267,85 @@ class ParseMDToJson:
         }
 
 
-    def parse_md_to_json(self, markdown_path: str = None,table_name: str = None):
+    def parse_single_md_file(self, markdown_file: str) -> Dict[str, Any]:
+        """解析单个 Markdown 文件并返回 JSON 结果"""
+        print(f"markdown_file:{markdown_file}")
+            
+        # 1. 读取 Markdown 文件
+        markdown_content = self.parse_markdown_file(markdown_file)
+    
+        # 2. 提取基本信息
+        basic_info = self.extract_basic_info(markdown_content)
+    
+        # 3. 提取字段清单
+        fields = self.extract_field_list(markdown_content)
+    
+        # 4. 创建指标字典
+        metrics = self.create_metric_dict(fields)
+    
+        # 5. 创建最终 JSON
+        result = self.create_json_result(basic_info, metrics)
+    
+        # 6. 输出结果
+        # print(json.dumps(result, indent=2, ensure_ascii=False))
+    
+        return result
+    
+    
+    def parse_md_to_json(self, markdown_path: str = None ,dw_layer: str = None, table_name: str = None):
         """主函数：处理整个转换流程"""
+        # 如果没有传入 markdown_path，使用默认路径
+        if not dw_layer:
+            dw_layer = "yz_datawarehouse_ads"
+        if not markdown_path:
+            # 获取当前脚本所在目录
+            current_script_dir = os.path.dirname(os.path.abspath(__file__))
+            # 回退到上一级目录的 metric_blood 文件夹
+            parent_dir = os.path.dirname(current_script_dir)
+            metric_blood_path_parent = os.path.join(parent_dir, 'metric_blood')
+            metric_blood_path = os.path.join(metric_blood_path_parent, dw_layer)
+            print(f"metric_blood_path:{metric_blood_path}")
+            if os.path.exists(metric_blood_path) and os.path.isdir(metric_blood_path):
+                markdown_path = metric_blood_path
+            else:
+                return "未找到 metric_blood 目录"
+        
         # 优先使用传入的参数，如果没有则使用默认路径
         # 默认路径
-        markdown_file = r"D:\codes\AIDataEasy\data_governance_agent\sql_to_md\metric_blood\yz_datawarehouse_ads.ads_pig_feed_sum_month.md"
-    
+        markdown_file = ""
+        results = []
+
+        print(f"markdown_path:{markdown_path}")
         try:
-            print(f"markdown_file:{markdown_file}")
-            # 1. 读取 Markdown 文件
-            markdown_content = self.parse_markdown_file(markdown_file)
-    
-            # 2. 提取基本信息
-            basic_info = self.extract_basic_info(markdown_content)
-    
-            # 3. 提取字段清单
-            fields = self.extract_field_list(markdown_content)
-    
-            # 4. 创建指标字典
-            metrics = self.create_metric_dict(fields)
-    
-            # 5. 创建最终 JSON
-            result = self.create_json_result(basic_info, metrics)
-
-            # 6. 输出结果
-            print(json.dumps(result, indent=2, ensure_ascii=False))
-
-            return result
+            if markdown_path:
+                if table_name:
+                    markdown_file = os.path.join(markdown_path, f"{table_name}.md")
+                    if not os.path.exists(markdown_file):
+                        return "文件不存在"
+                    # 单文件模式
+                    result = self.parse_single_md_file(markdown_file)
+                    results.append(result)
+                elif os.path.isdir(markdown_path):
+                    # 目录模式：获取所有 md 文件
+                    md_files = [os.path.join(markdown_path, f) for f in os.listdir(markdown_path) if f.endswith('.md')]
+                    if not md_files:
+                        return "目录下没有找到 Markdown 文件"
+                    # 批量处理所有 md 文件
+                    for md_file in md_files:
+                        try:
+                            result = self.parse_single_md_file(md_file)
+                            results.append(result)
+                        except Exception as e:
+                            print(f"❌ Error processing {md_file}: {str(e)}")
+                            results.append({
+                                "success": False,
+                                "error": str(e),
+                                "file": md_file
+                            })
+            else:
+                return "请输入正确的参数"
+                
+            return results
 
         except Exception as e:
             print(f"❌ Error: {str(e)}")
@@ -296,8 +353,84 @@ class ParseMDToJson:
                 "success": False,
                 "error": str(e)
             }
+    
+    def parse_md_to_metric_metadata_list(self, markdown_path: str = None , dw_layer = None, table_name: str = None) -> List[MetricMetadataInfo]:
+        """解析 Markdown 文件并转换为 MetricMetadataInfo 列表
+        
+        Args:
+            markdown_path: Markdown 文件路径或目录
+            table_name: 表名（可选）
+            
+        Returns:
+            MetricMetadataInfo 对象列表
+        """
+        # 调用原有方法获取 JSON 结果
+        json_results = self.parse_md_to_json(markdown_path , dw_layer, table_name)
 
+        # 如果返回的是错误信息，返回空列表
+        if isinstance(json_results, str):
+            print(f"⚠️  {json_results}")
+            return []
+        if isinstance(json_results, dict) and json_results.get('success') is False:
+            print(f"❌ 解析失败：{json_results.get('error')}")
+            return []
+        
+        metric_metadata_list = []
+        
+        # 遍历每个文件的解析结果
+        for json_result in json_results:
+            if not isinstance(json_result, dict) or not json_result.get('success'):
+                continue
+                
+            data = json_result.get('data', {})
+            target = data.get('target', {})
+            metrics = data.get('metrics', {})
+            
+            # 从每个指标中提取信息
+            for metric_name_en, metric_data in metrics.items():
+                try:
+                    # 构建 MetricMetadataInfo 对象
+                    metric_info = MetricMetadataInfo(
+                        metric_name=metric_data.get('metric_name', ''),
+                        metric_column=metric_name_en,  # 使用 JSON 的 key 作为 metric_column
+                        synonyms=None,  # Markdown 中没有同义词字段
+                        datasource_id=None,  # 需要从其他地方获取
+                        table_name=target.get('table_name', ''),  # 使用表名
+                        core_fields=self._extract_core_fields(metrics),
+                        calc_logic=metric_data.get('calculation', {}).get('formula', ''),
+                        upstream_table=self._extract_upstream_table(metric_data),
+                        dw_layer=target.get('file_path', '').split('/')[0] if target.get('file_path') else '',
+                        enabled=True
+                    )
+                    metric_metadata_list.append(metric_info)
+                except Exception as e:
+                    print(f"⚠️  转换指标 {metric_name_en} 失败：{e}")
+                    continue
+        
+        print(f"✅ 成功转换 {len(metric_metadata_list)} 个指标元数据")
+        return metric_metadata_list
+    
+    def _extract_core_fields(self, metrics: Dict[str, Any]) -> str:
+        """从指标字典中提取核心字段（逗号分隔）"""
+        # 这里可以根据实际需求定义如何提取核心字段
+        # 暂时返回空字符串，或者可以从 dependencies 中提取
+        all_fields = set()
+        for metric_data in metrics.values():
+            dependencies = metric_data.get('calculation', {}).get('dependencies', [])
+            for dep in dependencies:
+                fields = dep.get('fields', [])
+                all_fields.update(fields)
+        return ', '.join(sorted(all_fields)) if all_fields else ''
+    
+    def _extract_upstream_table(self, metric_data: Dict[str, Any]) -> str:
+        """从指标数据中提取上游表"""
+        dependencies = metric_data.get('calculation', {}).get('dependencies', [])
+        if dependencies:
+            # 返回第一个依赖的表作为上游表
+            return dependencies[0].get('table', '')
+        return ''
 
 if __name__ == "__main__":
-    parse_md_to_json = ParseMDToJson()
-    parse_md_to_json.parse_md_to_json("yz_datawarehouse_ads.ads_pig_feed_sum_month")
+    parse = ParseMDToJson()
+    res = parse.parse_md_to_metric_metadata_list(table_name="yz_datawarehouse_ads.ads_pig_feed_sum_month")
+    print(res)

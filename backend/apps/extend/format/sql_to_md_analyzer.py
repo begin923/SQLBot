@@ -176,16 +176,16 @@ class SQLToMDAnalyzer:
             
             result["md_content"] = self.analyze_sql(sql_content, result["file_name"])
             
-            # 从 MD 内容中提取表名（新格式：横向表格，第二列是 target_table_id）
+            # 从 MD 内容中提取表名（新格式：横向表格，第二列是 table_name）
             if result["md_content"]:
                 for line in result["md_content"].split('\n'):
-                    # 匹配基本信息表格的数据行（第二列是 target_table_id）
-                    if line.startswith("|") and "target_table_id" not in line and "file_name" not in line:
+                    # 匹配基本信息表格的数据行（第二列是 table_name）
+                    if line.startswith("|") and "table_name" not in line and "file_name" not in line:
                         parts = [p.strip() for p in line.split("|") if p.strip()]
-                        # 横向表格：第一部分应该是 file_name，第二部分是 target_table_id
+                        # 横向表格：第一部分应该是 file_name，第二部分是 table_name
                         if len(parts) >= 2 and parts[0] != "-----------":
                             # 跳过表头行，取数据行的第二个字段
-                            if not any(keyword in parts[0] for keyword in ["file_name", "target_table_id", "warehouse_layer"]):
+                            if not any(keyword in parts[0] for keyword in ["file_name", "table_name", "table_desc", "warehouse_layer"]):
                                 result["table_name"] = parts[1]
                                 break
             

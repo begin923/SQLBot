@@ -2,6 +2,8 @@ import datetime
 from pathlib import Path
 from typing import List, Optional
 
+from sqlalchemy.orm import Session
+
 from apps.ai_model.embedding import EmbeddingModelCache
 from sqlalchemy import and_, or_, select, func, delete, update, text
 
@@ -308,7 +310,7 @@ def get_metric_metadata_by_names(session, metric_names: List[str], datasource_id
                 # 然后在 Python 中过滤相似度 > 阈值的记录
                 similarity_results = [
                     row for row in all_results
-                    if row[2] > similarity_threshold  # row[2] 是 similarity 列
+                    if row[2] is not None and row[2] > similarity_threshold  # row[2] 是 similarity 列，排除 NULL 值
                 ]
                 
                 # 按相似度降序排序并取 top N
@@ -633,7 +635,7 @@ def _init_local_config():
                 settings.LOCAL_MODEL_PATH = alt_path
 
 
-def fill_empty_embeddings():
+def fill_empty_embeddings(session: Session = None):
     """
     填充所有缺失的 embedding 向量
     参考 terminology 表的 run_fill_empty_embeddings 函数实现
@@ -652,13 +654,15 @@ def fill_empty_embeddings():
     print("🔍 正在查询需要向量化的记录...")
     try:
         # 创建独立的数据库会话
-        session = _create_local_session()
+        if session is None:
+            print("🔒 创建独立的数据库会话")
+            session = _create_local_session()
         
         try:
             # 使用 ORM 查询
-            from sqlalchemy import text
-            sql = text("SELECT id FROM metric_metadata WHERE embedding_vector IS NULL")
-            print(f"📝 执行 SQL: SELECT id FROM metric_metadata WHERE embedding_vector IS NULL")
+            select_null_vector = "SELECT id FROM metric_metadata WHERE embedding_vector IS NULL"
+            sql = text(select_null_vector)
+            print(f"📝 执行 SQL: {select_null_vector}")
             result = session.execute(sql)
             results = [row[0] for row in result.fetchall()]
             print(f"✅ 查询执行成功，找到 {len(results)} 条记录")

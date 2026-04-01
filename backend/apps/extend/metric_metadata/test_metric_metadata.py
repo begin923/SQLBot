@@ -23,12 +23,14 @@ import os
 from pathlib import Path
 
 # 添加项目根目录到 Python 路径
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+
 project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 # 现在可以直接导入后端模块
 from sqlalchemy.orm import sessionmaker, scoped_session
-from common.core.db import engine
 from sqlmodel import Session
 from apps.extend.metric_metadata.curd.metric_metadata import (
     create_metric_metadata,
@@ -42,6 +44,38 @@ from apps.extend.metric_metadata.curd.metric_metadata import (
 )
 from apps.extend.metric_metadata.models.metric_metadata_model import MetricMetadataInfo
 
+
+# 获取项目根目录（向上追溯 5 层：backend/apps/extend/metric_metadata -> D:\codes\MySQLBot）
+current_file = Path(__file__).resolve()
+project_root = current_file.parent.parent.parent.parent.parent
+# 加载根目录的.env 文件
+env_path = project_root / ".env"
+if env_path.exists():
+    load_dotenv(env_path)
+    print(f"✅ 已加载.env 文件：{env_path}")
+    print(f"   POSTGRES_SERVER={os.getenv('POSTGRES_SERVER')}")
+    print(f"   POSTGRES_DB={os.getenv('POSTGRES_DB')}")
+else:
+    print(f"⚠️  未找到.env 文件：{env_path}")
+    # 尝试当前工作目录
+    alt_env_path = Path.cwd() / ".env"
+    if alt_env_path.exists() and str(alt_env_path) != str(env_path):
+        load_dotenv(alt_env_path)
+        print(f"✅ 已加载备用.env 文件：{alt_env_path}")
+    else:
+        print("ℹ️  将使用默认数据库配置")
+# 从环境变量读取数据库配置（使用.env 文件中的变量名）
+DB_HOST = os.getenv("POSTGRES_SERVER", "localhost")
+DB_PORT = os.getenv("POSTGRES_PORT", "5432")
+DB_USER = os.getenv("POSTGRES_USER", "sqlbot")
+DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "sqlbot")
+DB_NAME = os.getenv("POSTGRES_DB", "sqlbot")
+
+DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+print(f"📡 数据库连接：{DB_HOST}:{DB_PORT}/{DB_NAME}")
+print(f"👤 用户：{DB_USER}")
+
+engine = create_engine(DATABASE_URL)
 session_maker = scoped_session(sessionmaker(bind=engine, class_=Session))
 
 
@@ -316,7 +350,7 @@ def test_delete():
         print("⏭️  跳过删除测试")
 
 
-def test_fill_embeddings():
+def test_fill_embeddings(session:Session = None):
     """9. 填充 Embedding"""
     print_section("9. 填充 Embedding 向量")
     
@@ -324,7 +358,7 @@ def test_fill_embeddings():
     print("⚠️  此操作可能需要较长时间，请耐心等待...")
     
     try:
-        fill_empty_embeddings()
+        fill_empty_embeddings(session)
         print(f"✅ Embedding 填充完成，请查看日志")
     except Exception as e:
         print(f"❌ 错误：{e}")
@@ -373,4 +407,5 @@ def run_all_tests():
 
 
 if __name__ == "__main__":
-    run_all_tests()
+
+    test_fill_embeddings(session_maker)

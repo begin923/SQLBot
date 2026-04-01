@@ -395,8 +395,40 @@ class StaticSQLHandler:
         # 从用户提供的 SQL 中提取表名
         tables = self.extract_tables_from_sql(sql)
         SQLBotLogUtil.info(f"Extracted tables from provided SQL: {tables}")
-        # 如果有数据源且提取到表名，则调用标准接口添加表到指定数据源中
-        for table in tables:
-            self.add_table_to_ds(ds,table)
+        
+        # 批量添加表到数据源（避免重复触发 embedding）
+        if ds and tables:
+            # 先获取已有表
+            existing_tables = _session.query(CoreTable).filter(
+                CoreTable.ds_id == ds.id
+            ).all()
+            existing_table_names = {table.table_name for table in existing_tables}
+            
+            # 构造新表列表
+            new_tables = []
+            for table_name in tables:
+                if table_name not in existing_table_names:
+                    table_obj = CoreTable(
+                        ds_id=ds.id,
+                        checked=True,
+                        table_name=table_name,
+                        table_comment="",
+                        custom_comment=""
+                    )
+                    new_tables.append(table_obj)
+                    SQLBotLogUtil.info(f"Adding new table: {table_name}")
+                else:
+                    SQLBotLogUtil.info(f"Table {table_name} already exists")
+            
+            # 如果有新表，则批量添加并触发一次 embedding
+            if new_tables:
+                from apps.datasource.crud.datasource import chooseTables, getTablesByDs
+                from common.core.deps import Trans
+                all_tables = existing_tables + new_tables
+                trans = Trans()
+                chooseTables(_session, trans, ds.id, all_tables)
+                _session.commit()
+                SQLBotLogUtil.info(f"Successfully added/verified {len(new_tables)} tables")
+        
         # 直接返回结果，不发送响应，由调用方处理
         return full_sql_text, sql
