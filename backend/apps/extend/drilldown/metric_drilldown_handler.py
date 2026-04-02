@@ -17,6 +17,8 @@ from typing import Dict, Any, List
 
 from common.utils.utils import SQLBotLogUtil
 from apps.extend.format.parse_md_to_json import ParseMDToJson
+from apps.extend.drilldown.drill_agg_rule_engine import DrillAggRuleEngine
+from typing import Dict, Any, List, Tuple
 
 
 class MetricDrilldownHandler:
@@ -29,10 +31,196 @@ class MetricDrilldownHandler:
         Args:
         """
         self.parser = ParseMDToJson()
+        self.rule_engine = DrillAggRuleEngine()  # 新增：聚合规则引擎
+
+    def extract_metrics_and_intent(self, llm_client, question: str) -> Tuple[List[str], Dict[str, Any]]:
+        """
+        从用户问题中同时提取指标名称和用户意图
+        
+        功能：
+        1. 分析用户问题，提取其中提到的指标字段名
+        2. 分析用户意图（下钻类型、聚合规则）
+        
+        Args:
+            llm_client: LLM 客户端实例
+            question: 用户问题
+            
+        Returns:
+            Tuple[List[str], Dict[str, Any]]: (指标名称列表，用户意图字典)
+            用户意图字典格式：{
+                "is_granular": bool,      # 是否粒度下钻
+                "is_raw": bool,           # 是否穿透下钻（查明细）
+                "need_agg": bool,         # 是否需要聚合
+                "agg_rule_desc": str,     # 聚合规则描述
+                "drill_type_reason": str  # 判断理由
+            }
+            
+        示例:
+            输入："按月下钻指标 d7_sum 的明细数据"
+            输出：(
+                ["d7_sum"],
+                {
+                    "is_granular": True,
+                    "is_raw": True,
+                    "need_agg": False,
+                    "agg_rule_desc": "不聚合，查原始明细",
+                    "drill_type_reason": "包含'明细'关键词，触发穿透下钻"
+                }
+            )
+        """
+        from langchain_core.messages import HumanMessage
+        import json
+        
+        # ========== 步骤 1：LLM 提取指标名称和初步意图 ==========
+        prompt = f"""# 角色
+你是数据查询意图分析专家。
+
+# 任务
+从用户问题中提取：
+1. 所有提到的指标名称（字段名）
+2. 用户查询意图（下钻类型、是否要明细）
+
+# 用户问题
+{question}
+
+# 提取规则
+## 1. 识别指标字段
+- 提取用户提到的具体指标名称（中文或英文）
+- 保留原始名称（用户说中文就输出中文，说英文就输出英文）
+
+## 2. 判断用户意图
+- **粒度下钻**：包含"下钻"、"钻取"、"drill"、"按维度拆分"等词
+- **穿透下钻**：包含"明细"、"明细数据"、"明细查询"、"raw"、"detail"等词
+- **聚合查询**：包含"汇总"、"合计"、"统计"、"总和"、"平均值"等词
+
+## 3. 排除非指标词汇
+- 动词类：查询、统计、汇总、分析、查看、展示、显示
+- 名词类：数据、指标、明细、维度、总和、平均值、最大值、最小值
+- 时间类：年、月、日、季度、年度、月度（除非是字段名如 dt_year）
+- 其他：按、的、和、与、及、等
+
+# 输出格式
+严格按照以下 JSON 格式输出:
+{{
+    "metrics": ["指标 1", "指标 2", ...],
+    "intent": {{
+        "is_granular": true/false,      // 是否粒度下钻
+        "is_raw": true/false,           // 是否穿透下钻（查明细）
+        "need_agg": true/false,         // 是否需要聚合
+        "reason": "判断理由说明"
+    }}
+}}
+
+# 示例
+## 示例 1 - 粒度下钻
+输入："按月下钻指标 d7_sum"
+输出：
+{{
+    "metrics": ["d7_sum"],
+    "intent": {{
+        "is_granular": true,
+        "is_raw": false,
+        "need_agg": true,
+        "reason": "包含'下钻'关键词，需要按维度拆分并聚合"
+    }}
+}}
+
+## 示例 2 - 穿透下钻（查明细）
+输入："查询 d7_sum 的明细数据"
+输出：
+{{
+    "metrics": ["d7_sum"],
+    "intent": {{
+        "is_granular": false,
+        "is_raw": true,
+        "need_agg": false,
+        "reason": "包含'明细'关键词，查询原始明细数据，不需要聚合"
+    }}
+}}
+
+## 示例 3 - 聚合查询
+输入："汇总统计销售额和销售量"
+输出：
+{{
+    "metrics": ["销售额", "销售量"],
+    "intent": {{
+        "is_granular": false,
+        "is_raw": false,
+        "need_agg": true,
+        "reason": "包含'汇总'、'统计'关键词，需要聚合查询"
+    }}
+}}
+
+请根据上述规则，从用户问题中提取指标名称和意图。"""
+        
+        # 调用 LLM 提取
+        response = llm_client.invoke([HumanMessage(content=prompt)])
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        SQLBotLogUtil.info(f"Metric and intent extraction response: {response_text}")
+        
+        # 解析 JSON 结果
+        try:
+            result = json.loads(response_text, strict=False)
+            metrics = result.get("metrics", [])
+            intent = result.get("intent", {})
+            
+            # 确保 metrics 是列表
+            if not isinstance(metrics, list):
+                metrics = []
+            
+            # ========== 步骤 2：使用规则引擎校验意图 ==========
+            # 基于 drill_agg_rule_engine.py 的规则进行二次判断
+            rule_is_granular, rule_is_raw = self.rule_engine.judge_drill_type(question)
+            
+            # 统一计算 need_agg 和 agg_rule_desc（只调用一次）
+            agg_rule_desc, need_agg = self.rule_engine.get_agg_rule(
+                question=question,
+                curr_layer="unknown",  # 暂时未知，后续根据元数据更新
+                is_granular=rule_is_granular,
+                is_raw=rule_is_raw
+            )
+            
+            # 如果 LLM 判断和规则引擎不一致，以规则引擎为准（更可靠）
+            if intent:
+                intent['is_granular'] = rule_is_granular
+                intent['is_raw'] = rule_is_raw
+                intent['need_agg'] = need_agg
+                intent['agg_rule_desc'] = agg_rule_desc
+            else:
+                intent = {
+                    "is_granular": rule_is_granular,
+                    "is_raw": rule_is_raw,
+                    "need_agg": need_agg,
+                    "agg_rule_desc": "",
+                    "reason": ""
+                }
+            
+            SQLBotLogUtil.info(f"Extracted metrics: {metrics}, intent: {intent}")
+            return metrics, intent
+            
+        except Exception as e:
+            SQLBotLogUtil.error(f"Failed to parse LLM response: {str(e)}")
+            # 降级处理：只提取指标，使用规则引擎判断意图
+            metrics = self.get_metric_from_question(llm_client, question)
+            rule_is_granular, rule_is_raw = self.rule_engine.judge_drill_type(question)
+            agg_rule_desc, need_agg = self.rule_engine.get_agg_rule(
+                question=question,
+                curr_layer="unknown",
+                is_granular=rule_is_granular,
+                is_raw=rule_is_raw
+            )
+            intent = {
+                "is_granular": rule_is_granular,
+                "is_raw": rule_is_raw,
+                "need_agg": need_agg,
+                "agg_rule_desc": agg_rule_desc,
+                "reason": f"LLM 解析失败，使用规则引擎判断：{str(e)}"
+            }
+            return metrics, intent
 
     def get_metric_from_question(self, llm_client, question: str) -> List[str]:
         """
-        从用户问题中提取指标名称列表
+        从用户问题中提取指标名称列表（保留原有方法作为降级方案）
         
         功能：分析用户问题，提取其中提到的指标字段名
         
@@ -116,374 +304,6 @@ class MetricDrilldownHandler:
             SQLBotLogUtil.error(f"Failed to parse LLM response: {str(e)}")
             return []
 
-
-
-    def get_user_intent_and_table_scope(self, llm_client, question: str) -> Dict[str, Any]:
-        """
-        分析用户意图和表范围
-        
-        功能：直接根据用户问题判断用户意图和表查询范围并返回结果，不做其他操作
-        
-        Args:
-            llm_client: LLM 客户端实例
-            question: 用户问题
-            
-        Returns:
-            dict: {
-                "is_current_table": bool,  # 是否查询当前表 (下钻且有 SQL 时为 true)
-                "table_name": "表名",  # 非下钻查询或需要查询上游表时的表名
-                "metrics": List[str],  # 指标列表
-                "reason": "判断理由"
-            }
-            
-        注意：
-        - 删除了 sql 字段，避免触发静态 SQL 模式
-        - 只用于提取表名，供后续添加表到数据源使用
-            
-        与 extract_blood_from_md 的关系:
-        - decide_table_scope: 负责判断"查询什么表"
-        - extract_blood_from_md: 负责"解析该表的血缘数据"
-        - 先调用 decide_table_scope 获取表名，再调用 extract_blood_from_md 解析血缘
-        """
-        from langchain_core.messages import HumanMessage
-
-        # TODO 新增判断sql是对当前表下钻还是查询上游表
-        # 构建提示词：让 LLM 分析用户问题的查询范围
-        prompt = f"""# 角色
-你是数据查询意图分析专家。
-
-# 任务
-1、分析用户问题，判断是下钻查询还是查询明细
-2、基于第一点，判断已执行sql类型
-3、基于第二点，判断指标血缘指向当前表还是上游表，并根据意图准确标识指标名称
-
-# 用户问题
-{question}
-
-# 分析要点
-1. 判断是否是下钻查询（关键词：下钻、钻取、drill）
-2. 判断是否是查询明细（关键词：查询明细、明细查询）
-3. **关键血缘逻辑**（必须严格遵守）：
-   - **若指标血缘指向当前表** → `is_current_table = true`（查询当前表）
-   - **若指标血缘指向上游表** → `is_current_table = false`（查询上游表）
-4. 提取信息：
-   - 表名：指标血缘指定的目标表
-   - 指标：指标字段名（从问题或SQL提取）
-
-# 输出格式
-严格按照以下JSON格式输出:
-{{
-    "is_current_table": true/false,
-    "table_name": "指标血缘指定的目标表名",
-    "metrics": ["指标1", "指标2"],
-    "reason": "判断理由说明（基于血缘配置）"
-}}
-
-# 示例 1 - 聚合指标（血缘指向当前表）
-输入："按月下钻指标 d7_sum ; 已执行sql: select dt_year, sum(d7_estrus) as d7_sum from yz_datawarehouse_ads.ads_pig_feed_day group by dt_year"
-输出：
-{{
-    "is_current_table": true,
-    "table_name": "yz_datawarehouse_ads.ads_pig_feed_day",
-    "metrics": ["d7_sum"],
-    "reason": "根据sql分析指标d7_sum是聚合指标，且来源 d7_estrus ,因为表结构有关于按月度统计维度，所以血缘指向当前表（yz_datawarehouse_ads.ads_pig_feed_day）"
-}}
-
-# 示例 2 - 聚合指标（血缘指向当前表）
-输入："按天下钻指标 d7_sum ; 已执行sql: select dt_year, sum(d7_estrus) as d7_sum from yz_datawarehouse_ads.ads_pig_feed_day group by dt_year"
-输出：
-{{
-    "is_current_table": true,
-    "table_name": "yz_datawarehouse_ads.ads_pig_feed_day",
-    "metrics": ["d7_estrus"],
-    "reason": "根据sql分析指标d7_sum是聚合指标，且来源 d7_estrus ,因为表结构的最细粒度是按的统计维度，所以血缘指向当前表（yz_datawarehouse_ads.ads_pig_feed_day）"
-}}
-
-# 示例 3 - 明细指标（血缘指向当前表）
-输入："查询指标明细数据 ; 已执行sql: select dt_month, sum(app_feed) as app_feed_sum from yz_datawarehouse_ads.ads_pig_feed_day group by dt_month"
-输出：
-{{
-    "is_current_table": true,
-    "table_name": "yz_datawarehouse_ads.ads_pig_feed_day",
-    "metrics": ["app_feed"],
-    "reason": "由于当前sql是聚合查询且且需求是查询指标app_feed_sum是明细指标app_feed字段的明细数据，只需要调整为查询当前的明细，血缘指向当前表"
-}}
-
-# 示例 4 - 明细指标（血缘指向上游表）
-输入："查询指标明细数据 ; 已执行sql: select dt_day, app_feed from yz_datawarehouse_ads.ads_pig_feed_day"
-输出：
-{{
-    "is_current_table": false,
-    "table_name": "yz_datawarehouse_ads.ads_pig_feed_day",
-    "metrics": ["app_feed"],
-    "reason": "由于当前sql是明细查询且需求是查询指标app_feed是明细指标，血缘指向上游表"
-}}"""
-        
-        # 调用 LLM 分析
-        response = llm_client.invoke([HumanMessage(content=prompt)])
-        response_text = response.content if hasattr(response, 'content') else str(response)
-        SQLBotLogUtil.info(f"User intent and table scope response: {response_text}")
-        
-        # 解析 JSON 结果
-        try:
-            result = json.loads(response_text, strict=False)
-            # 删除 sql 字段（如果存在），确保不会触发静态 SQL 模式
-            if 'sql' in result:
-                del result['sql']
-            return result
-        except Exception as e:
-            SQLBotLogUtil.error(f"Failed to parse LLM response: {str(e)}")
-            return {
-                "is_current_table": False,
-                "table_name": "",
-                "metrics": [],
-                "reason": f"解析失败：{str(e)}"
-            }
-
-
-    # ========== MD 文档解析相关方法 ==========
-    def extract_metric_blood_from_md(self, table_name: str) -> Dict[str, Any]:
-        """
-        从指定表的 MD 文档 ，提取指标血缘数据
-        
-        Args:
-            table_name: 表名 (如："ads_sales_summary")
-
-        Returns:
-            解析结果字典
-        """
-        
-        # 直接调用 ParseMD.read_md_by_table 方法
-        result = self.parser.parse_md_to_json(table_name)
-        
-        if result["success"]:
-            SQLBotLogUtil.info(f"Successfully parsed MD for table: {table_name}")
-        else:
-            SQLBotLogUtil.warning(f"Failed to parse MD for table {table_name}: {result.get('error')}")
-        
-        return result
-
-
-
-    # ========== 核心业务方法：下钻分析完整流程 ==========
-    @staticmethod
-    def generate_drilldown_sql_by_llm(llm_service, field_blood: dict):
-        """
-        基于血缘信息，调用大模型生成下钻 SQL
-        
-        Args:
-            llm_service: LLMService 实例
-            field_blood: 字段血缘信息字典，格式为：
-                        {
-                            "目标字段名": [
-                                {
-                                    "源字段": "源表。源字段",
-                                    "源表": "yz_datawarehouse_dwd.dwd_feed_back",
-                                    "转换逻辑": "SUM",
-                                    "字段类型": "指标"
-                                }
-                            ]
-                        }
-            
-        Returns:
-            生成的 SQL 语句，如果生成失败则返回 None
-        """
-        from langchain_core.messages import SystemMessage, HumanMessage
-        from common.utils.utils import SQLBotLogUtil
-        import orjson
-        import traceback
-        
-        # 辅助函数：提取 JSON
-        def extract_nested_json(text: str) -> str:
-            """从文本中提取 JSON 字符串"""
-            import re
-            # 尝试匹配```json 块
-            json_pattern = r'```(?:json)?\s*(\{.*?\})\s*```'
-            matches = re.findall(json_pattern, text, re.DOTALL)
-            if matches:
-                return matches[0]
-            
-            # 尝试直接查找{}之间的内容
-            start = text.find('{')
-            end = text.rfind('}') + 1
-            if start != -1 and end > start:
-                return text[start:end]
-            
-            return ""
-        
-        try:
-            # 从 field_blood 中提取所有源表 (去重)
-            source_tables = set()
-            blood_desc_lines = []
-            target_fields = list(field_blood.keys())
-            
-            for target_field, blood_records in field_blood.items():
-                for record in blood_records:
-                    source_field = record.get('源字段', '')
-                    conversion = record.get('转换逻辑', '')
-                    source_table = record.get('源表', '')
-                    field_type = record.get('字段类型', '')
-                    
-                    # 收集源表
-                    if source_table:
-                        source_tables.add(source_table)
-                    
-                    # 构建血缘描述
-                    if source_field and conversion:
-                        blood_desc_lines.append(
-                            f"- {target_field} ← {source_field} ({conversion}) [类型：{field_type}, 源表：{source_table}]"
-                        )
-            
-            blood_desc = "\n".join(blood_desc_lines) if blood_desc_lines else "无"
-            source_tables_list = list(source_tables) if source_tables else []
-            
-            # 构建提示词
-            system_prompt = """你是一个 SQL 生成专家，擅长根据字段血缘关系和用户需求生成正确的 SQL 查询。
-
-# 任务
-根据提供的字段血缘关系和用户问题，生成符合以下要求的 SQL:
-1. **理解下钻的含义**:
-   - **目标字段**: 是上一个问题中查询的字段 (通常是聚合后的指标，如 d7_sum)
-   - **下钻查询**: 就是查询目标字段的**来源**,即**源字段**(如 d7_estrus)
-   - 简单说:**下钻 = 查看目标字段是从哪里来的 = SELECT 源字段**
-2. SELECT 字段应该是:
-   - 如果是下钻查询:SELECT 源字段 + 原始 SQL 中的维度字段 (如 org_id 等),不要加聚合函数
-   - 如果是聚合查询:SELECT 聚合函数 (源字段) + 维度字段
-3. 根据用户问题的语义添加合适的 WHERE、ORDER BY 等子句
-4. 确保 SQL 语法正确且可执行
-5. 只输出 SQL 语句本身，不要包含任何解释或额外文字
-6. 以 JSON 格式输出，包含 sql 字段
-
-# 关键判断规则
-- 当用户说"下钻指标 XXX"时 = 查看该指标的明细数据 = SELECT 源字段 (不加聚合)
-- 当用户说"按 XX 维度统计/汇总/求和"时 = 聚合查询 = SELECT 聚合函数 (源字段) GROUP BY 维度
-
-# 重要提醒
-- 如果用户问题中包含原始 SQL，需要**智能处理**:
-  * ✅ 保留原始 SQL 的 **WHERE 条件**(如 org_id = xxx)
-  * ✅ 保留原始 SQL 的 **维度字段**(如 SELECT org_id 中的 org_id)
-  * ❌ 移除原始 SQL 的 **聚合函数**(如 SUM()、COUNT() 等)
-  * ❌ 移除原始 SQL 的 **GROUP BY 子句**(因为下钻不需要分组)
-- 示例说明:
-  * 上个问题:`SELECT SUM(d7_estrus) AS d7_sum FROM ...` → 目标字段是 `d7_sum`
-  * 下钻查询:`d7_sum` 从哪里来？→ 来自 `d7_estrus` → 所以 SELECT `d7_estrus`"""
-
-            user_prompt = f"""# 用户问题
-{llm_service.chat_question.question}
-
-# 字段血缘关系
-{blood_desc}
-
-# 可用信息
-目标字段列表:{target_fields}(这些是上个回答中查询的字段)
-源表列表:{source_tables_list}
-
-# 输出格式
-请严格按照以下 JSON 格式输出:
-{{
-    "sql": "生成的 SQL 语句"
-}}
-
-# 示例对比
-## 示例 1 - 下钻查询 (查看明细，无条件)
-用户问题：下钻指标 d7_sum
-字段血缘关系:
-- d7_sum ← d7_estrus (SUM) [类型：指标，源表：yz_datawarehouse_ads.ads_algo_female_batch_production]
-目标字段列表:["d7_sum"]
-源表列表:["yz_datawarehouse_ads.ads_algo_female_batch_production"]
-分析:
-- "下钻"=查看明细
-- **目标字段**:d7_sum(上个回答查询的字段)
-- **源字段**:d7_estrus(d7_sum 的来源字段)
-- **下钻查询**:就是查询 d7_sum 从哪里来 → SELECT d7_estrus
-- 没有指定条件，直接查询所有明细
-- 不要聚合，不要 GROUP BY
-输出:{{"sql": "SELECT d7_estrus FROM yz_datawarehouse_ads.ads_algo_female_batch_production"}}
-
-## 示例 2 - 聚合查询 (按维度汇总)
-用户问题：按 org_id 汇总 d7_sum
-字段血缘关系:
-- d7_sum ← d7_estrus (SUM) [类型：指标，源表：yz_datawarehouse_dwd.dwd_feed_back]
-目标字段列表:["d7_sum"]
-源表列表:["yz_datawarehouse_dwd.dwd_feed_back"]
-分析:
-- "按 org_id 汇总"=聚合查询
-- 需要 GROUP BY org_id
-- SELECT SUM(d7_estrus) AS d7_sum
-输出:{{"sql": "SELECT org_id, SUM(d7_estrus) AS d7_sum FROM yz_datawarehouse_dwd.dwd_feed_back GROUP BY org_id"}}
-
-## 示例 3 - 带条件的下钻查询
-用户问题：查询 org_id 为 709347917181313024 的 d7_sum 明细
-字段血缘关系:
-- d7_sum ← d7_estrus (SUM) [类型：指标，源表：yz_datawarehouse_ads.ads_algo_female_batch_production]
-目标字段列表:["d7_sum"]
-源表列表:["yz_datawarehouse_ads.ads_algo_female_batch_production"]
-分析:
-- "明细"=下钻查询
-- **目标字段**:d7_sum(上个回答查询的字段)
-- **源字段**:d7_estrus(d7_sum 的来源字段)
-- **下钻查询**:查询 d7_sum 从哪里来 → SELECT d7_estrus
-- 用户明确要求"org_id 为 709347917181313024"的条件
-- 所以需要 WHERE，但不需要 GROUP BY
-输出:{{"sql": "SELECT d7_estrus FROM yz_datawarehouse_ads.ads_algo_female_batch_production WHERE org_id = '709347917181313024'"}}
-
-## 示例 4 - 下钻查询 (保留原始 SQL 的条件和维度，去除聚合)
-用户问题：下钻指标 d7_sum {{"sql": "SELECT org_id, SUM(d7_estrus) AS d7_sum FROM yz_datawarehouse_ads.ads_algo_female_batch_production WHERE org_id = 709347917181313024 GROUP BY org_id"}}
-字段血缘关系:
-- d7_sum ← d7_estrus (SUM) [类型：指标，源表：yz_datawarehouse_ads.ads_algo_female_batch_production]
-目标字段列表:["d7_sum"]
-源表列表:["yz_datawarehouse_ads.ads_algo_female_batch_production"]
-分析:
-- 用户要求"下钻"=查看明细
-- **目标字段**:d7_sum(上个回答查询的字段)
-- **源字段**:d7_estrus(d7_sum 的来源字段)
-- **下钻查询**:查询 d7_sum 从哪里来 → SELECT d7_estrus
-- 原始 SQL 中有:
-  * 维度字段:org_id(需要保留)
-  * WHERE 条件:org_id = 709347917181313024(需要保留)
-  * 聚合函数:SUM()(需要移除，因为下钻不要聚合)
-  * GROUP BY:org_id(需要移除，因为下钻不要分组)
-- 最终 SQL:SELECT org_id + 源字段 d7_estrus + WHERE 条件
-输出:{{"sql": "SELECT org_id, d7_estrus FROM yz_datawarehouse_ads.ads_algo_female_batch_production WHERE org_id = 709347917181313024"}}
-
-请根据上述要求，为当前用户问题生成 SQL。特别注意:
-1. 如果用户问题中包含"下钻",请查询**源字段**(目标字段的来源),不要聚合，不要 GROUP BY!
-2. 如果用户问题中包含原始 SQL，需要**智能处理**:
-   - ✅ 保留 WHERE 条件
-   - ✅ 保留维度字段
-   - ❌ 移除聚合函数和 GROUP BY"""
-
-            # 调用 LLM
-            messages = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_prompt)
-            ]
-            
-            response = llm_service.llm.invoke(messages)
-            response_text = response.content if hasattr(response, 'content') else str(response)
-            
-            SQLBotLogUtil.info(f"LLM generated SQL response: {response_text}")
-            
-            # 解析 JSON 结果
-            json_str = extract_nested_json(response_text)
-            if not json_str:
-                SQLBotLogUtil.warning(f"Failed to extract JSON from LLM response: {response_text}")
-                return None
-            
-            result = orjson.loads(json_str)
-            sql = result.get('sql', '').strip()
-            
-            if not sql:
-                SQLBotLogUtil.warning("Generated SQL is empty")
-                return None
-            
-            SQLBotLogUtil.info(f"Successfully generated SQL by LLM: {sql}")
-            return sql
-            
-        except Exception as e:
-            SQLBotLogUtil.error(f"Error generating SQL by LLM: {str(e)}, traceback: {traceback.format_exc()}")
-            return None
-
 # ===================== 使用示例 =====================
 if __name__ == "__main__":
     """测试指标下钻分析器"""
@@ -497,7 +317,3 @@ if __name__ == "__main__":
     # 测试表名
     test_table = "yz_datawarehouse_ads.ads_algo_female_batch_production"
     
-    # 测试 1: 解析 MD 文档
-    print("\n===== 测试 MD 文档解析 =====")
-    blood_result = analyzer.extract_metric_blood_from_md(test_table, "blood")
-    print(json.dumps(blood_result, ensure_ascii=False, indent=2))

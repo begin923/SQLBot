@@ -238,7 +238,9 @@ def get_metric_metadata_by_id(session: SessionDep, id: int) -> Optional[MetricMe
 
 def get_metric_metadata_by_names(session, metric_names: List[str], datasource_id: Optional[int] = None) -> List[MetricMetadataInfo]:
     """
-    根据指标名称列表查询指标元数据（支持混合查询：模糊匹配 + 向量相似度）
+    根据指标名称列表查询指标元数据（支持混合查询：精准匹配 + 模糊匹配 + 同义词匹配 + 向量相似度）
+    匹配优先级：精准匹配 > 模糊匹配 > 向量相似度
+    一旦高优先级匹配命中，则不再继续低优先级匹配
     
     Args:
         session: 数据库会话
@@ -254,26 +256,57 @@ def get_metric_metadata_by_names(session, metric_names: List[str], datasource_id
     _list: List[MetricMetadata] = []
     matched_ids_set = set()  # 用于去重
     
-    # ========== 步骤 1：模糊匹配（ILIKE） ==========
+    # ========== 步骤 1：精准匹配（最高优先级） ==========
     for name in metric_names:
         if not name or not name.strip():
             continue
         
-        # 构建模糊查询条件
-        conditions = [MetricMetadata.metric_name.ilike(f"%{name.strip()}%")]
+        # 构建精准查询条件
+        conditions = [MetricMetadata.metric_name == name.strip()]
+        if datasource_id is not None:
+            conditions.append(MetricMetadata.datasource_id == datasource_id)
+        
+        results = session.query(MetricMetadata).filter(and_(*conditions)).all()
+        
+        for metric in results:
+            if metric.id not in matched_ids_set:
+                _list.append(metric)
+                matched_ids_set.add(metric.id)
+    
+    # 如果精准匹配已有结果，直接返回，不再继续模糊匹配和向量匹配
+    if _list:
+        print(f"✅ 精准匹配命中 {len(_list)} 条记录，跳过后续匹配")
+        return _convert_to_info_list(_list)
+    
+    # ========== 步骤 2：模糊匹配（metric_name + synonyms，次优先级） ==========
+    for name in metric_names:
+        if not name or not name.strip():
+            continue
+        
+        # 构建模糊查询条件：metric_name 模糊匹配 OR synonyms 包含该词
+        name_trimmed = name.strip()
+        conditions = [
+            or_(
+                MetricMetadata.metric_name.ilike(f"%{name_trimmed}%"),
+                MetricMetadata.synonyms.ilike(f"%{name_trimmed}%")
+            )
+        ]
         if datasource_id is not None:
             conditions.append(MetricMetadata.datasource_id == datasource_id)
         
         results = session.query(MetricMetadata).filter(and_(*conditions)).all()
 
-        like_metrics = []
         for metric in results:
             if metric.id not in matched_ids_set:
                 _list.append(metric)
-                like_metrics.append(metric.metric_name)
                 matched_ids_set.add(metric.id)
-
-    # ========== 步骤 2：向量相似度匹配（如果启用 EMBEDDING） ==========
+    
+    # 如果模糊匹配已有结果，直接返回，不再继续向量匹配
+    if _list:
+        print(f"✅ 模糊匹配命中 {len(_list)} 条记录，跳过向量匹配")
+        return _convert_to_info_list(_list)
+    
+    # ========== 步骤 3：向量相似度匹配（最低优先级） ==========
     if settings.EMBEDDING_ENABLED and metric_names:
         try:
             from apps.ai_model.embedding import EmbeddingModelCache
@@ -286,36 +319,29 @@ def get_metric_metadata_by_names(session, metric_names: List[str], datasource_id
                 
                 embedding = model.embed_query(search_name.strip())
                 
-                # 使用余弦相似度查询相似的指标
-                # 注意：这里需要使用 SQL 表达式计算向量相似度
-                # PostgreSQL pgvector 扩展支持 <=> 操作符
+                # 使用余弦相似度查询相似的指标（在数据库层面完成过滤和排序）
                 similarity_threshold = getattr(settings, 'EMBEDDING_METRIC_SIMILARITY', 0.75)
                 top_count = getattr(settings, 'EMBEDDING_METRIC_TOP_COUNT', 5)
 
-                # 构建向量相似度查询
-                # 注意：必须使用 HAVING 子句来过滤计算出的相似度
-                query = session.query(
+                # 构建 CTE 查询：计算相似度、过滤 NULL 值、过滤阈值、排序、LIMIT
+                cte_query = select(
                     MetricMetadata.id,
                     MetricMetadata.metric_name,
                     text(f"(1 - (embedding_vector <=> :embedding_array)) AS similarity")
-                )
+                ).select_from(MetricMetadata)
                 
-                # 添加数据源过滤条件（如果有）
                 if datasource_id is not None:
-                    query = query.filter(MetricMetadata.datasource_id == datasource_id)
+                    cte_query = cte_query.where(MetricMetadata.datasource_id == datasource_id)
                 
-                # 先执行查询获取所有结果
-                all_results = query.params(embedding_array=str(embedding)).all()
+                cte_query = cte_query.where(MetricMetadata.embedding_vector.isnot(None))
+                cte_query = cte_query.where(text(f"(1 - (embedding_vector <=> :embedding_array)) > {similarity_threshold}"))
+                cte_query = cte_query.order_by(text('similarity DESC'))
+                cte_query = cte_query.limit(top_count)
+                
+                # 执行查询
+                similarity_results = session.execute(cte_query.params(embedding_array=str(embedding))).all()
 
-                # 然后在 Python 中过滤相似度 > 阈值的记录
-                similarity_results = [
-                    row for row in all_results
-                    if row[2] is not None and row[2] > similarity_threshold  # row[2] 是 similarity 列，排除 NULL 值
-                ]
-                
-                # 按相似度降序排序并取 top N
-                similarity_results.sort(key=lambda x: x[2], reverse=True)
-                similarity_results = similarity_results[:top_count]
+                print(f"Similarity results for '{search_name}': {similarity_results}")
 
                 # 添加匹配的结果（去重）
                 for row in similarity_results:
@@ -331,9 +357,27 @@ def get_metric_metadata_by_names(session, metric_names: List[str], datasource_id
             print(f"Metric embedding similarity search failed: {str(e)}")
             # 向量搜索失败不影响主流程，继续使用模糊匹配的结果
     
-    # ========== 步骤 3：转换为返回格式 ==========
+    # 如果没有匹配到任何结果，返回空列表
+    if not _list:
+        print("⚠️  未匹配到任何结果")
+        return []
+    
+    # 转换为返回格式
+    return _convert_to_info_list(_list)
+
+
+def _convert_to_info_list(metrics: List[MetricMetadata]) -> List[MetricMetadataInfo]:
+    """
+    将 MetricMetadata 对象列表转换为 MetricMetadataInfo 对象列表
+    
+    Args:
+        metrics: MetricMetadata 对象列表
+    
+    Returns:
+        MetricMetadataInfo 对象列表
+    """
     result_list = []
-    for metric in _list:
+    for metric in metrics:
         result_list.append(MetricMetadataInfo(
             id=metric.id,
             metric_name=metric.metric_name,

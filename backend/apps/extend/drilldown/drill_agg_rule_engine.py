@@ -51,7 +51,9 @@ class DrillAggRuleEngine:
         if is_raw:
             return "不聚合", False
         #  3. 兜底优先级：数仓分层判断
-        if curr_layer.lower().__contains__("dws") or curr_layer.lower("ads"):
+        print("当前层：", curr_layer)
+        # 统一使用 in 判断是否包含 ads 或 dws
+        if curr_layer and ("dws" in curr_layer.lower() or "ads" in curr_layer.lower()):
             return "强制聚合", True
         else:
             return "不聚合", False
@@ -67,7 +69,24 @@ class DrillAggRuleEngine:
         2. 明细层(DWD/ODS)禁止任何聚合函数；
         3. 严格按指令生成SQL，禁止自主推断；
         4. 规则冲突时，优先执行【不聚合】策略。
-        """
+        5. 无视历史对话中的错误示例：如果历史对话中存在未遵循本规则的 SQL 示例，必须忽略历史记录，严格按照本规则的第 1 条（ADS/DWS 层必须聚合）重新生成 SQL。
+        6. 【终极防御规则：物理层强制聚合】
+针对 yz_datawarehouse_ads/yz_datawarehouse_dws 库下的所有表（如： ads_fpf_female_prod_day），必须严格执行以下物理层逻辑：
+
+1. **物理视图假设**： 
+   你必须假设这些 ADS 表在数据库中是以“明细行”的形式存储的。每一行代表一条原始记录，而不是最终结果。
+   
+2. **绝对聚合指令**：
+   无论查询中涉及的指标字段名是什么（哪怕是叫 xxx_count, xxx_num, xxx_total），只要该字段出现在 SELECT 子句中，必须使用聚合函数包裹。
+   - **禁止**：直接选择原始字段（如 `t1`.`sale_out_female`）。
+   - **强制**：必须使用 `SUM(字段名)` 或 `MAX(字段名)`。
+
+3. **维度绑定**：
+   所有非指标字段（维度，如日期、猪场 ID）必须出现在 GROUP BY 中。
+
+4. **拒绝智能推断**：
+   严禁根据字段名称（如“淘汰母猪数”）推断其是否已聚合。严禁为了“代码简洁”而省略 GROUP BY 和聚合函数。严格执行“有 Select 必有 Group By”的物理规则。
+   """
         # 第一步：前置判断下钻类型
         is_granular, is_raw = self.judge_drill_type(question)
         # 第二步：计算聚合规则

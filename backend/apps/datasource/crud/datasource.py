@@ -470,11 +470,16 @@ def updateNum(session: SessionDep, ds: CoreDatasource):
 
 def get_table_obj_by_ds(session: SessionDep, current_user: CurrentUser, ds: CoreDatasource, table_name_list: List[str] = None) -> List[TableAndFields]:
     _list: List = []
-    if table_name_list:
-        tables = session.query(CoreTable).filter(and_(CoreTable.ds_id == ds.id, CoreTable.table_name.in_(table_name_list))).all()
+    # 根据是否传入 table_name_list 决定查询范围
+    if table_name_list and len(table_name_list) > 0:
+        # 只查询指定的表
+        tables = session.query(CoreTable).filter(
+            and_(CoreTable.ds_id == ds.id, CoreTable.table_name.in_(table_name_list))
+        ).all()
     else:
+        # 查询数据源下所有表
         tables = session.query(CoreTable).filter(CoreTable.ds_id == ds.id).all()
-    tables = session.query(CoreTable).filter(CoreTable.ds_id == ds.id).all()
+    
     conf = DatasourceConf(**json.loads(aes_decrypt(ds.configuration))) if ds.type != "excel" else get_engine_config()
     schema = conf.dbSchema if conf.dbSchema is not None and conf.dbSchema != "" else conf.database
 
