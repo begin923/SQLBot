@@ -3,28 +3,29 @@
 """
 Markdown to JSON Converter
 Converts structured Markdown documentation to standardized JSON format
+使用手动解析以支持复杂表格
 """
 
 import json
 import os
-import re
 import sys
-import ast
 from typing import Dict, List, Any, Optional
+import csv
+from io import StringIO
 
 # 导入指标元数据模型
 from apps.extend.metric_metadata.models.metric_metadata_model import MetricMetadataInfo
 
 
 class ParseMDToJson:
-    """MD 文档解析器，支持血缘和维度属性解析"""
+    """MD 文档解析器，支持血缘和维度属性解析 - 使用 CSV 解析器处理 Markdown 表格"""
 
     def __init__(self):
         pass
 
 
-    def parse_markdown_file(self,file_path: str) -> str:
-        """读取Markdown文件内容"""
+    def parse_markdown_file(self, file_path: str) -> str:
+        """读取 Markdown 文件内容"""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 return f.read()
@@ -34,8 +35,8 @@ class ParseMDToJson:
             raise Exception(f"Error reading file: {str(e)}")
 
 
-    def extract_basic_info(self,markdown: str) -> Dict[str, str]:
-        """从 Markdown 中提取基本信息 - 使用逐行解析"""
+    def extract_basic_info(self, markdown: str) -> Dict[str, str]:
+        """从 Markdown 中提取基本信息 - 使用 CSV 解析器处理 Markdown 表格"""
         lines = markdown.split('\n')
 
         for i, line in enumerate(lines):
@@ -43,14 +44,10 @@ class ParseMDToJson:
                 # 这是表头行，下一行是数据行
                 if i + 2 < len(lines):  # 跳过表头和分隔线
                     data_line = lines[i + 2]  # 表头->分隔线->数据行
-                    if data_line.startswith('|') and 'ads_' in data_line:
-                        # 分割单元格（去掉首尾的|）
-                        parts = data_line.strip().split('|')
-                        cells = [part.strip() for part in parts[1:-1]]  # 去掉首尾空元素
-
-                        # 根据表头确定索引
-                        header_parts = line.strip().split('|')
-                        headers = [h.strip() for h in header_parts[1:-1]]
+                    if data_line.startswith('|') and ('ads_' in data_line or 'dwd_' in data_line or 'dws_' in data_line or 'ods_' in data_line):
+                        # 使用 CSV 解析器处理 Markdown 表格
+                        headers = self.parse_markdown_table_row(line)
+                        cells = self.parse_markdown_table_row(data_line)
 
                         result = {}
                         for idx, header in enumerate(headers):
@@ -75,38 +72,76 @@ class ParseMDToJson:
         raise ValueError("Basic info not found in markdown")
 
 
-    def extract_field_list(self,markdown: str) -> List[Dict[str, Any]]:
-        """从 Markdown 中提取字段清单 - 使用逐行解析"""
+    def parse_markdown_table_row(self, row: str) -> List[str]:
+        """解析 Markdown 表格行，正确处理单元格内的逗号和管道符"""
+        # 去掉首尾的 | 和空格
+        row = row.strip()
+        if row.startswith('|'):
+            row = row[1:]
+        if row.endswith('|'):
+            row = row[:-1]
+        
+        # 分割单元格
+        cells = []
+        current_cell = ''
+        in_pipe_count = 0
+        
+        for char in row:
+            if char == '|' and (not current_cell or current_cell[-1] != '\\'):
+                # 遇到管道符（且不是转义的），完成当前单元格
+                cells.append(current_cell.strip())
+                current_cell = ''
+            else:
+                current_cell += char
+        
+        # 添加最后一个单元格
+        if current_cell:
+            cells.append(current_cell.strip())
+        
+        return cells
+
+
+    def extract_field_list(self, markdown: str) -> List[Dict[str, Any]]:
+        """从 Markdown 中提取字段清单 - 使用 CSV 解析器处理 Markdown 表格"""
         lines = markdown.split('\n')
         fields = []
         in_field_section = False
         headers = []
 
-        for line in lines:
-            line = line.strip()
+        print(f"\n📝 开始提取字段列表...")
+        
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
 
             # 检测字段清单章节
-            if line.startswith('## 字段清单'):
+            if line_stripped.startswith('## 字段清单'):
                 in_field_section = True
+                print(f"   ✅ 找到字段清单章节 (第 {i+1} 行)")
                 continue
+            
+            # 如果遇到新的章节标题，结束字段清单解析
+            if in_field_section and line_stripped.startswith('## ') and '字段清单' not in line_stripped:
+                print(f"   ⏹️  遇到新章节，结束字段清单解析 (第 {i+1} 行)")
+                break
 
             if not in_field_section:
                 continue
 
             # 跳过空行和分隔线
-            if not line or line.startswith('|---') or line.startswith('|------'):
+            if not line_stripped or line_stripped.startswith('|---') or line_stripped.startswith('|------'):
                 continue
 
             # 检测表头行
-            if line.startswith('|') and 'field_id' in line:
-                headers = [cell.strip() for cell in line.split('|') if cell.strip()]
+            if line_stripped.startswith('|') and 'field_id' in line_stripped:
+                headers = self.parse_markdown_table_row(line_stripped)
+                print(f"   📋 表头列数：{len(headers)}")
                 continue
 
             # 解析数据行
-            if line.startswith('|') and headers:
-                cells = [cell.strip() for cell in line.split('|') if cell.strip()]
+            if line_stripped.startswith('|') and headers:
+                cells = self.parse_markdown_table_row(line_stripped)
 
-                # 确保单元格数量与表头一致（允许最后一列为空）
+                # 确保单元格数量与表头一致
                 while len(cells) < len(headers):
                     cells.append('')
 
@@ -118,6 +153,7 @@ class ParseMDToJson:
                 if field_dict:
                     fields.append(field_dict)
 
+        print(f"   ✅ 共提取 {len(fields)} 个字段\n")
         return fields
 
 
@@ -155,6 +191,54 @@ class ParseMDToJson:
         return value.strip().lower() == 'true'
 
 
+    def create_dimension_dict(self, fields: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """从字段列表创建维度字典 (以 field_name_en 为 key)"""
+        dimensions = {}
+        dimension_count = 0
+        metric_count = 0
+        other_count = 0
+        
+        print(f"\n📊 开始创建维度字典...")
+        print(f"   输入字段总数：{len(fields)}")
+        
+        for field in fields:
+            field_type = field.get('field_type', '')
+            field_name_en = field.get('field_name_en', '')
+            
+            if field_type != 'dimension':
+                if field_type == 'metric':
+                    metric_count += 1
+                else:
+                    other_count += 1
+                continue
+            
+            dimension_count += 1
+            dimensions[field_name_en] = {
+                "dim_id": field.get('field_id', ''),
+                "dim_name": field.get('field_name', ''),
+                "dim_column": field_name_en,
+                "data_type": field.get('data_type', ''),
+                "calculation_type": field.get('calculation_type', ''),
+                "formula": field.get('formula', ''),
+                "source_tables": self.parse_array(field.get('source_tables', '[]')),
+                "source_fields": self.parse_array(field.get('source_fields', '[]')),
+                "filters": field.get('filters', ''),
+                "joins": field.get('joins', ''),
+                "business_description": field.get('business_description', ''),
+                "is_cross_table": self.parse_boolean(field.get('is_cross_table', 'false')),
+                "support_drill_down": self.parse_boolean(field.get('support_drill_down', 'false')),
+                "drill_down_fields": self.parse_array(field.get('drill_down_fields', '[]')),
+                "validation_status": field.get('validation_status', '')
+            }
+        
+        print(f"   - 指标字段：{metric_count} 个")
+        print(f"   - 维度字段：{dimension_count} 个")
+        print(f"   - 其他字段：{other_count} 个")
+        print(f"✅ 维度字典创建完成，共 {len(dimensions)} 条\n")
+        
+        return dimensions
+    
+    
     def create_metric_dict(self,fields: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         """从字段列表创建指标字典 (以 metric_name_en 为 key)"""
         metrics = {}
@@ -246,7 +330,7 @@ class ParseMDToJson:
         return "待确认"
 
 
-    def create_json_result(self,basic_info: Dict[str, str], metrics: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    def create_json_result(self, basic_info: Dict[str, str], metrics: Dict[str, Dict[str, Any]], dimensions: Dict[str, Dict[str, Any]], fields: List[Dict[str, Any]]) -> Dict[str, Any]:
         """创建最终的 JSON 结果"""
         return {
             "success": True,
@@ -262,7 +346,9 @@ class ParseMDToJson:
                     "desc": basic_info['target_table_desc'],  # table_desc
                     "file_path": f"{basic_info['warehouse_layer']}/{basic_info['file_name']}"
                 },
-                "metrics": metrics
+                "metrics": metrics,
+                "dimensions": dimensions,  # 新增：维度字段列表
+                "fields": fields  # 保留：所有字段信息（包括维度和指标）
             }
         }
 
@@ -279,14 +365,18 @@ class ParseMDToJson:
     
         # 3. 提取字段清单
         fields = self.extract_field_list(markdown_content)
+        print(f"extract_field_list:{fields}")
     
         # 4. 创建指标字典
         metrics = self.create_metric_dict(fields)
+        
+        # 5. 创建维度字典
+        dimensions = self.create_dimension_dict(fields)
     
-        # 5. 创建最终 JSON
-        result = self.create_json_result(basic_info, metrics)
+        # 6. 创建最终 JSON（包含 metrics, dimensions, fields）
+        result = self.create_json_result(basic_info, metrics, dimensions, fields)
     
-        # 6. 输出结果
+        # 7. 输出结果
         # print(json.dumps(result, indent=2, ensure_ascii=False))
     
         return result
@@ -432,5 +522,5 @@ class ParseMDToJson:
 
 if __name__ == "__main__":
     parse = ParseMDToJson()
-    res = parse.parse_md_to_metric_metadata_list(table_name="yz_datawarehouse_ads.ads_pig_feed_sum_month")
+    res = parse.parse_md_to_metric_metadata_list(table_name="yz_datawarehouse.ads.ads_anc_idx_female_wean_info")
     print(res)
