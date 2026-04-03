@@ -1,8 +1,7 @@
 import datetime
+import time
 from pathlib import Path
 from typing import List, Optional
-
-from sqlalchemy.orm import Session
 
 from apps.ai_model.embedding import EmbeddingModelCache
 from sqlalchemy import and_, or_, select, func, delete, update, text
@@ -67,7 +66,7 @@ def create_metric_metadata(session: SessionDep, info: MetricMetadataInfo, skip_e
     # ========== 步骤 4：处理 Embedding ==========
     if not skip_embedding and settings.EMBEDDING_ENABLED:
         try:
-            _save_metric_embeddings([metric.id])
+            _save_metric_embeddings([metric.id], session)
         except Exception as e:
             print(f"Metric embedding processing failed: {str(e)}")
             # embedding 失败不影响主流程
@@ -133,7 +132,7 @@ def batch_create_metric_metadata(session: SessionDep, info_list: List[MetricMeta
     # 批量处理 embedding（只在最后执行一次）
     if success_count > 0 and inserted_ids and settings.EMBEDDING_ENABLED:
         try:
-            _save_metric_embeddings(inserted_ids)
+            _save_metric_embeddings(inserted_ids, session)
         except Exception as e:
             print(f"Batch metric embedding processing failed: {str(e)}")
     
@@ -186,7 +185,7 @@ def update_metric_metadata(session: SessionDep, info: MetricMetadataInfo):
     # 更新 embedding
     if settings.EMBEDDING_ENABLED:
         try:
-            _save_metric_embeddings([info.id])
+            _save_metric_embeddings([info.id], session)
         except Exception as e:
             print(f"Update metric embedding processing failed: {str(e)}")
     
@@ -504,13 +503,14 @@ def get_all_metric_metadata(session: SessionDep,
     return _list
 
 
-def _save_metric_embeddings(ids: List[int]):
+def _save_metric_embeddings(ids: List[int], session: SessionDep):
     """
     为指标元数据计算并保存 embedding 向量
     参考 terminology 表的 save_embeddings 函数实现
     
     Args:
         ids: 指标 ID 列表
+        session: 数据库会话（由调用方传入）
     """
     if not settings.EMBEDDING_ENABLED:
         print("ℹ️  EMBEDDING_ENABLED 未启用，跳过向量化")
@@ -519,9 +519,6 @@ def _save_metric_embeddings(ids: List[int]):
     if not ids or len(ids) == 0:
         print("ℹ️  没有需要处理的数据，跳过向量化")
         return
-    
-    # 创建独立的数据库会话
-    session = _create_local_session()
     
     try:
         print(f"🔍 正在查询 {len(ids)} 条记录...")
@@ -551,7 +548,6 @@ def _save_metric_embeddings(ids: List[int]):
             print("✅ Embedding 模型加载成功")
             
             print("⏳ 开始计算 embedding 向量（这可能需要一些时间）...")
-            import time
             start_time = time.time()
             results = model.embed_documents(texts)
             end_time = time.time()
@@ -600,43 +596,8 @@ def _save_metric_embeddings(ids: List[int]):
         traceback.print_exc()
         raise
     finally:
-        session.close()
         print("🔒 数据库会话已关闭")
 
-
-def _create_local_session():
-    """
-    创建一个独立的数据库会话（用于本地测试或后台任务）
-    不依赖 SessionDep，直接从.env 文件读取配置
-    
-    Returns:
-        session: SQLAlchemy 会话对象
-    """
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-    import os
-    from dotenv import load_dotenv
-    
-    # 加载根目录的.env 文件
-    env_path = Path(__file__).parent.parent.parent.parent.parent / ".env"
-    if env_path.exists():
-        load_dotenv(env_path)
-    
-    # 从环境变量读取数据库配置
-    db_host = os.getenv("POSTGRES_SERVER", "localhost")
-    db_port = os.getenv("POSTGRES_PORT", "5432")
-    db_user = os.getenv("POSTGRES_USER", "sqlbot")
-    db_password = os.getenv("POSTGRES_PASSWORD", "sqlbot")
-    db_name = os.getenv("POSTGRES_DB", "sqlbot")
-    
-    database_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-    
-    # 创建引擎和会话
-    engine = create_engine(database_url)
-    SessionLocal = sessionmaker(bind=engine)
-    session = SessionLocal()
-    
-    return session
 
 
 def _init_local_config():
@@ -679,10 +640,13 @@ def _init_local_config():
                 settings.LOCAL_MODEL_PATH = alt_path
 
 
-def fill_empty_embeddings(session: Session = None):
+def fill_empty_embeddings(session: SessionDep):
     """
     填充所有缺失的 embedding 向量
     参考 terminology 表的 run_fill_empty_embeddings 函数实现
+    
+    Args:
+        session: 数据库会话（由调用方传入）
     """
     # 先初始化本地配置，确保 LOCAL_MODEL_PATH 等配置项正确
     _init_local_config()
@@ -697,13 +661,7 @@ def fill_empty_embeddings(session: Session = None):
     # 使用 ORM 方式查询
     print("🔍 正在查询需要向量化的记录...")
     try:
-        # 创建独立的数据库会话
-        if session is None:
-            print("🔒 创建独立的数据库会话")
-            session = _create_local_session()
-        
-        try:
-            # 使用 ORM 查询
+        # 使用 ORM 查询
             select_null_vector = "SELECT id FROM metric_metadata WHERE embedding_vector IS NULL"
             sql = text(select_null_vector)
             print(f"📝 执行 SQL: {select_null_vector}")
@@ -720,20 +678,11 @@ def fill_empty_embeddings(session: Session = None):
             
             if results:
                 print(f"⏳ 开始调用 _save_metric_embeddings...")
-                # 关闭当前会话，在新会话中处理向量化
-                session.close()
-                _save_metric_embeddings(list(results))
+                _save_metric_embeddings(list(results), session)
                 print(f"✅ 向量化处理完成")
-        
-        finally:
-            session.close()
-            print("🔒 数据库会话已关闭")
     
     except Exception as query_error:
         print(f"❌ 查询失败：{query_error}")
         import traceback
         traceback.print_exc()
         raise
-    finally:
-        session.close()
-        print("🔒 数据库会话已关闭")

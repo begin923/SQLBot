@@ -127,7 +127,7 @@ async def delete(session: SessionDep, ids: List[int]):
 
 
 @router.post("/fill-embeddings")
-async def fill_embeddings():
+async def fill_embeddings(session: SessionDep):
     """
     填充缺失的 embedding 向量（后台任务）
     
@@ -135,11 +135,7 @@ async def fill_embeddings():
         执行结果
     """
     try:
-        from common.core.db import engine
-        from sqlalchemy.orm import sessionmaker, scoped_session
-        session_maker = scoped_session(sessionmaker(bind=engine))
-        
-        fill_empty_embeddings()
+        fill_empty_embeddings(session)
         return {"success": True, "message": "开始填充 embedding，请稍后查看日志"}
     except Exception as e:
         return {"success": False, "message": str(e)}

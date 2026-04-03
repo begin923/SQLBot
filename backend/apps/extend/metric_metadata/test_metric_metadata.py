@@ -26,25 +26,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 
-project_root = Path(__file__).parent.parent.parent.parent
-sys.path.insert(0, str(project_root))
-
 # 现在可以直接导入后端模块
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlmodel import Session
-from apps.extend.metric_metadata.curd.metric_metadata import (
-    create_metric_metadata,
-    batch_create_metric_metadata,
-    get_all_metric_metadata,
-    page_metric_metadata,
-    get_metric_metadata_by_id,
-    delete_metric_metadata,
-    update_metric_metadata,
-    fill_empty_embeddings
-)
-from apps.extend.metric_metadata.models.metric_metadata_model import MetricMetadataInfo
-
-
+project_root = Path(__file__).parent.parent.parent.parent
+sys.path.insert(0, str(project_root))
 # 获取项目根目录（向上追溯 5 层：backend/apps/extend/metric_metadata -> D:\codes\MySQLBot）
 current_file = Path(__file__).resolve()
 project_root = current_file.parent.parent.parent.parent.parent
@@ -77,6 +63,19 @@ print(f"👤 用户：{DB_USER}")
 
 engine = create_engine(DATABASE_URL)
 session_maker = scoped_session(sessionmaker(bind=engine, class_=Session))
+
+
+from apps.extend.metric_metadata.curd.metric_metadata import (
+    create_metric_metadata,
+    batch_create_metric_metadata,
+    get_all_metric_metadata,
+    page_metric_metadata,
+    get_metric_metadata_by_id,
+    delete_metric_metadata,
+    update_metric_metadata,
+    fill_empty_embeddings
+)
+from apps.extend.metric_metadata.models.metric_metadata_model import MetricMetadataInfo
 
 
 def print_section(title):
@@ -350,7 +349,7 @@ def test_delete():
         print("⏭️  跳过删除测试")
 
 
-def test_fill_embeddings(session:Session = None):
+def test_fill_embeddings(session):
     """9. 填充 Embedding"""
     print_section("9. 填充 Embedding 向量")
     

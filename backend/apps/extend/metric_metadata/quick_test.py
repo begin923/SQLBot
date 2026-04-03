@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 # 获取项目根目录（向上追溯 4 层）
-from apps.extend.format.parse_md_to_json import ParseMDToJson
+from apps.extend.metric_metadata.parse_md_to_json import ParseMDToJson
 from apps.extend.metric_metadata.curd.metric_metadata import fill_empty_embeddings, get_metric_metadata_by_names
 
 current_file = Path(__file__).resolve()
@@ -22,10 +22,10 @@ project_root = current_file.parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 # 直接导入需要的模块，避免循环依赖
-from sqlalchemy import create_engine, Column, BigInteger, String, Text, DateTime, func
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 
 # 导入正式的模型定义
 from apps.extend.metric_metadata.models.metric_metadata_model import MetricMetadataInfo, MetricMetadata
@@ -292,7 +292,7 @@ def test_vectorization(session: Session):
             # 调用 CRUD 中的向量化函数
             import time
             start_time = time.time()
-            fill_empty_embeddings()
+            fill_empty_embeddings(session)
             elapsed_time = time.time() - start_time
             
             print(f"   ✅ 向量化完成！耗时：{elapsed_time:.2f}秒")
