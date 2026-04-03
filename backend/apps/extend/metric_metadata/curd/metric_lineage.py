@@ -63,7 +63,7 @@ def create_metric_lineage(session: SessionDep, info: MetricLineageInfo):
 
 def batch_create_metric_lineage(session: SessionDep, info_list: List[MetricLineageInfo]):
     """
-    批量创建指标血缘记录
+    批量创建或更新指标血缘记录
     
     Args:
         session: 数据库会话
@@ -77,11 +77,13 @@ def batch_create_metric_lineage(session: SessionDep, info_list: List[MetricLinea
             'success_count': 0,
             'failed_records': [],
             'duplicate_count': 0,
+            'update_count': 0,
             'original_count': 0
         }
     
     failed_records = []
     success_count = 0
+    update_count = 0
     
     # 去重处理
     unique_key_set = set()
@@ -101,10 +103,38 @@ def batch_create_metric_lineage(session: SessionDep, info_list: List[MetricLinea
         unique_key_set.add(unique_key)
         deduplicated_list.append(info)
     
-    # 批量插入
+    # 批量插入或更新
     for info in deduplicated_list:
         try:
-            create_metric_lineage(session, info)
+            # 检查是否已存在
+            exists_query = session.query(MetricLineage).filter(
+                and_(
+                    MetricLineage.metric_column == info.metric_column.strip(),
+                    MetricLineage.table_name == info.table_name.strip()
+                )
+            ).first()
+            
+            if exists_query:
+                # 已存在则更新
+                stmt = update(MetricLineage).where(
+                    and_(
+                        MetricLineage.metric_column == info.metric_column.strip(),
+                        MetricLineage.table_name == info.table_name.strip()
+                    )
+                ).values(
+                    metric_name=info.metric_name.strip() if info.metric_name else None,
+                    synonyms=info.synonyms.strip() if info.synonyms else None,
+                    upstream_table=info.upstream_table.strip() if info.upstream_table else None,
+                    filter=info.filter.strip() if info.filter else None,
+                    calc_logic=info.calc_logic.strip() if info.calc_logic else None,
+                    dw_layer=info.dw_layer.strip() if info.dw_layer else None,
+                )
+                session.execute(stmt)
+                update_count += 1
+            else:
+                # 不存在则创建
+                create_metric_lineage(session, info)
+            
             success_count += 1
         except Exception as e:
             failed_records.append({
@@ -112,8 +142,11 @@ def batch_create_metric_lineage(session: SessionDep, info_list: List[MetricLinea
                 'errors': [str(e)]
             })
     
+    session.commit()
+    
     return {
         'success_count': success_count,
+        'update_count': update_count,
         'failed_records': failed_records,
         'duplicate_count': duplicate_count,
         'original_count': len(info_list),
@@ -173,6 +206,7 @@ def delete_metric_lineage(session: SessionDep, keys: List[tuple]):
         session: 数据库会话
         keys: 要删除的记录键列表 [(metric_column, table_name), ...]
     """
+    from sqlalchemy import or_
     conditions = [
         and_(
             MetricLineage.metric_column == key[0],
@@ -182,6 +216,19 @@ def delete_metric_lineage(session: SessionDep, keys: List[tuple]):
     ]
     
     stmt = delete(MetricLineage).where(or_(*conditions))
+    session.execute(stmt)
+    session.commit()
+
+
+def delete_metric_lineage_by_table(session: SessionDep, table_name: str):
+    """
+    根据表名删除所有指标血缘记录
+    
+    Args:
+        session: 数据库会话
+        table_name: 表名
+    """
+    stmt = delete(MetricLineage).where(MetricLineage.table_name == table_name)
     session.execute(stmt)
     session.commit()
 
@@ -442,7 +489,7 @@ def create_metric_dimension(session: SessionDep, info: MetricDimensionInfo):
 
 def batch_create_metric_dimension(session: SessionDep, info_list: List[MetricDimensionInfo]):
     """
-    批量创建指标维度记录
+    批量创建或更新指标维度记录
     
     Args:
         session: 数据库会话
@@ -456,11 +503,13 @@ def batch_create_metric_dimension(session: SessionDep, info_list: List[MetricDim
             'success_count': 0,
             'failed_records': [],
             'duplicate_count': 0,
+            'update_count': 0,
             'original_count': 0
         }
     
     failed_records = []
     success_count = 0
+    update_count = 0
     
     # 去重处理
     unique_key_set = set()
@@ -480,10 +529,33 @@ def batch_create_metric_dimension(session: SessionDep, info_list: List[MetricDim
         unique_key_set.add(unique_key)
         deduplicated_list.append(info)
     
-    # 批量插入
+    # 批量插入或更新
     for info in deduplicated_list:
         try:
-            create_metric_dimension(session, info)
+            # 检查是否已存在
+            exists_query = session.query(MetricDimension).filter(
+                and_(
+                    MetricDimension.table_name == info.table_name.strip(),
+                    MetricDimension.dim_column == info.dim_column.strip()
+                )
+            ).first()
+            
+            if exists_query:
+                # 已存在则更新
+                stmt = update(MetricDimension).where(
+                    and_(
+                        MetricDimension.table_name == info.table_name.strip(),
+                        MetricDimension.dim_column == info.dim_column.strip()
+                    )
+                ).values(
+                    dim_name=info.dim_name.strip() if info.dim_name else None,
+                )
+                session.execute(stmt)
+                update_count += 1
+            else:
+                # 不存在则创建
+                create_metric_dimension(session, info)
+            
             success_count += 1
         except Exception as e:
             failed_records.append({
@@ -491,8 +563,11 @@ def batch_create_metric_dimension(session: SessionDep, info_list: List[MetricDim
                 'errors': [str(e)]
             })
     
+    session.commit()
+    
     return {
         'success_count': success_count,
+        'update_count': update_count,
         'failed_records': failed_records,
         'duplicate_count': duplicate_count,
         'original_count': len(info_list),
@@ -508,6 +583,7 @@ def delete_metric_dimension(session: SessionDep, keys: List[tuple]):
         session: 数据库会话
         keys: 要删除的记录键列表 [(table_name, dim_column), ...]
     """
+    from sqlalchemy import or_
     conditions = [
         and_(
             MetricDimension.table_name == key[0],
@@ -516,8 +592,20 @@ def delete_metric_dimension(session: SessionDep, keys: List[tuple]):
         for key in keys
     ]
     
-    from sqlalchemy import or_
     stmt = delete(MetricDimension).where(or_(*conditions))
+    session.execute(stmt)
+    session.commit()
+
+
+def delete_metric_dimension_by_table(session: SessionDep, table_name: str):
+    """
+    根据表名删除所有指标维度记录
+    
+    Args:
+        session: 数据库会话
+        table_name: 表名
+    """
+    stmt = delete(MetricDimension).where(MetricDimension.table_name == table_name)
     session.execute(stmt)
     session.commit()
 

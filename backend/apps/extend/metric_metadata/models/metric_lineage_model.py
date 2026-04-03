@@ -18,7 +18,7 @@ class MetricLineage(SQLModel, table=True):
     filter: Optional[str] = Field(sa_column=Column(Text, nullable=True))
     calc_logic: Optional[str] = Field(sa_column=Column(Text, nullable=True))
     dw_layer: Optional[str] = Field(sa_column=Column(String(20), nullable=True))
-    embedding_vector: Optional[List[float]] = Field(sa_column=Column('vector', nullable=True))
+    embedding_vector: Optional[List[float]] = Field(sa_column=Column('embedding_vector', nullable=True))
     create_time: Optional[datetime] = Field(sa_column=Column(DateTime(timezone=False), nullable=True, default=datetime.now))
 
 

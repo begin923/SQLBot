@@ -38,7 +38,11 @@ from apps.datasource.crud.permission import get_row_permission_filters, is_norma
 from apps.datasource.embedding.ds_embedding import get_ds_embedding
 from apps.datasource.models.datasource import CoreDatasource, CoreTable
 from apps.db.db import exec_sql, get_version, check_connection, get_fields
+from apps.extend.chat_manager.services.chat_service import ChatService
+from apps.extend.drilldown.drill_agg_rule_engine import DrillAggRuleEngine
 from apps.extend.metric_metadata.curd.metric_metadata import get_metric_metadata_by_names
+
+from apps.extend.sql_engine.sql_validator import SQLValidator
 from apps.system.crud.assistant import AssistantOutDs, AssistantOutDsFactory, get_assistant_ds
 from apps.system.schemas.system_schema import AssistantOutDsSchema
 from apps.terminology.curd.terminology import get_terminology_template
@@ -61,7 +65,6 @@ dynamic_subsql_prefix = 'select * from sqlbot_dynamic_temp_table_'
 
 session_maker = scoped_session(sessionmaker(bind=engine, class_=Session))
 
-from apps.extend.drilldown.metric_drilldown_handler import MetricDrilldownHandler
 from apps.extend.static.static_sql_handler import StaticSQLHandler
 
 
@@ -162,8 +165,10 @@ class LLMService:
         # 初始化静态 SQL 处理对象
         self.static_sql_handler = StaticSQLHandler()
     
-        # 初始化指标钻取分析对象
-        self.metric_drilldown = MetricDrilldownHandler()
+        # 初始化 SQL 校验引擎（用于 ADS/DWS 层校验和自动修复）
+        self.sql_validator = SQLValidator(llm=self.llm)
+        self.chat_service = ChatService(llm=self.llm)
+        self.rule_engine = DrillAggRuleEngine()
         
     def _batch_add_tables_to_ds(self, session, table_names: List[str]):
         """
@@ -1003,88 +1008,6 @@ class LLMService:
                 err = traceback.format_exc(limit=1, chain=True)
                 raise SQLBotDBError(err)
 
-    def retry_generate_sql_with_error(self, session: Session, original_sql: str, error_info: str) -> Optional[str]:
-        """SQL 执行失败时，让大模型根据错误信息重新生成 SQL
-        
-        Args:
-            session: 数据库会话
-            original_sql: 原始执行的 SQL
-            error_info: 错误信息
-            
-        Returns:
-            修复后的 SQL（包含 JSON 包装），如果无法修复则返回 None
-        """
-        try:
-            # 构建错误修复提示词
-            retry_message = [
-                SystemMessage(content="""你是一个 SQL 专家，擅长修复执行失败的 SQL 语句。
-我会提供：
-1. 原始 SQL 语句
-2. 执行时的错误信息
-
-请你根据错误信息分析原因，并生成修复后的正确 SQL。
-
-要求：
-- 必须使用 JSON 格式返回，格式为：{"success": true, "sql": "修复后的 SQL"}
-- 如果无法修复，返回：{"success": false, "message": "无法修复的原因"}
-- 保持原有查询意图不变
-- 确保语法符合数据库规范"""),
-                HumanMessage(content=f"""原始 SQL:
-```sql
-{original_sql}
-```
-
-执行错误:
-{error_info}
-
-请修复这个 SQL，并以 JSON 格式返回：""")
-            ]
-            
-            SQLBotLogUtil.info("开始重试生成 SQL...")
-            full_retry_text = ''
-            token_usage = {}
-            
-            res = process_stream(self.llm.stream(retry_message), token_usage)
-            for chunk in res:
-                if chunk.get('content'):
-                    full_retry_text += chunk.get('content')
-            
-            SQLBotLogUtil.info(f"重试生成结果：{full_retry_text}")
-            
-            # 提取 JSON（去除可能的 markdown 标记）
-            retry_json_str = full_retry_text.strip()
-            if retry_json_str.startswith('```json'):
-                retry_json_str = retry_json_str[7:]
-            if retry_json_str.startswith('```'):
-                retry_json_str = retry_json_str[3:]
-            if retry_json_str.endswith('```'):
-                retry_json_str = retry_json_str[:-3]
-            retry_json_str = retry_json_str.strip()
-            
-            # 验证是否为有效 JSON
-            try:
-                import orjson
-                data = orjson.loads(retry_json_str)
-                if data.get('success') and data.get('sql'):
-                    return retry_json_str  # 返回完整的 JSON 字符串
-            except:
-                pass
-            
-            # 如果不是 JSON，尝试提取 SQL
-            if 'SELECT' in retry_json_str.upper() or 'INSERT' in retry_json_str.upper() or 'UPDATE' in retry_json_str.upper() or 'DELETE' in retry_json_str.upper():
-                # 构造 JSON 格式返回
-                return orjson.dumps({'success': True, 'sql': retry_json_str}).decode()
-            
-            # 如果返回 FAILED 或空，说明无法修复
-            if not retry_json_str or retry_json_str.upper() == 'FAILED':
-                return None
-            
-            return retry_json_str
-            
-        except Exception as e:
-            SQLBotLogUtil.error(f"重试生成 SQL 失败：{e}")
-            return None
-
     def pop_chunk(self):
         try:
             chunk = self.chunk_list.pop(0)
@@ -1183,97 +1106,118 @@ class LLMService:
 
             # ========== 下钻查询分析和处理 ==========
             # 从用户问题中提取指标名称和用户意图（整合规则引擎）
-            metrics, user_intent = self.metric_drilldown.extract_metrics_and_intent(self.llm, self.chat_question.question)
-            SQLBotLogUtil.info(f"提取的指标：{metrics}, 用户意图：{user_intent}")
-            
-            # 查询指标元数据
-            metric_info_list = get_metric_metadata_by_names(_session ,metrics)
-            SQLBotLogUtil.info(f"metric_info_list:{metric_info_list}")
-            
-            # 提取表名列表
-            table_name_list = []
-            for metric in metric_info_list:
-                table_name_list.append(metric.table_name)
-            
-            # 批量添加指标表到数据源（避免重复触发 embedding）
-            SQLBotLogUtil.info(f"table_name_list:{table_name_list}")
-            if table_name_list:
-                self._batch_add_tables_to_ds(_session, table_name_list)
-            
-            # 获取最新 schema
-            table_scheme = get_table_schema(session=_session,
-                             current_user=self.current_user, ds=self.ds,
-                             question=self.chat_question.question,
-                             table_name_list=table_name_list)
-            
-            SQLBotLogUtil.info(f"self.chat_question.db_schema:{self.chat_question.db_schema}")
-            self.chat_question.db_schema = table_scheme
-            
-            # 刷新 sql_message，使用最新的 db_schema
-            self.refresh_sql_messages_with_new_schema()
-            
-            # ========== 应用聚合规则到 LLM Prompt（关键步骤） ==========
-            # 根据用户意图和数仓分层，动态注入聚合规则到提示词
-            if metric_info_list and len(metric_info_list) > 0:
-                # 获取数仓分层信息：优先使用 dw_layer，否则从表名中提取
-                curr_layer = metric_info_list[0].dw_layer
-                if not curr_layer and metric_info_list[0].table_name:
-                    # 从表名中提取：'yz_datawarehouse_ads.table_name' -> 'yz_datawarehouse_ads'
-                    table_name = metric_info_list[0].table_name
-                    curr_layer = table_name.split('.')[0] if '.' in table_name else table_name
-                
-                # 如果还是为空，则使用默认值
-                curr_layer = curr_layer or "unknown"
-                
-                SQLBotLogUtil.info(f"当前数仓分层：{curr_layer}")
-                agg_rule_prompt = self.metric_drilldown.rule_engine.build_final_prompt(
-                    question=self.chat_question.question,
-                    curr_layer=curr_layer
-                )
-                
-                # 将聚合规则注入到 chat_question 中（在 generate_sql 时使用）
-                # 方式 1：追加到 custom_prompt
-                if not self.chat_question.custom_prompt:
-                    self.chat_question.custom_prompt = agg_rule_prompt
-                else:
-                    self.chat_question.custom_prompt += f"\n\n{agg_rule_prompt}"
-                
-                SQLBotLogUtil.info(f"已注入聚合规则到 Prompt: {agg_rule_prompt}")
-                
-                # 关键：刷新 sql_message，使聚合规则生效（重新生成 SystemMessage）
+            """
+            1、用户问题 → 判断【指标】【维度】是否明确
+            2、分支1：指标+维度明确
+               → 查询指标体系 → 优先取ADS层表
+               → ADS不满足（无表/缺维度）→ 取DWS层表
+            3、分支2：指标/维度不明确
+               → 查询chat_state历史对话指标+维度
+               → 若chat_state有数据 → 复用历史走ADS→DWS
+               → 若chat_state无数据 → 直接反问用户：请明确需要查询的指标和维度
+            4、生成SQL前，通过指标体系校验表是否为ADS/DWS（前置拦截）
+            5、校验通过则执行，不通过直接拦截上报异常
+            """
+
+            extract_res_dict = self.chat_service.extract_fields_from_question(session=_session, question=self.chat_question.question,chat_id=self.chat_question.chat_id)
+            metrics = extract_res_dict.get('metrics',[])
+            dimensions = extract_res_dict.get('dimensions',[])
+            if not metrics and len(metrics) == 0:
+                SQLBotLogUtil.info("当前用户问题没有可查询指标，开始查找聊天状态数据")
+                raise "没有可查询指标"
+            elif not dimensions and len(dimensions) == 0:
+                raise "没有可查询维度"
+            else:
+                # 重置用户问题：将提取结果转为字符串
+                self.chat_question.question = str(extract_res_dict)
+                # 查询指标元数据
+                metric_info_list = get_metric_metadata_by_names(_session ,metrics)
+                SQLBotLogUtil.info(f"metric_info_list:{metric_info_list}")
+
+                # 提取表名列表
+                table_name_list = []
+                for metric in metric_info_list:
+                    table_name_list.append(metric.table_name)
+
+                # 批量添加指标表到数据源（避免重复触发 embedding）
+                SQLBotLogUtil.info(f"table_name_list:{table_name_list}")
+                if table_name_list:
+                    self._batch_add_tables_to_ds(_session, table_name_list)
+
+                # 获取最新 schema
+                table_scheme = get_table_schema(session=_session,
+                                 current_user=self.current_user, ds=self.ds,
+                                 question=self.chat_question.question,
+                                 table_name_list=table_name_list)
+
+                SQLBotLogUtil.info(f"self.chat_question.db_schema:{self.chat_question.db_schema}")
+                self.chat_question.db_schema = table_scheme
+
+                # 刷新 sql_message，使用最新的 db_schema
                 self.refresh_sql_messages_with_new_schema()
-                SQLBotLogUtil.info("✅ 已刷新 SQL messages，聚合规则已注入系统提示词")
-                
-                # ========== 根据用户意图处理表范围 ==========
-                # user_intent 中已经包含是否查明细的意图，直接使用 upstream_table
-                if user_intent.get('is_raw', False):
-                    # 用户要查明细，只使用上游表，当前指标表不需要
-                    SQLBotLogUtil.info("用户要求查明细，准备使用上游表...")
-                    
-                    # 收集所有上游表
-                    upstream_tables = set()
-                    for metric_info in metric_info_list:
-                        if metric_info.upstream_table:
-                            # upstream_table 可能是逗号分隔的多个表名
-                            tables = [t.strip() for t in metric_info.upstream_table.split(',')]
-                            for table in tables:
-                                if table:  # 确保表名不为空
-                                    upstream_tables.add(table)
-                    
-                    # 只使用上游表，不添加当前指标表
-                    if upstream_tables:
-                        SQLBotLogUtil.info(f"使用上游表：{upstream_tables}")
-                        self._batch_add_tables_to_ds(_session, list(upstream_tables))
-                        
-                        # 获取上游表的 schema
-                        table_scheme = get_table_schema(session=_session,
-                                         current_user=self.current_user, ds=self.ds,
-                                         question=self.chat_question.question,
-                                         table_name_list=list(upstream_tables))
-                        self.chat_question.db_schema = table_scheme
-                        self.refresh_sql_messages_with_new_schema()
-                        SQLBotLogUtil.info(f"已更新 schema，仅包含上游表：{list(upstream_tables)}")
-                # else: 用户要查汇总/当前表，使用默认的 table_name_list（已在上面添加）
+
+                # ========== 应用聚合规则到 LLM Prompt（关键步骤） ==========
+                # 根据用户意图和数仓分层，动态注入聚合规则到提示词
+                if metric_info_list and len(metric_info_list) > 0:
+                    # 获取数仓分层信息：优先使用 dw_layer，否则从表名中提取
+                    curr_layer = metric_info_list[0].dw_layer
+                    if not curr_layer and metric_info_list[0].table_name:
+                        # 从表名中提取：'yz_datawarehouse_ads.table_name' -> 'yz_datawarehouse_ads'
+                        table_name = metric_info_list[0].table_name
+                        curr_layer = table_name.split('.')[0] if '.' in table_name else table_name
+
+                    # 如果还是为空，则使用默认值
+                    curr_layer = curr_layer or "unknown"
+
+                    SQLBotLogUtil.info(f"当前数仓分层：{curr_layer}")
+                    agg_rule_prompt = self.rule_engine.build_final_prompt(
+                        question=self.chat_question.question,
+                        curr_layer=curr_layer
+                    )
+
+                    # 将聚合规则注入到 chat_question 中（在 generate_sql 时使用）
+                    # 方式 1：追加到 custom_prompt
+                    if not self.chat_question.custom_prompt:
+                        self.chat_question.custom_prompt = agg_rule_prompt
+                    else:
+                        self.chat_question.custom_prompt += f"\n\n{agg_rule_prompt}"
+
+                    SQLBotLogUtil.info(f"已注入聚合规则到 Prompt: {agg_rule_prompt}")
+
+                    # 关键：刷新 sql_message，使聚合规则生效（重新生成 SystemMessage）
+                    self.refresh_sql_messages_with_new_schema()
+                    SQLBotLogUtil.info("✅ 已刷新 SQL messages，聚合规则已注入系统提示词")
+
+                    # ========== 根据用户意图处理表范围 ==========
+                    # chat_manager 中已经包含是否查明细的意图，直接使用 upstream_table
+                    # if dimensions.get('is_raw', False):
+                    #     # 用户要查明细，只使用上游表，当前指标表不需要
+                    #     SQLBotLogUtil.info("用户要求查明细，准备使用上游表...")
+                    #
+                    #     # 收集所有上游表
+                    #     upstream_tables = set()
+                    #     for metric_info in metric_info_list:
+                    #         if metric_info.upstream_table:
+                    #             # upstream_table 可能是逗号分隔的多个表名
+                    #             tables = [t.strip() for t in metric_info.upstream_table.split(',')]
+                    #             for table in tables:
+                    #                 if table:  # 确保表名不为空
+                    #                     upstream_tables.add(table)
+                    #
+                    #     # 只使用上游表，不添加当前指标表
+                    #     if upstream_tables:
+                    #         SQLBotLogUtil.info(f"使用上游表：{upstream_tables}")
+                    #         self._batch_add_tables_to_ds(_session, list(upstream_tables))
+                    #
+                    #         # 获取上游表的 schema
+                    #         table_scheme = get_table_schema(session=_session,
+                    #                          current_user=self.current_user, ds=self.ds,
+                    #                          question=self.chat_question.question,
+                    #                          table_name_list=list(upstream_tables))
+                    #         self.chat_question.db_schema = table_scheme
+                    #         self.refresh_sql_messages_with_new_schema()
+                    #         SQLBotLogUtil.info(f"已更新 schema，仅包含上游表：{list(upstream_tables)}")
+                    # else: 用户要查汇总/当前表，使用默认的 table_name_list（已在上面添加）
 
             # 执行静态 sql
             static_sql_keyword = "#FIXED_SQL_START#" in self.chat_question.question
@@ -1301,41 +1245,33 @@ class LLMService:
                 SQLBotLogUtil.info(f"full_sql_text: {full_sql_text}")
 
                 # ========== ADS/DWS 层 SQL 严格校验 ==========
-                from apps.extend.utils.check import SQLValidator
-                is_valid, error_msg = SQLValidator.validate_ads_dws_sql(full_sql_text)
+                # 使用 SQL 校验引擎进行校验和自动修复
+                is_valid, fixed_sql_json, error_msg = self.sql_validator.validate_and_fix(full_sql_text)
+                
                 if not is_valid:
-                    # 校验失败，让大模型重新生成
-                    SQLBotLogUtil.info(error_msg)
-                    if in_chat:
-                        yield 'data:' + orjson.dumps({'type': 'info', 'msg': f'SQL 校验失败：{error_msg}'}).decode() + '\n\n'
-                    
-                    # 调用大模型重新生成 SQL
-                    fixed_sql_json = self.retry_generate_sql_with_error(_session, full_sql_text, error_msg)
-                    if fixed_sql_json:
-                        # 从 JSON 中提取 SQL
-                        try:
-                            fixed_data = orjson.loads(fixed_sql_json)
-                            if fixed_data.get('success') and fixed_data.get('sql'):
-                                fixed_sql = fixed_data['sql']
-                                # 比较提取后的 SQL 是否不同
-                                if fixed_sql != full_sql_text:
-                                    SQLBotLogUtil.info(f'大模型已重新生成 SQL: {fixed_sql}')
-                                    full_sql_text = fixed_sql_json  # 保存完整的 JSON 格式
-                                    # 重新通知用户（保持和原始 SQL 生成一致的格式）
-                                    if in_chat:
-                                        yield 'data:' + orjson.dumps({'content': fixed_sql, 'reasoning_content': '', 'type': 'sql-result'}).decode() + '\n\n'
-                                        yield 'data:' + orjson.dumps({'type': 'info', 'msg': 'sql generated'}).decode() + '\n\n'
-                                else:
-                                    # 无法修复，重新抛出异常
-                                    raise ValueError(error_msg)
-                            else:
-                                # 无法修复，重新抛出异常
-                                raise ValueError(error_msg)
-                        except Exception as parse_error:
-                            SQLBotLogUtil.error(f'解析修复后的 SQL 失败：{parse_error}')
-                            raise ValueError(error_msg)
-                    else:
-                        # 无法修复，重新抛出异常
+                    # 校验失败且无法修复，抛出异常
+                    raise ValueError(error_msg)
+                
+                if fixed_sql_json and fixed_sql_json != full_sql_text:
+                    # 校验失败但修复成功，通知用户
+                    try:
+                        fixed_data = orjson.loads(fixed_sql_json)
+                        fixed_sql = fixed_data['sql']
+                        SQLBotLogUtil.info(f'SQL 校验引擎自动修复成功：{fixed_sql}')
+                        
+                        # 更新 full_sql_text 为修复后的 JSON 格式
+                        full_sql_text = fixed_sql_json
+                        
+                        # 重新通知用户（保持和原始 SQL 生成一致的格式）
+                        if in_chat:
+                            yield 'data:' + orjson.dumps({
+                                'content': fixed_sql, 
+                                'reasoning_content': '', 
+                                'type': 'sql-result'
+                            }).decode() + '\n\n'
+                            yield 'data:' + orjson.dumps({'type': 'info', 'msg': 'sql generated'}).decode() + '\n\n'
+                    except Exception as parse_error:
+                        SQLBotLogUtil.error(f'解析修复后的 SQL 失败：{parse_error}')
                         raise ValueError(error_msg)
                 # ========== 校验结束 ==========
 
@@ -1427,22 +1363,30 @@ class LLMService:
             try:
                 result = self.execute_sql(sql=real_execute_sql)
             except ParseSQLResultError as e:
-                # SQL 执行失败（如聚合字段未参与 GROUP BY），尝试让大模型修复
+                # SQL 执行失败（如聚合字段未参与 GROUP BY），使用校验引擎进行修复
                 error_info = str(e)
-                SQLBotLogUtil.info(f'SQL 执行失败，尝试让大模型修复：{error_info}')
+                SQLBotLogUtil.info(f'SQL 执行失败，尝试使用校验引擎修复：{error_info}')
+                
                 # 通知用户正在重新生成
                 if in_chat:
-                    yield 'data:' + orjson.dumps({'type': 'info', 'msg': f'SQL 执行失败，正在重新生成...错误信息：{error_info}'}).decode() + '\n\n'
-                # 调用大模型重新生成 SQL
-                fixed_sql_json = self.retry_generate_sql_with_error(_session, real_execute_sql, error_info)
+                    yield 'data:' + orjson.dumps({
+                        'type': 'info', 
+                        'msg': f'SQL 执行失败，正在重新生成...错误信息：{error_info}'
+                    }).decode() + '\n\n'
+                
+                # 使用校验引擎的 retry_generate 方法进行修复
+                fixed_sql_json = self.sql_validator.retry_generate(
+                    original_sql=real_execute_sql,
+                    error_info=error_info
+                )
+                
                 if fixed_sql_json:
-                    # 从 JSON 中提取 SQL
                     try:
                         fixed_data = orjson.loads(fixed_sql_json)
                         if fixed_data.get('success') and fixed_data.get('sql'):
                             fixed_sql = fixed_data['sql']
                             if fixed_sql != real_execute_sql:
-                                SQLBotLogUtil.info(f'大模型已修复 SQL: {fixed_sql}')
+                                SQLBotLogUtil.info(f'校验引擎已修复 SQL: {fixed_sql}')
                                 real_execute_sql = fixed_sql
                                 # 重新执行修复后的 SQL
                                 result = self.execute_sql(sql=real_execute_sql)

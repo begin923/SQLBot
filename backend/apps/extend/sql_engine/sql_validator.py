@@ -278,4 +278,4 @@ ORDER BY `org_id`,
 LIMIT 1000
     """
     is_valid, fixed_sql, error_msg = sql_validator.validate_and_fix(sql)
-    print(is_valid, fixed_sql, error_msg)
+    print(f"is_valid:{is_valid}, fixed_sql:{fixed_sql}, error_msg:{error_msg}")

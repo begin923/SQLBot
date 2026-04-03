@@ -114,7 +114,7 @@ def extract_metrics_and_intent(self, llm_client, question: str) -> Tuple[List[st
     
     Returns:
         metrics: List[str] - 指标名称列表
-        intent: Dict[str, Any] - 用户意图字典
+        chat_manager: Dict[str, Any] - 用户意图字典
             {
                 "is_granular": bool,      # 是否粒度下钻
                 "is_raw": bool,           # 是否穿透下钻

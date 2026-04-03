@@ -189,3 +189,4 @@ test.py
 
 
 !/.venv/
+/backend/apps/extend/metric_blood/

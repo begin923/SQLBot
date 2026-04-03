@@ -818,3 +818,29 @@ def get_old_questions(session: SessionDep, datasource: int):
     for r in result:
         records.append(r.question)
     return records
+
+
+def get_recent_records_by_chat_id(session: SessionDep, chat_id: int, datasource_id: int = None, limit: int = 10) -> List[ChatRecord]:
+    """
+    根据 chat_id 查询最新的 N 条记录
+    
+    Args:
+        session: 数据库会话
+        chat_id: 聊天 ID
+        datasource_id: 数据源 ID（可选，用于验证记录是否属于指定数据源）
+        limit: 返回记录数量限制，默认 10 条
+    
+    Returns:
+        ChatRecord 列表（按 create_time 降序排列）
+    """
+    query = (
+        session.query(ChatRecord)
+        .filter(ChatRecord.chat_id == chat_id)
+    )
+    
+    # 如果提供了 datasource_id，则添加过滤条件
+    if datasource_id is not None:
+        query = query.filter(ChatRecord.datasource == datasource_id)
+    
+    records = query.order_by(ChatRecord.create_time.desc()).limit(limit).all()
+    return records
