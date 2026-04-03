@@ -38,3 +38,5 @@ CREATE UNIQUE INDEX idx_metric_table ON metric_metadata (metric_column,table_nam
 CREATE INDEX idx_datasource ON metric_metadata (datasource_id);
 CREATE INDEX idx_table_name ON metric_metadata (table_name);
 
+
+
