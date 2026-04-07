@@ -29,6 +29,7 @@ class MetricDimension(SQLModel, table=True):
     table_name: str = Field(sa_column=Column(String(100), primary_key=True, nullable=False))
     dim_column: str = Field(sa_column=Column(String(100), primary_key=True, nullable=False))
     dim_name: Optional[str] = Field(sa_column=Column(String(100), nullable=True))
+    embedding_vector: Optional[List[float]] = Field(sa_column=Column('embedding_vector', nullable=True))
     create_time: Optional[datetime] = Field(sa_column=Column(DateTime(timezone=False), nullable=True, default=datetime.now))
 
 

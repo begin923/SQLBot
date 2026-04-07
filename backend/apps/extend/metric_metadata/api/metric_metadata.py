@@ -12,7 +12,17 @@ from apps.extend.metric_metadata.curd.metric_metadata import (
     get_all_metric_metadata,
     fill_empty_embeddings
 )
+from apps.extend.metric_metadata.curd.metric_lineage import (
+    batch_create_metric_dimension,
+    delete_metric_dimension,
+    get_metric_dimensions_by_table,
+    page_metric_dimension,
+    get_all_metric_dimension,
+    search_metric_dimensions,
+    save_dimension_embeddings
+)
 from apps.extend.metric_metadata.models.metric_metadata_model import MetricMetadataInfo
+from apps.extend.metric_metadata.models.metric_lineage_model import MetricDimensionInfo
 from common.core.deps import SessionDep
 
 router = APIRouter(tags=["Metric Metadata"], prefix="/extend/metric-metadata")
@@ -334,3 +344,166 @@ async def test_clear_all(session: SessionDep):
             "success": False,
             "error": str(e)
         }
+
+
+# ========== Metric Dimension API ==========
+
+@router.get("/dimension/page/{current_page}/{page_size}")
+async def page_dimensions(
+    session: SessionDep,
+    current_page: int,
+    page_size: int,
+    table_name: Optional[str] = Query(None, description="表名")
+):
+    """
+    分页查询指标维度
+    
+    Returns:
+        分页结果
+    """
+    current_page, page_size, total_count, total_pages, _list = page_metric_dimension(
+        session, current_page, page_size, table_name
+    )
+    
+    return {
+        "current_page": current_page,
+        "page_size": page_size,
+        "total_count": total_count,
+        "total_pages": total_pages,
+        "data": _list
+    }
+
+
+@router.get("/dimension/list")
+async def list_dimensions(
+    session: SessionDep,
+    table_name: Optional[str] = Query(None, description="表名")
+):
+    """
+    获取所有指标维度（不分页）
+    
+    Returns:
+        维度列表
+    """
+    _list = get_all_metric_dimension(session, table_name)
+    return {"data": _list}
+
+
+@router.get("/dimension/table/{table_name}")
+async def get_dimensions_by_table(session: SessionDep, table_name: str):
+    """
+    根据表名查询所有维度
+    
+    Returns:
+        维度列表
+    """
+    _list = get_metric_dimensions_by_table(session, table_name)
+    return {"data": _list}
+
+
+@router.post("/dimension/batch")
+async def batch_create_dimensions(session: SessionDep, info_list: List[MetricDimensionInfo]):
+    """
+    批量创建指标维度
+    
+    Args:
+        info_list: 维度信息列表
+    
+    Returns:
+        处理结果统计
+    """
+    result = batch_create_metric_dimension(session, info_list)
+    return result
+
+
+@router.delete("/dimension")
+async def delete_dimensions(session: SessionDep, keys: List[List[str]]):
+    """
+    删除指标维度
+    
+    Args:
+        keys: 要删除的记录键列表 [[table_name, dim_column], ...]
+    
+    Returns:
+        删除结果
+    """
+    # 将 List[List[str]] 转换为 List[tuple]
+    tuple_keys = [(key[0], key[1]) for key in keys]
+    delete_metric_dimension(session, tuple_keys)
+    return {"success": True, "deleted_count": len(tuple_keys)}
+
+
+@router.get("/dimension/search")
+async def search_dimensions(
+    session: SessionDep,
+    search_text: str = Query(..., description="搜索文本"),
+    table_name: Optional[str] = Query(None, description="表名（可选，用于过滤）"),
+    datasource_id: Optional[int] = Query(None, description="数据源 ID（可选）"),
+    search_mode: str = Query('hybrid', description="搜索模式: hybrid(混合，默认), exact(精准), fuzzy(模糊), vector(向量)"),
+    top_k: int = Query(10, description="返回结果数量限制")
+):
+    """
+    搜索指标维度（支持精准、模糊、向量检索）
+    
+    搜索策略：
+    - hybrid (默认): 三级检索，按顺序执行 精准→模糊→向量，匹配到即返回
+    - exact: 仅精准匹配
+    - fuzzy: 仅模糊匹配
+    - vector: 仅向量语义搜索
+    
+    Args:
+        search_text: 搜索文本
+        table_name: 表名（可选，用于过滤）
+        datasource_id: 数据源 ID（可选）
+        search_mode: 搜索模式，默认 'hybrid'
+        top_k: 返回结果数量
+    
+    Returns:
+        搜索结果
+    """
+    try:
+        # 获取向量模型
+        from apps.ai_model.embedding import EmbeddingModelCache
+        embedding_model = EmbeddingModelCache.get_model()
+        
+        results = search_metric_dimensions(
+            session=session,
+            search_text=search_text,
+            embedding_model=embedding_model,
+            table_name=table_name,
+            datasource_id=datasource_id,
+            search_mode=search_mode,
+            top_k=top_k
+        )
+        return {
+            "success": True,
+            "data": results,
+            "count": len(results),
+            "search_mode": search_mode
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@router.post("/dimension/fill-embeddings")
+async def fill_dimension_embeddings(session: SessionDep):
+    """
+    填充缺失的维度 embedding 向量（后台任务）
+    
+    Returns:
+        执行结果
+    """
+    try:
+        # 获取向量模型
+        from apps.ai_model.embedding import EmbeddingModelCache
+        embedding_model = EmbeddingModelCache.get_model()
+        
+        save_dimension_embeddings(session, embedding_model, keys=None)
+        return {"success": True, "message": "开始填充维度 embedding，请稍后查看日志"}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
