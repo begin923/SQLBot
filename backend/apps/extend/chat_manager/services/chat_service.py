@@ -179,7 +179,8 @@ class ChatService:
             合并后的结果字典，包含：
             - metrics: List[str] 合并后的指标列表
             - dimensions: List[str] 合并后的维度列表
-            - filters: Dict[str, Any] 过滤条件
+            - filters: List[str] 过滤条件列表
+            - sql_generation_hint: str SQL 生成提示（当同时有维度和指标时，提示必须使用 GROUP BY 和聚合函数）
         """
         metrics = extracted_result.get('metrics', [])
         dimensions = extracted_result.get('dimensions', [])
@@ -191,11 +192,11 @@ class ChatService:
             'dimensions': dimensions.copy(),
             'filters': filters.copy()
         }
-        
+                
         # 如果需要查询 chat_state
         if need_chat_state:
-            SQLBotLogUtil.info("当前问题未提取到指标维度，开始从聊天历史中获取...")
-            
+            SQLBotLogUtil.info("当前问题未提取到指标维度,开始从聊天历史中获取...")
+                    
             # 查询聊天历史状态
             chat_state = self.state_service.extract_chat_state_from_history(
                 session=session,
@@ -203,32 +204,38 @@ class ChatService:
                 datasource_id=datasource_id,
                 limit=limit
             )
-
-            SQLBotLogUtil.info(f"从历史中获取的 chat_state：{chat_state}")
-
+        
+            SQLBotLogUtil.info(f"从历史中获取的 chat_state:{chat_state}")
+        
             if chat_state and chat_state.metrics:
-                SQLBotLogUtil.info(f"从历史中提取到指标：{chat_state.metrics}")
-                
-                # 如果没有提取到指标，直接使用历史指标
+                SQLBotLogUtil.info(f"从历史中提取到指标:{chat_state.metrics}")
+                        
+                # 如果没有提取到指标,直接使用历史指标
                 if not result['metrics']:
                     result['metrics'].append(chat_state.metrics)
-                
-                # 如果有维度信息，也一并添加
+                        
+                # 如果有维度信息,也一并添加
                 if hasattr(chat_state, 'dimensions') and chat_state.dimensions:
                     result['dimensions'].extend(chat_state.dimensions)
-
+        
                 if hasattr(chat_state, 'filters') and chat_state.filters:
                     result['filters'].extend(chat_state.filters)
-                
-                SQLBotLogUtil.info(f"合并后的指标：{result['metrics']}, 维度：{result['dimensions']}")
+                        
+                SQLBotLogUtil.info(f"合并后的指标:{result['metrics']}, 维度:{result['dimensions']}")
             else:
                 SQLBotLogUtil.warning("未能从聊天历史中提取到有效数据")
         else:
-            SQLBotLogUtil.info(f"当前问题已提取到指标：{metrics}, 维度：{dimensions}，无需查询历史")
-        
+            SQLBotLogUtil.info(f"当前问题已提取到指标:{metrics}, 维度:{dimensions},无需查询历史")
+                
+        # 添加 SQL 生成提示:当有维度和指标时,必须使用 GROUP BY 和聚合函数
+        if result['dimensions'] and result['metrics']:
+            result['sql_generation_hint'] = '生成SQL描述:必须要使用group by 分组维度字段,指标计算必须要使用聚合函数'
+        else:
+            result['sql_generation_hint'] = ''
+                
         return result
     
-    def extract_fields_from_question(
+    def extract_metric_and_dim_from_question(
         self,
         session: SessionDep,
         question: str,
@@ -256,6 +263,7 @@ class ChatService:
             - metrics: List[str] 指标列表（当前提取 + 历史补充）
             - dimensions: List[str] 维度列表（当前提取 + 历史补充）
             - filters: List[str] 过滤条件列表
+            - sql_generation_hint: str SQL 生成提示（当同时有维度和指标时，提示必须使用 GROUP BY 和聚合函数）
         """
         # 步骤 1：从当前问题中提取指标、维度和过滤条件
         extracted_result = self.extract_metrics_and_dimensions(question)
@@ -277,5 +285,5 @@ if __name__ == '__main__':
     llm = Utils.create_llm_client()
     session = Utils.create_local_session()
     chat_service = ChatService(llm=llm)
-    result = chat_service.extract_fields_from_question(session,"按天查询最近一个月的明细数据",32)
+    result = chat_service.extract_metric_and_dim_from_question(session, "按天查询最近一个月的明细数据", 32)
     print(f"提取结果：{str(result)}")

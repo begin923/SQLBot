@@ -293,13 +293,14 @@ update_chat_state(session, info)
 > "按月下钻北京和上海地区的销售额和销售量，最近一个月的数据"
 
 **系统处理：**
+
 ```python
 from apps.extend.chat_manager.services.chat_service import ChatService
 
 chat_service = ChatService(llm)
 
 # 自动提取指标、维度和过滤条件
-result = chat_service.extract_fields_from_question(
+result = chat_service.extract_metric_and_dim_from_question(
     session=session,
     question="按月下钻北京和上海地区的销售额和销售量，最近一个月的数据",
     chat_id=chat_id
@@ -316,9 +317,10 @@ print(result)
 ```
 
 **如果问题中无法提取指标维度：**
+
 ```python
 # 自动从聊天历史中补充
-result = chat_service.extract_fields_from_question(
+result = chat_service.extract_metric_and_dim_from_question(
     session=session,
     question="那上海的呢？",
     chat_id=chat_id

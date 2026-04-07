@@ -295,7 +295,7 @@ class LLMService:
         
         # 恢复历史对话
         self.sql_message.extend(old_messages)
-        print(f"✅ 已刷新 SQL messages，使用最新的 db_schema")
+        SQLBotLogUtil.info(f"✅ 已刷新 SQL messages，使用最新的 db_schema")
 
     def init_record(self, session: Session) -> ChatRecord:
         self.record = save_question(session=session, current_user=self.current_user, question=self.chat_question)
@@ -621,26 +621,6 @@ class LLMService:
             raise _error
 
     def generate_sql(self, _session: Session):
-        # 检查是否为静态SQL执行模式
-        # if self.is_drill_down:
-        #     SQLBotLogUtil.info("====== 当前表下钻查询模式")
-        #     self.sql_message.append(HumanMessage(
-        #         self.chat_question.drill_down_user_question()
-        #     ))
-        # elif self.is_view_details :
-        #     SQLBotLogUtil.info("====== 下钻查询上游表明细数据模式")
-        #     fields = self.view_details_dependencies.get('fields')
-        #     # SQLBotLogUtil.info(f"view_details_dependencies fields: {fields}")
-        #     fields_str = ','.join(fields)
-        #     self.sql_message.append(HumanMessage(
-        #         self.chat_question.view_details_user_question(
-        #             table_name=self.view_details_dependencies.get('table'),
-        #             calculation_fields=fields_str
-        #         )
-        #     ))
-        # else:
-            # 常规模式
-            # append current question
         self.sql_message.append(HumanMessage(
             self.chat_question.sql_user_question(current_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                                  change_title=self.change_title)
@@ -1104,121 +1084,6 @@ class LLMService:
             if not connected:
                 raise SQLBotDBConnectionError('Connect DB failed')
 
-            # ========== 下钻查询分析和处理 ==========
-            # 从用户问题中提取指标名称和用户意图（整合规则引擎）
-            """
-            1、用户问题 → 判断【指标】【维度】是否明确
-            2、分支1：指标+维度明确
-               → 查询指标体系 → 优先取ADS层表
-               → ADS不满足（无表/缺维度）→ 取DWS层表
-            3、分支2：指标/维度不明确
-               → 查询chat_state历史对话指标+维度
-               → 若chat_state有数据 → 复用历史走ADS→DWS
-               → 若chat_state无数据 → 直接反问用户：请明确需要查询的指标和维度
-            4、生成SQL前，通过指标体系校验表是否为ADS/DWS（前置拦截）
-            5、校验通过则执行，不通过直接拦截上报异常
-            """
-
-            extract_res_dict = self.chat_service.extract_fields_from_question(session=_session, question=self.chat_question.question,chat_id=self.chat_question.chat_id)
-            metrics = extract_res_dict.get('metrics',[])
-            dimensions = extract_res_dict.get('dimensions',[])
-            if not metrics and len(metrics) == 0:
-                SQLBotLogUtil.info("当前用户问题没有可查询指标，开始查找聊天状态数据")
-                raise "没有可查询指标"
-            elif not dimensions and len(dimensions) == 0:
-                raise "没有可查询维度"
-            else:
-                # 重置用户问题：将提取结果转为字符串
-                self.chat_question.question = str(extract_res_dict)
-                # 查询指标元数据
-                metric_info_list = get_metric_metadata_by_names(_session ,metrics)
-                SQLBotLogUtil.info(f"metric_info_list:{metric_info_list}")
-
-                # 提取表名列表
-                table_name_list = []
-                for metric in metric_info_list:
-                    table_name_list.append(metric.table_name)
-
-                # 批量添加指标表到数据源（避免重复触发 embedding）
-                SQLBotLogUtil.info(f"table_name_list:{table_name_list}")
-                if table_name_list:
-                    self._batch_add_tables_to_ds(_session, table_name_list)
-
-                # 获取最新 schema
-                table_scheme = get_table_schema(session=_session,
-                                 current_user=self.current_user, ds=self.ds,
-                                 question=self.chat_question.question,
-                                 table_name_list=table_name_list)
-
-                SQLBotLogUtil.info(f"self.chat_question.db_schema:{self.chat_question.db_schema}")
-                self.chat_question.db_schema = table_scheme
-
-                # 刷新 sql_message，使用最新的 db_schema
-                self.refresh_sql_messages_with_new_schema()
-
-                # ========== 应用聚合规则到 LLM Prompt（关键步骤） ==========
-                # 根据用户意图和数仓分层，动态注入聚合规则到提示词
-                if metric_info_list and len(metric_info_list) > 0:
-                    # 获取数仓分层信息：优先使用 dw_layer，否则从表名中提取
-                    curr_layer = metric_info_list[0].dw_layer
-                    if not curr_layer and metric_info_list[0].table_name:
-                        # 从表名中提取：'yz_datawarehouse_ads.table_name' -> 'yz_datawarehouse_ads'
-                        table_name = metric_info_list[0].table_name
-                        curr_layer = table_name.split('.')[0] if '.' in table_name else table_name
-
-                    # 如果还是为空，则使用默认值
-                    curr_layer = curr_layer or "unknown"
-
-                    SQLBotLogUtil.info(f"当前数仓分层：{curr_layer}")
-                    agg_rule_prompt = self.rule_engine.build_final_prompt(
-                        question=self.chat_question.question,
-                        curr_layer=curr_layer
-                    )
-
-                    # 将聚合规则注入到 chat_question 中（在 generate_sql 时使用）
-                    # 方式 1：追加到 custom_prompt
-                    if not self.chat_question.custom_prompt:
-                        self.chat_question.custom_prompt = agg_rule_prompt
-                    else:
-                        self.chat_question.custom_prompt += f"\n\n{agg_rule_prompt}"
-
-                    SQLBotLogUtil.info(f"已注入聚合规则到 Prompt: {agg_rule_prompt}")
-
-                    # 关键：刷新 sql_message，使聚合规则生效（重新生成 SystemMessage）
-                    self.refresh_sql_messages_with_new_schema()
-                    SQLBotLogUtil.info("✅ 已刷新 SQL messages，聚合规则已注入系统提示词")
-
-                    # ========== 根据用户意图处理表范围 ==========
-                    # chat_manager 中已经包含是否查明细的意图，直接使用 upstream_table
-                    # if dimensions.get('is_raw', False):
-                    #     # 用户要查明细，只使用上游表，当前指标表不需要
-                    #     SQLBotLogUtil.info("用户要求查明细，准备使用上游表...")
-                    #
-                    #     # 收集所有上游表
-                    #     upstream_tables = set()
-                    #     for metric_info in metric_info_list:
-                    #         if metric_info.upstream_table:
-                    #             # upstream_table 可能是逗号分隔的多个表名
-                    #             tables = [t.strip() for t in metric_info.upstream_table.split(',')]
-                    #             for table in tables:
-                    #                 if table:  # 确保表名不为空
-                    #                     upstream_tables.add(table)
-                    #
-                    #     # 只使用上游表，不添加当前指标表
-                    #     if upstream_tables:
-                    #         SQLBotLogUtil.info(f"使用上游表：{upstream_tables}")
-                    #         self._batch_add_tables_to_ds(_session, list(upstream_tables))
-                    #
-                    #         # 获取上游表的 schema
-                    #         table_scheme = get_table_schema(session=_session,
-                    #                          current_user=self.current_user, ds=self.ds,
-                    #                          question=self.chat_question.question,
-                    #                          table_name_list=list(upstream_tables))
-                    #         self.chat_question.db_schema = table_scheme
-                    #         self.refresh_sql_messages_with_new_schema()
-                    #         SQLBotLogUtil.info(f"已更新 schema，仅包含上游表：{list(upstream_tables)}")
-                    # else: 用户要查汇总/当前表，使用默认的 table_name_list（已在上面添加）
-
             # 执行静态 sql
             static_sql_keyword = "#FIXED_SQL_START#" in self.chat_question.question
             if static_sql_keyword:
@@ -1228,6 +1093,59 @@ class LLMService:
                 full_sql_text, sql = self.static_sql_handler.exe_static_sql(_session, in_chat , self.ds,self.provided_sql,self.record.id)
                 chart_type = self.get_chart_type_from_sql_answer(full_sql_text)
             else:
+                # 从用户问题中提取指标名称和用户意图（整合规则引擎）
+                """
+                1、用户问题 → 判断【指标】【维度】是否明确
+                2、分支1：指标+维度明确
+                   → 查询指标体系 → 优先取ADS层表
+                   → ADS不满足（无表/缺维度）→ 取DWS层表
+                3、分支2：指标/维度不明确
+                   → 查询chat_state历史对话指标+维度
+                   → 若chat_state有数据 → 复用历史走ADS→DWS
+                   → 若chat_state无数据 → 直接反问用户：请明确需要查询的指标和维度
+                4、执行SQL前，通过指标体系校验表是否为ADS/DWS（前置拦截）
+                5、校验通过则执行，不通过直接拦截上报异常
+                """
+
+                extract_res_dict = self.chat_service.extract_metric_and_dim_from_question(session=_session,
+                                                                                          question=self.chat_question.question,
+                                                                                          chat_id=self.chat_question.chat_id)
+                metrics = extract_res_dict.get('metrics', [])
+                dimensions = extract_res_dict.get('dimensions', [])
+                if not metrics and len(metrics) == 0:
+                    SQLBotLogUtil.info("当前用户问题没有可查询指标，开始查找聊天状态数据")
+                    raise "没有可查询指标"
+                elif not dimensions and len(dimensions) == 0:
+                    raise "没有可查询维度"
+                else:
+                    # 重置用户问题：将提取结果转为字符串
+                    self.chat_question.question = str(extract_res_dict)
+                    # 查询指标元数据，获取指标元数据信息
+                    metric_info_list = get_metric_metadata_by_names(_session, metrics)
+                    SQLBotLogUtil.info(f"metric_info_list:{metric_info_list}")
+
+                    # 提取表名列表
+                    table_name_list = []
+                    for metric in metric_info_list:
+                        table_name_list.append(metric.table_name)
+
+                    # 批量添加指标表到数据源（避免重复触发 embedding）
+                    # SQLBotLogUtil.info(f"table_name_list:{table_name_list}")
+                    if table_name_list:
+                        self._batch_add_tables_to_ds(_session, table_name_list)
+
+                    # 获取最新 schema
+                    table_schemes = get_table_schema(session=_session,
+                                                     current_user=self.current_user, ds=self.ds,
+                                                     question=self.chat_question.question,
+                                                     table_name_list=table_name_list)
+
+                    # SQLBotLogUtil.info(f"self.chat_question.db_schema:{self.chat_question.db_schema}")
+                    self.chat_question.db_schema = table_schemes
+
+                    # 刷新 sql_message，使用最新的 db_schema
+                    self.refresh_sql_messages_with_new_schema()
+
                 # 常规 LLM 生成
                 SQLBotLogUtil.info("Regular query, using LLM to generate SQL")
                 sql_res = self.generate_sql(_session)
