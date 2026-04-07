@@ -2,14 +2,6 @@ template:
   terminology: |
 
     {terminologies}
-    <terminology>
-      <words>
-        <word>料肉比下钻</word>
-      </words>
-      <description>
-        - 分子：采食量 - dwd_fpf_porker_feed_wide.total_forage_weight（g）/ dwd_fpf_porker_feed_wide.total_forage_weight_kg（kg） - 聚合逻辑：SUM(dwd_fpf_porker_forage_record_detail.forage_weight/dwd_fpf_porker_forage_record_detail.forage_weight_kg) - 基础表：dwd_fpf_porker_forage_record_detail - 聚合维度：org_id/group_code/dt_date/room_id/pen_id/yz_id - 分母：日增量 - dwd_fpf_porker_feed_wide.last_day_weight - dwd_fpf_porker_feed_wide.pre_weight - dwd_fpf_porker_feed_wide.last_day_weight → dwd_fpf_feed_sorter_weight_record.last_day_weight - dwd_fpf_porker_feed_wide.pre_weight → dwd_fpf_feed_sorter_weight_record.pre_weight - 校验字段：dwd_fpf_porker_feed_wide.pre_date → dwd_fpf_feed_sorter_weight_record.pre_date
-      </description>
-    </terminology>
   data_training: |
     
     {data_training}
