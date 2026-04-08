@@ -8,14 +8,14 @@ Markdown to Metric Lineage and Dimension Converter
 import os
 from typing import Dict, List, Any, Optional, Tuple
 
-from apps.extend.metric_metadata.models.metric_lineage_model import MetricLineageInfo, MetricDimensionInfo
-from apps.extend.metric_metadata.curd.metric_lineage import (
+from apps.extend.metrics.models.metric_lineage_model import MetricLineageInfo, MetricDimensionInfo
+from apps.extend.metrics.curd.metric_lineage import (
     batch_create_metric_lineage,
     batch_create_metric_dimension,
     delete_metric_lineage_by_table,
     delete_metric_dimension_by_table
 )
-from apps.extend.metric_metadata.parse_md_to_json import ParseMDToJson
+from apps.extend.metrics.parse_md_to_json import ParseMDToJson
 from apps.extend.utils.utils import Utils
 from common.core.deps import SessionDep
 

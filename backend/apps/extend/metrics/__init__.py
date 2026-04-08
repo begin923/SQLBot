@@ -8,6 +8,6 @@
 4. 指标血缘关系追踪
 """
 
-from apps.extend.metric_metadata.api.metric_metadata import router as metric_metadata_router
+from apps.extend.metrics.api.metric_metadata import router as metric_metadata_router
 
 __all__ = ["metric_metadata_router"]

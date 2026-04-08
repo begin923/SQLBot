@@ -14,7 +14,7 @@ import ast
 from markdown_to_data import md_to_dict
 
 # 导入指标元数据模型
-from apps.extend.metric_metadata.models.metric_metadata_model import MetricMetadataInfo
+from apps.extend.metrics.models.metric_metadata_model import MetricMetadataInfo
 
 
 class ParseMDToJsonWithData:

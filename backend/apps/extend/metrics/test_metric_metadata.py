@@ -3,7 +3,7 @@ Metric Metadata 本地测试脚本（直接调用后端接口版本）
 
 使用方法:
     # 在项目根目录或 PyCharm 中运行
-    python backend/apps/extend/metric_metadata/test_metric_metadata.py
+    python backend/apps/extend/metrics/test_metric_metadata.py
     
 特点:
     ✅ 不需要启动 HTTP 服务
@@ -31,7 +31,7 @@ from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlmodel import Session
 project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
-# 获取项目根目录（向上追溯 5 层：backend/apps/extend/metric_metadata -> D:\codes\MySQLBot）
+# 获取项目根目录（向上追溯 5 层：backend/apps/extend/metrics -> D:\codes\MySQLBot）
 current_file = Path(__file__).resolve()
 project_root = current_file.parent.parent.parent.parent.parent
 # 加载根目录的.env 文件
@@ -65,7 +65,7 @@ engine = create_engine(DATABASE_URL)
 session_maker = scoped_session(sessionmaker(bind=engine, class_=Session))
 
 
-from apps.extend.metric_metadata.curd.metric_metadata import (
+from apps.extend.metrics.curd.metric_metadata import (
     create_metric_metadata,
     batch_create_metric_metadata,
     get_all_metric_metadata,
@@ -75,7 +75,7 @@ from apps.extend.metric_metadata.curd.metric_metadata import (
     update_metric_metadata,
     fill_empty_embeddings
 )
-from apps.extend.metric_metadata.models.metric_metadata_model import MetricMetadataInfo
+from apps.extend.metrics.models.metric_metadata_model import MetricMetadataInfo
 
 
 def print_section(title):

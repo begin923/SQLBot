@@ -2,7 +2,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Query
 
-from apps.extend.metric_metadata.curd.metric_metadata import (
+from apps.extend.metrics.curd.metric_metadata import (
     create_metric_metadata,
     batch_create_metric_metadata,
     update_metric_metadata,
@@ -12,7 +12,7 @@ from apps.extend.metric_metadata.curd.metric_metadata import (
     get_all_metric_metadata,
     fill_empty_embeddings
 )
-from apps.extend.metric_metadata.curd.metric_lineage import (
+from apps.extend.metrics.curd.metric_lineage import (
     batch_create_metric_dimension,
     delete_metric_dimension,
     get_metric_dimensions_by_table,
@@ -21,8 +21,8 @@ from apps.extend.metric_metadata.curd.metric_lineage import (
     search_metric_dimensions,
     save_dimension_embeddings
 )
-from apps.extend.metric_metadata.models.metric_metadata_model import MetricMetadataInfo
-from apps.extend.metric_metadata.models.metric_lineage_model import MetricDimensionInfo
+from apps.extend.metrics.models.metric_metadata_model import MetricMetadataInfo
+from apps.extend.metrics.models.metric_lineage_model import MetricDimensionInfo
 from common.core.deps import SessionDep
 
 router = APIRouter(tags=["Metric Metadata"], prefix="/extend/metric-metadata")
@@ -332,7 +332,7 @@ async def test_clear_all(session: SessionDep):
     """
     try:
         from sqlalchemy import text
-        session.execute(text("TRUNCATE TABLE metric_metadata RESTART IDENTITY CASCADE"))
+        session.execute(text("TRUNCATE TABLE metrics RESTART IDENTITY CASCADE"))
         session.commit()
         return {
             "success": True,

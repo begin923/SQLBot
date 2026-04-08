@@ -6,7 +6,7 @@ from typing import List, Optional
 from apps.ai_model.embedding import EmbeddingModelCache
 from sqlalchemy import and_, or_, select, func, delete, update, text
 
-from apps.extend.metric_metadata.models.metric_metadata_model import MetricMetadata, MetricMetadataInfo
+from apps.extend.metrics.models.metric_metadata_model import MetricMetadata, MetricMetadataInfo
 from common.core.config import settings
 from common.core.deps import SessionDep
 
@@ -662,7 +662,7 @@ def fill_empty_embeddings(session: SessionDep):
     print("🔍 正在查询需要向量化的记录...")
     try:
         # 使用 ORM 查询
-            select_null_vector = "SELECT id FROM metric_metadata WHERE embedding_vector IS NULL"
+            select_null_vector = "SELECT id FROM metrics WHERE embedding_vector IS NULL"
             sql = text(select_null_vector)
             print(f"📝 执行 SQL: {select_null_vector}")
             result = session.execute(sql)

@@ -4,7 +4,7 @@ from typing import List, Optional, Union
 
 from apps import settings
 from sqlalchemy import and_, select, func, delete, update
-from apps.extend.metric_metadata.models.metric_lineage_model import MetricLineage, MetricDimension, MetricLineageInfo, MetricDimensionInfo
+from apps.extend.metrics.models.metric_lineage_model import MetricLineage, MetricDimension, MetricLineageInfo, MetricDimensionInfo
 from apps.extend.utils.utils import Utils
 from common.core.deps import SessionDep
 

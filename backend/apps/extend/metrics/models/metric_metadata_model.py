@@ -8,7 +8,7 @@ from sqlmodel import SQLModel, Field
 
 
 class MetricMetadata(SQLModel, table=True):
-    __tablename__ = "metric_metadata"
+    __tablename__ = "metrics"
     
     id: Optional[int] = Field(sa_column=Column(BigInteger, Identity(always=True), primary_key=True))
     metric_name: str = Field(sa_column=Column(String(100), nullable=False))
