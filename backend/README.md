@@ -217,6 +217,134 @@ class SQLValidator:
 | `MISSING_CLAUSE` | 缺少 GROUP BY 或聚合函数 | ✅ 是 | LLM 自动修复 |
 | `EMPTY_SQL` | SQL 为空 | ❌ 否 | 直接报错 |
 
+### 2.1 ADS/DWS 分层路由与下钻分析
+
+#### 数仓分层架构
+
+SQLBot 支持标准的数仓分层架构：
+
+- **ODS (Operational Data Store)**：操作数据层，原始数据
+- **DWD (Data Warehouse Detail)**：明细数据层，清洗后的明细数据
+- **DWS (Data Warehouse Summary)**：汇总数据层，轻度聚合
+- **ADS (Application Data Service)**：应用数据层，高度聚合的业务指标
+
+#### 分层路由逻辑
+
+```python
+# apps/chat/task/llm.py - LLMService.run_task()
+
+# 1. 从用户问题中提取指标名称
+extract_res_dict = self.chat_service.extract_metric_and_dim_from_question(...)
+metrics = extract_res_dict.get('metrics', [])
+dimensions = extract_res_dict.get('dimensions', [])
+
+# 2. 查询指标元数据，获取指标的表信息和血缘关系
+metric_info_list = get_metric_metadata_by_names(_session, metrics)
+
+# 3. 优先使用 ADS 层表（高性能）
+for metric in metric_info_list:
+    # 尝试在 ADS 表中查找维度
+    results, all_matched = search_metric_dimensions(
+        _session, dimensions, embedding_model, metric.table_name
+    )
+    
+    if all_matched:
+        # ADS 表满足需求，直接使用
+        table_name_list.append(metric.table_name)
+    else:
+        # ADS 表缺少维度，降级到 DWS 上游表
+        results, all_matched = search_metric_dimensions(
+            _session, dimensions, embedding_model, metric.upstream_table
+        )
+        if all_matched:
+            table_name_list.append(metric.upstream_table)
+```
+
+**路由策略：**
+1. **优先 ADS 层**：性能最优，数据已预聚合
+2. **降级 DWS 层**：当 ADS 表缺少所需维度时，使用上游 DWS 表
+3. **拦截 ODS/DWD**：不允许直接查询明细层（数据安全 + 性能考虑）
+
+#### ⚠️ 重要：计算逻辑中禁止使用表别名
+
+**规则说明：**
+
+在指标元数据的 `calc_logic`（计算逻辑）字段中，**严禁使用表别名**。必须使用完整的字段名或明确的字段引用。
+
+**❌ 错误示例：**
+
+```python
+# 指标元数据配置
+MetricMetadataInfo(
+    metric_name="订单量",
+    table_name="ads.ads_order_summary",
+    calc_logic="COUNT(DISTINCT a.order_id)",  # ❌ 错误：使用了别名 'a'
+    upstream_table="dws.dws_order_detail"
+)
+```
+
+**✅ 正确示例：**
+
+```python
+# 指标元数据配置
+MetricMetadataInfo(
+    metric_name="订单量",
+    table_name="ads.ads_order_summary",
+    calc_logic="COUNT(DISTINCT order_id)",  # ✅ 正确：直接使用字段名
+    upstream_table="dws.dws_order_detail"
+)
+```
+
+**原因说明：**
+
+1. **LLM 无法识别别名来源**：
+   - 当 LLM 生成下钻 SQL 时，会参考 `calc_logic` 中的计算逻辑
+   - 如果 `calc_logic` 中包含别名（如 `a.order_id`），LLM 无法确定 `a` 代表哪个表
+   - 导致生成的 SQL 出现语法错误或逻辑错误
+
+2. **多表 JOIN 场景混乱**：
+   ```sql
+   -- ❌ 错误：LLM 不知道 'a' 是哪个表
+   SELECT COUNT(DISTINCT a.order_id)
+   FROM ads.ads_order_summary a
+   JOIN dws.dws_order_detail b ON a.order_id = b.order_id
+   
+   -- ✅ 正确：明确指定表名
+   SELECT COUNT(DISTINCT ads_order_summary.order_id)
+   FROM ads.ads_order_summary
+   JOIN dws.dws_order_detail 
+     ON ads_order_summary.order_id = dws_order_detail.order_id
+   ```
+
+3. **下钻分析时的表切换**：
+   - 从 ADS 下钻到 DWS 时，表名会变化
+   - 如果 `calc_logic` 中使用别名，LLM 无法正确映射到新表的字段
+
+**最佳实践：**
+
+```python
+# ✅ 推荐：直接使用字段名（单表场景）
+calc_logic="SUM(amount)"
+
+# ✅ 推荐：使用完整表名.字段名（多表场景）
+calc_logic="SUM(ads_order.amount) / COUNT(DISTINCT ads_order.user_id)"
+
+# ✅ 推荐：清晰的计算表达式
+calc_logic="(revenue - cost) / revenue * 100"
+
+# ❌ 避免：任何形式的别名
+calc_logic="SUM(a.amount)"  # ❌
+calc_logic="t1.revenue - t2.cost"  # ❌
+```
+
+**代码位置：**
+
+- 指标元数据定义：`apps/extend/metric_metadata/models/metric_lineage_model.py`
+- 下钻提示词构建：`apps/chat/task/llm.py` - `build_drilldown_prompt()`
+- 计算逻辑解析：`apps/extend/metric_metadata/curd/metric_lineage.py`
+
+---
+
 ### 3. 会话状态管理
 
 ```python

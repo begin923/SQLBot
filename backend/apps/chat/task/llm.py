@@ -40,6 +40,7 @@ from apps.datasource.models.datasource import CoreDatasource, CoreTable
 from apps.db.db import exec_sql, get_version, check_connection, get_fields
 from apps.extend.chat_manager.services.chat_service import ChatService
 from apps.extend.drilldown.drill_agg_rule_engine import DrillAggRuleEngine
+from apps.extend.metric_metadata.curd.metric_lineage import search_metric_dimensions
 from apps.extend.metric_metadata.curd.metric_metadata import get_metric_metadata_by_names
 
 from apps.extend.sql_engine.sql_validator import SQLValidator
@@ -67,6 +68,9 @@ session_maker = scoped_session(sessionmaker(bind=engine, class_=Session))
 
 from apps.extend.static.static_sql_handler import StaticSQLHandler
 
+# 获取向量模型
+from apps.ai_model.embedding import EmbeddingModelCache
+embedding_model = EmbeddingModelCache.get_model()
 
 class LLMService:
     ds: CoreDatasource
@@ -1118,19 +1122,41 @@ class LLMService:
                 elif not dimensions and len(dimensions) == 0:
                     raise "没有可查询维度"
                 else:
-                    # 重置用户问题：将提取结果转为字符串
-                    self.chat_question.question = str(extract_res_dict)
                     # 查询指标元数据，获取指标元数据信息
                     metric_info_list = get_metric_metadata_by_names(_session, metrics)
                     SQLBotLogUtil.info(f"metric_info_list:{metric_info_list}")
 
                     # 提取表名列表
                     table_name_list = []
-                    for metric in metric_info_list:
+                    dim_kv = []
+                    # for metric in metric_info_list:
+
+                    # 先实现单一指标
+                    metric = metric_info_list[0]
+                    calc_logic = ''
+                    # 判断是否缺失维度
+                    results, all_matched = search_metric_dimensions(_session, dimensions,embedding_model , metric.table_name)
+                    if all_matched:
+                        SQLBotLogUtil.info(f"维度满足，直接使用当前表")
                         table_name_list.append(metric.table_name)
+                        for dim in results:
+                            dim_kv.append(f"{dim.dim_name}:{dim.dim_column}")
+                    else:
+                        results, all_matched = search_metric_dimensions(_session, dimensions, embedding_model,
+                                                                        metric.upstream_table)
+                        if all_matched:
+                            SQLBotLogUtil.info(f"维度不满足，直接使用上游表")
+                            table_name_list.append(metric.upstream_table)
+                            calc_logic = metric.calc_logic
+                            for dim in results:
+                                dim_kv.append(f"{dim.dim_name}:{dim.dim_column}")
+                        else:
+                            raise "维度无法继续下钻"
+
+                    if dim_kv and len(dim_kv) > 0:
+                        extract_res_dict['dimension_reference'] = dim_kv
 
                     # 批量添加指标表到数据源（避免重复触发 embedding）
-                    # SQLBotLogUtil.info(f"table_name_list:{table_name_list}")
                     if table_name_list:
                         self._batch_add_tables_to_ds(_session, table_name_list)
 
@@ -1140,8 +1166,13 @@ class LLMService:
                                                      question=self.chat_question.question,
                                                      table_name_list=table_name_list)
 
-                    # SQLBotLogUtil.info(f"self.chat_question.db_schema:{self.chat_question.db_schema}")
                     self.chat_question.db_schema = table_schemes
+
+                    # 重置用户问题：将提取结果转为字符串
+                    date_filter = extract_res_dict.get('filters',[])
+                    user_query = f"按{','.join(dimensions)}分组，分组参考字段：{','.join(dim_kv)}，查询{'和'.join(date_filter)}的{metric.metric_name}，{metric.metric_name}计算逻辑为{calc_logic}"
+                    print(f"user_query:{user_query}")
+                    self.chat_question.question = user_query
 
                     # 刷新 sql_message，使用最新的 db_schema
                     self.refresh_sql_messages_with_new_schema()
@@ -2055,8 +2086,6 @@ def process_stream(res: Iterator[BaseMessageChunk],
         else:
             # 不在思考块中或标签解析未启用，正常输出
             output_content += content
-
-        print(f"output_content:{output_content}")
 
         yield {
             'content': output_content,

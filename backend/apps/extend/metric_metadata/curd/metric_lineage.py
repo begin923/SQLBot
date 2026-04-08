@@ -1,6 +1,6 @@
 import datetime
 import time
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from apps import settings
 from sqlalchemy import and_, select, func, delete, update
@@ -785,13 +785,13 @@ def _convert_dimension_to_info_list(dimensions: List[MetricDimension]) -> List[M
 
 # ========== MetricDimension 向量检索功能 ==========
 
-def _search_by_exact(session: SessionDep, search_text: str, table_name: Optional[str] = None) -> List[MetricDimension]:
+def _search_by_exact(session: SessionDep, search_texts: List[str], table_name: Optional[str] = None) -> List[MetricDimension]:
     """
-    精准匹配搜索
+    精准匹配搜索（支持批量）
     
     Args:
         session: 数据库会话
-        search_text: 搜索文本
+        search_texts: 搜索文本列表
         table_name: 表名（可选，用于过滤）
     
     Returns:
@@ -801,13 +801,15 @@ def _search_by_exact(session: SessionDep, search_text: str, table_name: Optional
     start_time = time.time()
     
     try:
-        # 先拼接 table_name 条件，再拼接 dim_name 条件（优化查询性能）
+        # 先拼接 table_name 条件
         conditions = []
         if table_name:
             conditions.append(MetricDimension.table_name == table_name)
-        conditions.append(MetricDimension.dim_name == search_text)
         
-        # 构建查询并执行
+        # 使用 IN 条件进行批量精准匹配
+        conditions.append(MetricDimension.dim_name.in_(search_texts))
+        
+        # 构建查询并执行（单次查询）
         results = session.query(MetricDimension).filter(and_(*conditions)).all()
         
         elapsed_time = time.time() - start_time
@@ -819,13 +821,13 @@ def _search_by_exact(session: SessionDep, search_text: str, table_name: Optional
         raise
 
 
-def _search_by_fuzzy(session: SessionDep, search_text: str, table_name: Optional[str] = None) -> List[MetricDimension]:
+def _search_by_fuzzy(session: SessionDep, search_texts: List[str], table_name: Optional[str] = None) -> List[MetricDimension]:
     """
-    模糊匹配搜索
+    模糊匹配搜索（支持批量）
     
     Args:
         session: 数据库会话
-        search_text: 搜索文本
+        search_texts: 搜索文本列表
         table_name: 表名（可选，用于过滤）
     
     Returns:
@@ -835,11 +837,16 @@ def _search_by_fuzzy(session: SessionDep, search_text: str, table_name: Optional
     start_time = time.time()
     
     try:
-        conditions = [MetricDimension.dim_name.ilike(f"%{search_text}%")]
+        from sqlalchemy import or_
+        
+        # 构建多个 LIKE 条件，使用 OR 连接（单次查询）
+        like_conditions = [MetricDimension.dim_name.ilike(f"%{text}%") for text in search_texts]
+        
+        conditions = [or_(*like_conditions)]
         if table_name:
             conditions.append(MetricDimension.table_name == table_name)
         
-        # 构建查询并执行
+        # 构建查询并执行（单次查询）
         results = session.query(MetricDimension).filter(and_(*conditions)).all()
         
         elapsed_time = time.time() - start_time
@@ -851,15 +858,15 @@ def _search_by_fuzzy(session: SessionDep, search_text: str, table_name: Optional
         raise
 
 
-def _search_by_vector(session: SessionDep, search_text: str, embedding_model, top_k: int = 1, table_name: Optional[str] = None) -> List[MetricDimensionInfo]:
+def _search_by_vector(session: SessionDep, search_texts: List[str], embedding_model, top_k: int = 1, table_name: Optional[str] = None) -> List[MetricDimensionInfo]:
     """
-    向量语义搜索（直接返回 MetricDimensionInfo，不包含 embedding_vector）
+    向量语义搜索（支持批量，直接返回 MetricDimensionInfo，不包含 embedding_vector）
     
     Args:
         session: 数据库会话
-        search_text: 搜索文本
+        search_texts: 搜索文本列表
         embedding_model: 向量模型（必选）
-        top_k: 返回结果数量限制
+        top_k: 每个文本返回结果数量限制
         table_name: 表名（可选，用于过滤）
     
     Returns:
@@ -871,71 +878,74 @@ def _search_by_vector(session: SessionDep, search_text: str, embedding_model, to
     try:
         from sqlalchemy import text
         
-        # 使用传入的向量模型
-        embedding = embedding_model.embed_query(search_text)
+        # 批量计算 embeddings（单次调用）
+        embeddings = embedding_model.embed_documents(search_texts)
         
         similarity_threshold = getattr(settings, 'EMBEDDING_DIMENSION_SIMILARITY', 0.75)
         vector_top_k = getattr(settings, 'EMBEDDING_DIMENSION_TOP_COUNT', top_k)
         
-        # 使用 CTE + JOIN 一次性获取完整对象并保持排序（排除 embedding_vector 字段）
-        if table_name:
-            # 有表名过滤：在 CTE 和主查询中都添加过滤
-            cte_sql = text("""
-                WITH vector_matches AS (
+        # 构建 UNION ALL 查询，一次性获取所有文本的向量搜索结果
+        union_queries = []
+        all_params = {}
+        
+        for idx, embedding in enumerate(embeddings):
+            param_prefix = f'embed_{idx}'
+            search_text = search_texts[idx]
+            
+            if table_name:
+                query_template = f"""
                     SELECT 
                         table_name,
                         dim_column,
-                        (1 - (embedding_vector <=> :embedding_array)) AS similarity
+                        dim_name,
+                        create_time,
+                        (1 - (embedding_vector <=> :{param_prefix}_array)) AS similarity,
+                        '{search_text}' AS search_keyword
                     FROM metric_dimension
                     WHERE table_name = :table_name
                       AND embedding_vector IS NOT NULL
-                      AND (1 - (embedding_vector <=> :embedding_array)) > :threshold
+                      AND (1 - (embedding_vector <=> :{param_prefix}_array)) > :{param_prefix}_threshold
                     ORDER BY similarity DESC
-                    LIMIT :limit
-                )
-                SELECT md.table_name, md.dim_column, md.dim_name, md.create_time
-                FROM metric_dimension md
-                INNER JOIN vector_matches vm 
-                    ON md.table_name = vm.table_name 
-                    AND md.dim_column = vm.dim_column
-                WHERE md.table_name = :table_name
-                ORDER BY vm.similarity DESC
-            """)
-        else:
-            # 无表名过滤
-            cte_sql = text("""
-                WITH vector_matches AS (
+                    LIMIT :{param_prefix}_limit
+                """
+            else:
+                query_template = f"""
                     SELECT 
                         table_name,
                         dim_column,
-                        (1 - (embedding_vector <=> :embedding_array)) AS similarity
+                        dim_name,
+                        create_time,
+                        (1 - (embedding_vector <=> :{param_prefix}_array)) AS similarity,
+                        '{search_text}' AS search_keyword
                     FROM metric_dimension
                     WHERE embedding_vector IS NOT NULL
-                      AND (1 - (embedding_vector <=> :embedding_array)) > :threshold
+                      AND (1 - (embedding_vector <=> :{param_prefix}_array)) > :{param_prefix}_threshold
                     ORDER BY similarity DESC
-                    LIMIT :limit
-                )
-                SELECT md.table_name, md.dim_column, md.dim_name, md.create_time
-                FROM metric_dimension md
-                INNER JOIN vector_matches vm 
-                    ON md.table_name = vm.table_name 
-                    AND md.dim_column = vm.dim_column
-                ORDER BY vm.similarity DESC
-            """)
+                    LIMIT :{param_prefix}_limit
+                """
+            
+            union_queries.append(query_template)
+            
+            # 添加参数
+            all_params[f'{param_prefix}_array'] = str(embedding)
+            all_params[f'{param_prefix}_threshold'] = similarity_threshold
+            all_params[f'{param_prefix}_limit'] = vector_top_k
         
-        # 执行查询
-        params = {
-            'embedding_array': str(embedding),
-            'threshold': similarity_threshold,
-            'limit': vector_top_k
-        }
-        
-        # 添加表名参数
         if table_name:
-            params['table_name'] = table_name
+            all_params['table_name'] = table_name
+        
+        # 使用 UNION ALL 合并所有查询（单次查询）
+        combined_sql = " UNION ALL ".join(union_queries)
+        final_sql = text(f"SELECT * FROM ({combined_sql}) AS combined_results ORDER BY search_keyword, similarity DESC")
         
         # 执行查询
-        results = session.execute(cte_sql, params).fetchall()
+        results = session.execute(final_sql, all_params).fetchall()
+        
+        # 找出向量搜索匹配到的搜索文本
+        matched_keywords = set()
+        if results:
+            for row in results:
+                matched_keywords.add(row.search_keyword)
         
         # 转换为 MetricDimensionInfo 对象
         dimensions_info = [
@@ -950,28 +960,30 @@ def _search_by_vector(session: SessionDep, search_text: str, embedding_model, to
         
         elapsed_time = time.time() - start_time
         print(f"✅ [Vector] 向量语义搜索完成，找到 {len(dimensions_info)} 条结果，耗时: {elapsed_time:.3f}s")
-        return dimensions_info
+        if matched_keywords:
+            print(f"   📌 向量匹配命中 {len(matched_keywords)} 个: {list(matched_keywords)}")
+        return dimensions_info, matched_keywords
     
     except Exception as e:
         elapsed_time = time.time() - start_time
         import traceback
         traceback.print_exc()
         print(f"❌ [Vector] 向量语义搜索失败，耗时: {elapsed_time:.3f}s, 错误: {str(e)}")
-        return []
+        return [], set()
 
 def search_metric_dimensions(session: SessionDep, 
-                             search_text: str, 
+                             search_texts: List[str],  # 搜索文本列表
                              embedding_model,
                              table_name: Optional[str] = None,
                              datasource_id: Optional[int] = None,
                              search_mode: str = 'hybrid',
-                             top_k: int = 1) -> List[MetricDimensionInfo]:
+                             top_k: int = 1) -> tuple[List[MetricDimensionInfo], bool]:
     """
-    搜索指标维度（支持精准、模糊、向量检索）
+    搜索指标维度（支持精准、模糊、向量检索，支持批量搜索）
     
     Args:
         session: 数据库会话
-        search_text: 搜索文本
+        search_texts: 搜索文本列表
         embedding_model: 向量模型（必选）
         table_name: 表名（可选，用于过滤）
         datasource_id: 数据源 ID（可选）
@@ -979,81 +991,136 @@ def search_metric_dimensions(session: SessionDep,
         top_k: 返回结果数量限制
     
     Returns:
-        指标维度信息对象列表
+        (指标维度信息对象列表, 是否全部匹配成功)
     """
     import time
     start_time = time.time()
+    
+    # 过滤空字符串
+    search_texts = [text.strip() for text in search_texts if text and text.strip()]
+    
     print(f"\n{'='*60}")
     print(f"🔎 [Search] 开始搜索维度")
-    print(f"   - 搜索文本: '{search_text}'")
+    print(f"   - 搜索文本: {search_texts}")
     print(f"   - 表名过滤: {table_name if table_name else '无'}")
     print(f"   - 搜索模式: {search_mode}")
     print(f"   - 返回数量: top_k={top_k}")
     print(f"{'='*60}")
     
-    if not search_text or not search_text.strip():
+    if not search_texts:
         print("⚠️  [Search] 搜索文本为空，返回空列表")
         return []
     
-    search_text = search_text.strip()
-    
-    # Hybrid 模式（默认）：三级检索，匹配到即返回
+    # Hybrid 模式（默认）：三级检索，逐级匹配未命中的搜索文本
     if search_mode == 'hybrid':
-        # ========== Hybrid 模式：三级检索，匹配到即返回 ==========
+        # ========== Hybrid 模式：逐级匹配，未命中的继续往下匹配 ==========
+        
+        remaining_texts = search_texts.copy()  # 记录还未匹配的搜索文本
+        all_results = []  # 收集所有层级的结果
+        all_matched_texts = set()  # 收集所有已匹配的搜索文本
         
         # 第 1 级：精准匹配
-        results = _search_by_exact(session, search_text, table_name)
-        if results:
-            total_time = time.time() - start_time
-            print(f"\n{'='*60}")
-            print(f"🏁 [Search] 搜索完成（精准匹配），总耗时: {total_time:.3f}s")
-            print(f"{'='*60}\n")
-            return _convert_dimension_to_info_list(results)
+        if remaining_texts:
+            results = _search_by_exact(session, remaining_texts, table_name)
+            matched_dims = [r.dim_name for r in results if r.dim_name]
+            
+            # 找出已经匹配的搜索文本
+            matched_texts = set()
+            for text in remaining_texts:
+                if text in matched_dims:
+                    matched_texts.add(text)
+            
+            # 从未匹配列表中移除已匹配的
+            remaining_texts = [text for text in remaining_texts if text not in matched_texts]
+            all_matched_texts.update(matched_texts)
+            
+            if results:
+                all_results.extend(_convert_dimension_to_info_list(results))
+                print(f"   📌 精准匹配命中 {len(matched_texts)} 个: {list(matched_texts)}")
         
-        # 第 2 级：模糊匹配
-        results = _search_by_fuzzy(session, search_text, table_name)
-        if results:
-            total_time = time.time() - start_time
-            print(f"\n{'='*60}")
-            print(f"🏁 [Search] 搜索完成（模糊匹配），总耗时: {total_time:.3f}s")
-            print(f"{'='*60}\n")
-            return _convert_dimension_to_info_list(results)
+        # 第 2 级：模糊匹配（只对未匹配的搜索文本）
+        if remaining_texts:
+            results = _search_by_fuzzy(session, remaining_texts, table_name)
+            
+            # 模糊匹配需要检查哪些搜索文本真正被匹配到了
+            matched_texts = set()
+            for result in results:
+                for text in remaining_texts:
+                    if text.lower() in result.dim_name.lower() if result.dim_name else False:
+                        matched_texts.add(text)
+                        break
+            
+            # 从未匹配列表中移除已匹配的
+            remaining_texts = [text for text in remaining_texts if text not in matched_texts]
+            all_matched_texts.update(matched_texts)
+            
+            if results:
+                all_results.extend(_convert_dimension_to_info_list(results))
+                print(f"   📌 模糊匹配命中 {len(matched_texts)} 个: {list(matched_texts)}")
         
-        # 第 3 级：向量语义搜索
-        results = _search_by_vector(session, search_text, embedding_model, top_k, table_name)  # 直接返回 MetricDimensionInfo
+        # 第 3 级：向量语义搜索（只对仍未匹配的搜索文本）
+        if remaining_texts:
+            print(f"   ⚡ 剩余 {len(remaining_texts)} 个未匹配，执行向量搜索: {remaining_texts}")
+            results, vector_matched = _search_by_vector(session, remaining_texts, embedding_model, top_k, table_name)  # 直接返回 MetricDimensionInfo
+            all_matched_texts.update(vector_matched)
+            if results:
+                all_results.extend(results)
+        
+        # 判断是否所有搜索文本都匹配成功
+        all_matched = len(all_matched_texts) == len(search_texts)
         
         total_time = time.time() - start_time
         print(f"\n{'='*60}")
-        print(f"🏁 [Search] 搜索完成（向量匹配），总耗时: {total_time:.3f}s")
+        print(f"🏁 [Search] 混合搜索完成，总计 {len(all_results)} 条结果，总耗时: {total_time:.3f}s  , 匹配结构：{all_results}")
+        print(f"   ✅ 匹配状态: {'全部匹配成功' if all_matched else f'部分匹配 ({len(all_matched_texts)}/{len(search_texts)})'}")
         print(f"{'='*60}\n")
-        return results  # 直接返回，不需要转换
+        return all_results, all_matched
     
     elif search_mode == 'exact':
         # ========== 精准匹配模式 ==========
-        results = _search_by_exact(session, search_text, table_name)
+        results = _search_by_exact(session, search_texts, table_name)
+        matched_dims = [r.dim_name for r in results if r.dim_name]
+        matched_texts = set(text for text in search_texts if text in matched_dims)
+        all_matched = len(matched_texts) == len(search_texts)
+        
         total_time = time.time() - start_time
         print(f"\n{'='*60}")
         print(f"🏁 [Search] 搜索完成（精准模式），总耗时: {total_time:.3f}s")
+        print(f"   ✅ 匹配状态: {'全部匹配成功' if all_matched else f'部分匹配 ({len(matched_texts)}/{len(search_texts)})'}")
         print(f"{'='*60}\n")
-        return _convert_dimension_to_info_list(results)
+        return _convert_dimension_to_info_list(results), all_matched
     
     elif search_mode == 'fuzzy':
         # ========== 模糊匹配模式 ==========
-        results = _search_by_fuzzy(session, search_text, table_name)
+        results = _search_by_fuzzy(session, search_texts, table_name)
+        
+        # 检查哪些搜索文本被匹配到了
+        matched_texts = set()
+        for result in results:
+            for text in search_texts:
+                if text.lower() in result.dim_name.lower() if result.dim_name else False:
+                    matched_texts.add(text)
+                    break
+        all_matched = len(matched_texts) == len(search_texts)
+        
         total_time = time.time() - start_time
         print(f"\n{'='*60}")
         print(f"🏁 [Search] 搜索完成（模糊模式），总耗时: {total_time:.3f}s")
+        print(f"   ✅ 匹配状态: {'全部匹配成功' if all_matched else f'部分匹配 ({len(matched_texts)}/{len(search_texts)})'}")
         print(f"{'='*60}\n")
-        return _convert_dimension_to_info_list(results)
+        return _convert_dimension_to_info_list(results), all_matched
     
     elif search_mode == 'vector':
         # ========== 向量检索模式 ==========
-        results = _search_by_vector(session, search_text, embedding_model, top_k, table_name)  # 直接返回 MetricDimensionInfo
+        results, matched_keywords = _search_by_vector(session, search_texts, embedding_model, top_k, table_name)  # 直接返回 MetricDimensionInfo
+        all_matched = len(matched_keywords) == len(search_texts)
+        
         total_time = time.time() - start_time
         print(f"\n{'='*60}")
         print(f"🏁 [Search] 搜索完成，总耗时: {total_time:.3f}s")
+        print(f"   ✅ 匹配状态: {'全部匹配成功' if all_matched else f'部分匹配 ({len(matched_keywords)}/{len(search_texts)})'}")
         print(f"{'='*60}\n")
-        return results  # 直接返回，不需要转换
+        return results, all_matched
     
     else:
         # 无效的搜索模式，返回空列表
@@ -1062,7 +1129,7 @@ def search_metric_dimensions(session: SessionDep,
         print(f"\n{'='*60}")
         print(f"🏁 [Search] 搜索完成（无效模式），总耗时: {elapsed_time:.3f}s")
         print(f"{'='*60}\n")
-        return []
+        return [], False
 
 
 def save_dimension_embeddings(session: SessionDep, embedding_model, keys: List[tuple] = None):
@@ -1144,9 +1211,16 @@ if __name__ == '__main__':
     from apps.ai_model.embedding import EmbeddingModelCache
     embedding_model = EmbeddingModelCache.get_model()
     session = Utils.create_local_session()
-    # save_dimension_embeddings(session, embedding_model)
     start_time = time.time()
-    res = search_metric_dimensions(session, '断奶时间', embedding_model, 'yz_datawarehouse_ads.ads_anc_idx_female_wean_info', 'hybrid')
+    results, all_matched = search_metric_dimensions(
+        session, 
+        ['日期', '母猪耳号', '配种时间'],  # 多个搜索文本
+        embedding_model, 
+        'yz_datawarehouse_ads.ads_anc_idx_female_wean_info', 
+        'hybrid'
+    )
     end_time = time.time()
     print(f"耗时: {end_time - start_time:.2f}s")
-    print(res)
+    print(f"结果数量: {len(results)}")
+    print(f"全部匹配: {all_matched}")
+    print(f"结果列表: {results}")
