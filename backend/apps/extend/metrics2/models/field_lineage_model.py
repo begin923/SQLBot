@@ -1,0 +1,34 @@
+from datetime import datetime
+from typing import Optional
+from sqlmodel import SQLModel, Field, Column, VARCHAR, DATETIME
+
+
+class FieldLineage(SQLModel, table=True):
+    """字段级血缘表 - 校验核心（含维度标记）"""
+    __tablename__ = "field_lineage"
+
+    lineage_id: str = Field(sa_column=Column(VARCHAR(32), primary_key=True, comment='字段血缘ID(F000001)'))
+    table_lineage_id: str = Field(sa_column=Column(VARCHAR(32), nullable=False, comment='关联的表血缘ID'))
+    source_table: str = Field(sa_column=Column(VARCHAR(128), nullable=False, comment='上游源表'))
+    source_field: str = Field(sa_column=Column(VARCHAR(64), nullable=False, comment='上游源字段'))
+    target_table: str = Field(sa_column=Column(VARCHAR(128), nullable=False, comment='下游目标表'))
+    target_field: str = Field(sa_column=Column(VARCHAR(64), nullable=False, comment='下游目标字段'))
+    target_field_mark: str = Field(default='normal', sa_column=Column(VARCHAR(16), nullable=False, server_default='normal', comment='目标字段标记：public_dim/private_dim/metric/normal'))
+    dim_id: Optional[str] = Field(default=None, sa_column=Column(VARCHAR(32), nullable=True, comment='公共维度绑定ID'))
+    create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, comment='创建时间'))
+
+    __table_args__ = (
+        {"comment": "字段映射校验表(含指标/维度标记，区分指标/公共/私有维度)"},
+    )
+
+
+class FieldLineageInfo(SQLModel):
+    """字段级血缘信息对象"""
+    lineage_id: Optional[str] = None
+    table_lineage_id: Optional[str] = None
+    source_table: Optional[str] = None
+    source_field: Optional[str] = None
+    target_table: Optional[str] = None
+    target_field: Optional[str] = None
+    target_field_mark: Optional[str] = 'normal'  # public_dim/private_dim/metric/normal
+    dim_id: Optional[str] = None  # 仅公共维度有值
