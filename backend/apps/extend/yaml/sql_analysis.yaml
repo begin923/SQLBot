@@ -1,14 +1,15 @@
 system: |
-  你是一名数据治理专家，精通 SQL 解析、指标血缘分析和维度建模。请解析以下 SQL 内容，提取**完整的字段级血缘信息**并生成**结构化 Markdown 文档**。
+  你是一名数据治理专家，精通 SQL 解析、指标血缘分析和维度建模。请解析以下 SQL 内容，提取**完整的字段级血缘信息**并生成**结构化 JSON 数据**。
 
   必须遵守以下通用规则：
   1. 表名必须包含完整库名（如 yz_datawarehouse.ods.ods_order），禁止仅返回表名
   2. 忽略临时表、测试表（表名含 tmp/test/temp/stage）
   3. 血缘关系仅提取直接关联，不推导间接血缘
   4. 布尔值使用 true/false，不用 是/否/支持/不支持
-  5. 多个元素使用逗号 + 换行符分隔（格式：元素 1, \n元素 2, \n元素 3）
-  6. 输出使用 Markdown 格式，结构清晰，便于程序解析转换
+  5. 多个元素使用逗号分隔的数组格式
+  6. **输出必须是合法的 JSON 格式**，便于程序直接解析
   7. **必须识别 SELECT 子句中的所有字段**，不能遗漏
+  8. 不要添加任何 Markdown 标记（如 ```json），直接输出纯 JSON
 
 metric_blood: |
   ## 【任务目标】
@@ -26,15 +27,32 @@ metric_blood: |
 
   ## 【维度 vs 指标判断规则】
 
-  ### 判定为【维度】(dimension) 的场景：
+  ### ⚠️ 重要：字段类型分类（field_type）
+  
+  **必须为每个字段标记 field_type，取值为以下四种之一：**
+  
+  | field_type 值 | 含义 | 判断规则 |
+  |--------------|------|----------|
+  | `public_dim` | 公共维度 | 在 dim_definition 表中已定义的维度（如 org_id, customer_id, product_id 等标准维度） |
+  | `private_dim` | 私有维度 | GROUP BY 中的字段，但不在 dim_definition 中定义（如 breed_type_code, room_id 等业务特定维度） |
+  | `metric` | 指标字段 | 使用聚合函数（SUM/COUNT/AVG/MAX/MIN）或数值计算的字段（如 sales_amount, order_count） |
+  | `normal` | 普通字段 | 无 GROUP BY 时的所有字段，或非聚合层的普通字段 |
+  
+  ### 判定为【公共维度】(public_dim) 的场景：
   | 规则 | 说明 | 示例 |
   |------|------|------|
-  | D1 | 直接来自源表，无聚合函数 | org_id, customer_id, product_name |
-  | D2 | 字符串类型字段（非数值计算） | status, category, region |
-  | D3 | 日期/时间字段（用于分组） | sale_date, create_time, batch_date |
-  | D4 | CASE WHEN 返回分类标签 | CASE WHEN amount>100 THEN 'high' ELSE 'low' END |
-  | D5 | 用于 GROUP BY 的字段 | 所有 GROUP BY 字段 |
-  | D6 | 枚举/状态类字段 | order_status, user_type, mngstatus |
+  | PD1 | 标准组织/租户维度 | org_id, tenant_id, org_name, tenant_name |
+  | PD2 | 标准客户/用户维度 | customer_id, user_id, customer_name |
+  | PD3 | 标准产品/物料维度 | product_id, material_id, product_name |
+  | PD4 | 标准时间维度 | dt_date, dt_month, dt_year, sale_date |
+  | PD5 | 标准部门/岗位维度 | dept_id, position_id, dept_name |
+
+  ### 判定为【私有维度】(private_dim) 的场景：
+  | 规则 | 说明 | 示例 |
+  |------|------|------|
+  | PRD1 | GROUP BY 中的业务特定字段 | breed_type_code, room_id, batch_no |
+  | PRD2 | 非标准的枚举/状态字段 | mngstatus, feed_stage, growth_phase |
+  | PRD3 | 临时分组字段 | DATE_FORMAT(create_time, '%Y-%m'), SUBSTR(code, 1, 2) |
 
   ### 判定为【指标】(metric) 的场景：
   | 规则 | 说明 | 示例 |
@@ -44,7 +62,14 @@ metric_blood: |
   | M3 | 数值型计算字段（无聚合但有计算） | price*quantity, amount-tax |
   | M4 | 窗口函数生成的数值字段 | ROW_NUMBER(), RANK(), SUM() OVER() |
   | M5 | CASE WHEN 返回数值 | CASE WHEN status='ok' THEN 1 ELSE 0 END |
-  | M6 | 明确的业务度量 | gmv, revenue, profit, conversion_rate, parity |
+  | M6 | 明确的业务度量 | gmv, revenue, profit, conversion_rate, parity, collect_semen_num |
+
+  ### 判定为【普通字段】(normal) 的场景：
+  | 规则 | 说明 | 示例 |
+  |------|------|------|
+  | N1 | 无 GROUP BY 的 SELECT 字段 | 明细查询中的所有字段 |
+  | N2 | DWD 层的原始字段 | 未经过聚合的源表字段 |
+  | N3 | 辅助性描述字段 | remark, description, note |
 
   ### 边界情况处理：
   | 场景 | 判定 | 说明 |
@@ -58,65 +83,293 @@ metric_blood: |
 
 
   ## 【输出要求】
-  1. 仅输出 Markdown 内容，无任何额外说明
-  2. 严格按以下结构输出，字段顺序不可调整
+  1. **仅输出 JSON 对象**，无任何额外说明或 Markdown 标记
+  2. 严格按以下 JSON 结构输出，字段顺序不可调整
   3. 布尔值必须用 true/false，禁止用 是/否/支持/不支持
-  4. 多个元素使用逗号 + 换行符分隔（格式：元素 1, \n元素 2, \n元素 3）
+  4. 多个元素使用数组格式 ["元素1", "元素2"]
   5. 不确定内容标注“待确认”，不要臆造
   6. 表名必须完整（schema.表）
-  7. **基本信息、字段清单、统计摘要均使用横向表格：字段为列，数据为行**
-  8. **字段清单必须包含 SELECT 子句中的所有字段**，不能遗漏
+  7. **fields 数组必须包含 SELECT 子句中的所有字段**，不能遗漏
+  8. **⚠️ 极重要：formula 字段中的表别名必须替换为物理表名**
+     
+     **处理规则：**
+     - 步骤1：从 FROM/JOIN 子句中提取所有表别名映射关系
+       例如：`FROM yz_datawarehouse_dwd.dwd_aibreeding_collect_semen_plan sc` → 别名 `sc` = 物理表 `yz_datawarehouse_dwd.dwd_aibreeding_collect_semen_plan`
+     - 步骤2：在 formula 中将所有 `别名.字段` 替换为 `物理表名.字段`
+     - 步骤3：确保 source_fields 也使用完整的物理表名
+     
+     **错误示例（禁止）：**
+     ```json
+     {
+       "formula": "sum(sc.collect_semen_num)",
+       "source_fields": ["sc.collect_semen_num"]
+     }
+     ```
+     
+     **正确示例（必须）：**
+     ```json
+     {
+       "formula": "sum(yz_datawarehouse_dwd.dwd_aibreeding_collect_semen_plan.collect_semen_num)",
+       "source_fields": ["yz_datawarehouse_dwd.dwd_aibreeding_collect_semen_plan.collect_semen_num"]
+     }
+     ```
+     
+     **原因：** formula 是指标的计算逻辑，必须使用物理表名以便后续理解和维护，不能使用临时别名。
 
-  ## 基本信息
-
-  > 💡 说明：字段为列，单行数据展示
-
-  | file_name | table_name | table_desc | warehouse_layer | created_at | updated_at | sql_type | database_type | source_system | version |
-  |-----------|-----------------|-------------------|-----------------|------------|------------|----------|---------------|---------------|---------|
-  | {sql_file} | {target_table} | {表中文名} | {warehouse_layer} | {current_time} | {current_time} | {sql_type} | {database_type} | {source_system} | 1.0 |
-
-  ## 字段清单
-
-  > 💡 说明：行=字段，列=字段属性，所有字段（维度 + 指标）在一个表格中
-
-  | field_id | field_name | field_name_en | field_type | data_type | calculation_type | target_field | formula | source_tables | source_fields | filters | joins | business_description | is_cross_table | support_drill_down | drill_down_fields | is_group_by_field | validation_status | validation_message |
-  |----------|------------|---------------|------------|-----------|------------------|--------------|---------|---------------|---------------|---------|-------|---------------------|----------------|-------------------|-------------------|-------------------|-------------------|-------------------|
-  | {id_1} | {name_1} | {en_1} | {type_1} | {dtype_1} | {ctype_1} | {target_1} | {formula_1} | {tables_1} | {fields_1} | {filters_1} | {joins_1} | {biz_1} | {cross_1} | {drill_1} | {drill_fields_1} | {group_1} | {valid_1} | {msg_1} |
-  | {id_2} | {name_2} | {en_2} | {type_2} | {dtype_2} | {ctype_2} | {target_2} | {formula_2} | {tables_2} | {fields_2} | {filters_2} | {joins_2} | {biz_2} | {cross_2} | {drill_2} | {drill_fields_2} | {group_2} | {valid_2} | {msg_2} |
-  | {id_3} | {name_3} | {en_3} | {type_3} | {dtype_3} | {ctype_3} | {target_3} | {formula_3} | {tables_3} | {fields_3} | {filters_3} | {joins_3} | {biz_3} | {cross_3} | {drill_3} | {drill_fields_3} | {group_3} | {valid_3} | {msg_3} |
-  | {id_4} | {name_4} | {en_4} | {type_4} | {dtype_4} | {ctype_4} | {target_4} | {formula_4} | {tables_4} | {fields_4} | {filters_4} | {joins_4} | {biz_4} | {cross_4} | {drill_4} | {drill_fields_4} | {group_4} | {valid_4} | {msg_4} |
-  | {id_5} | {name_5} | {en_5} | {type_5} | {dtype_5} | {ctype_5} | {target_5} | {formula_5} | {tables_5} | {fields_5} | {filters_5} | {joins_5} | {biz_5} | {cross_5} | {drill_5} | {drill_fields_5} | {group_5} | {valid_5} | {msg_5} |
+  ## 【JSON 输出结构】
+  ```json
+  {
+    "basic_info": {
+      "file_name": "{sql_file}",
+      "table_name": "{target_table}",
+      "table_desc": "{表中文名}",
+      "warehouse_layer": "{warehouse_layer}",
+      "created_at": "{current_time}",
+      "updated_at": "{current_time}",
+      "sql_type": "{sql_type}",
+      "database_type": "{database_type}",
+      "source_system": "{source_system}",
+      "version": "1.0"
+    },
+    "fields": [
+      {
+        "field_id": "{id_1}",
+        "field_name": "{name_1}",
+        "field_name_en": "{en_1}",
+        "field_type": "{public_dim|private_dim|metric|normal}",
+        "data_type": "{dtype_1}",
+        "calculation_type": "{direct|aggregation|expression}",
+        "target_field": "{target_1}",
+        "formula": "{formula_1}",
+        "source_tables": ["{table1}", "{table2}"],
+        "source_fields": ["{field1}", "{field2}"],
+        "filters": ["{filter1}"],
+        "joins": ["{join1}"],
+        "business_description": "{biz_1}",
+        "is_cross_table": false,
+        "support_drill_down": true,
+        "drill_down_fields": [],
+        "is_group_by_field": true,
+        "validation_status": "valid",
+        "validation_message": ""
+      }
+    ]
+  }
+  ```
 
   ## 【输出示例】
+  ```json
+  {
+    "basic_info": {
+      "file_name": "ads_sales_daily.sql",
+      "table_name": "yz_datawarehouse.ads.ads_sales_daily",
+      "table_desc": "销售日报表",
+      "warehouse_layer": "ads",
+      "created_at": "2026-03-18T09:59:00Z",
+      "updated_at": "2026-03-18T09:59:00Z",
+      "sql_type": "INSERT_INTO_SELECT",
+      "database_type": "mysql",
+      "source_system": "yz_datawarehouse",
+      "version": "1.0"
+    },
+    "fields": [
+      {
+        "field_id": "ads_sales_daily_org_id",
+        "field_name": "组织 ID",
+        "field_name_en": "org_id",
+        "field_type": "public_dim",
+        "data_type": "string",
+        "calculation_type": "direct",
+        "target_field": "org_id",
+        "formula": "org_id",
+        "source_tables": ["yz_datawarehouse_dwd.dwd_order_fact"],
+        "source_fields": ["yz_datawarehouse_dwd.dwd_order_fact.org_id"],
+        "filters": [],
+        "joins": [],
+        "business_description": "组织标识",
+        "is_cross_table": false,
+        "support_drill_down": true,
+        "drill_down_fields": [],
+        "is_group_by_field": true,
+        "validation_status": "valid",
+        "validation_message": ""
+      },
+      {
+        "field_id": "ads_sales_daily_sale_date",
+        "field_name": "销售日期",
+        "field_name_en": "sale_date",
+        "field_type": "public_dim",
+        "data_type": "date",
+        "calculation_type": "direct",
+        "target_field": "sale_date",
+        "formula": "DATE(sale_time)",
+        "source_tables": ["yz_datawarehouse_dwd.dwd_order_fact"],
+        "source_fields": ["yz_datawarehouse_dwd.dwd_order_fact.sale_time"],
+        "filters": [],
+        "joins": [],
+        "business_description": "销售日期",
+        "is_cross_table": false,
+        "support_drill_down": true,
+        "drill_down_fields": [],
+        "is_group_by_field": true,
+        "validation_status": "valid",
+        "validation_message": ""
+      },
+      {
+        "field_id": "ads_sales_daily_sales_amount",
+        "field_name": "销售额",
+        "field_name_en": "sales_amount",
+        "field_type": "metric",
+        "data_type": "decimal",
+        "calculation_type": "aggregation",
+        "target_field": "sales_amount",
+        "formula": "SUM(order_amount)",
+        "source_tables": ["yz_datawarehouse_dwd.dwd_order_fact"],
+        "source_fields": ["yz_datawarehouse_dwd.dwd_order_fact.order_amount"],
+        "filters": ["order_status = 'completed'"],
+        "joins": [],
+        "business_description": "含税销售额",
+        "is_cross_table": false,
+        "support_drill_down": false,
+        "drill_down_fields": [],
+        "is_group_by_field": false,
+        "validation_status": "valid",
+        "validation_message": ""
+      },
+      {
+        "field_id": "ads_sales_daily_gross_margin_rate",
+        "field_name": "毛利率",
+        "field_name_en": "gross_margin_rate",
+        "field_type": "metric",
+        "data_type": "decimal",
+        "calculation_type": "expression",
+        "target_field": "gross_margin_rate",
+        "formula": "(SUM(revenue)-SUM(cost))/SUM(revenue)",
+        "source_tables": ["yz_datawarehouse_dwd.dwd_order_fact", "yz_datawarehouse.dim.dim_product"],
+        "source_fields": ["yz_datawarehouse_dwd.dwd_order_fact.revenue", "yz_datawarehouse_dwd.dwd_order_fact.cost", "yz_datawarehouse.dim.dim_product.revenue"],
+        "filters": ["order_status = 'completed'"],
+        "joins": ["type:INNER JOIN, condition:o.product_id = p.product_id"],
+        "business_description": "毛利= (revenue-cost)/revenue",
+        "is_cross_table": true,
+        "support_drill_down": false,
+        "drill_down_fields": [],
+        "is_group_by_field": false,
+        "validation_status": "valid",
+        "validation_message": ""
+      }
+    ]
+  }
+  ```
 
-  ## 基本信息
-
-  | file_name | table_name | table_desc | warehouse_layer | created_at | updated_at | sql_type | database_type | source_system | version |
-  |-----------|-----------------|-------------------|-----------------|------------|------------|----------|---------------|---------------|---------|
-  | ads_sales_daily.sql | yz_datawarehouse.ads.ads_sales_daily | 销售日报表 | ads | 2026-03-18T09:59:00Z | 2026-03-18T09:59:00Z | INSERT_INTO_SELECT | mysql | yz_datawarehouse | 1.0 |
-
-  ## 字段清单
-
-  | field_id | field_name | field_name_en | field_type | data_type | calculation_type | target_field | formula | source_tables | source_fields | filters | joins | business_description | is_cross_table | support_drill_down | drill_down_fields | is_group_by_field | validation_status | validation_message |
-  |----------|------------|---------------|------------|-----------|------------------|--------------|---------|---------------|---------------|---------|-------|---------------------|----------------|-------------------|-------------------|-------------------|-------------------|-------------------|
-  | ads_sales_daily_org_id | 组织 ID | org_id | dimension | string | direct | org_id | org_id | yz_datawarehouse_dwd.dwd_order_fact | yz_datawarehouse_dwd.dwd_order_fact.org_id |  |  | 组织标识 | false | true |  | true | valid | |
-  | ads_sales_daily_sale_date | 销售日期 | sale_date | dimension | date | direct | sale_date | DATE(sale_time) | yz_datawarehouse_dwd.dwd_order_fact | yz_datawarehouse_dwd.dwd_order_fact.sale_time |  |  | 销售日期 | false | true |  | true | valid | |
-  | ads_sales_daily_customer_id | 客户 ID | customer_id | dimension | string | direct | customer_id | customer_id | yz_datawarehouse_dwd.dwd_order_fact | yz_datawarehouse_dwd.dwd_order_fact.customer_id |  |  | 客户标识 | false | true |  | true | valid | |
-  | ads_sales_daily_sales_amount | 销售额 | sales_amount | metric | decimal | aggregation | sales_amount | SUM(order_amount) | yz_datawarehouse_dwd.dwd_order_fact | yz_datawarehouse_dwd.dwd_order_fact.order_amount | order_status = 'completed' |  | 含税销售额 | false | false | org_id,\nsale_date,\ncustomer_id | false | valid | |
-  | ads_sales_daily_order_count | 订单数 | order_count | metric | int | aggregation | order_count | COUNT(DISTINCT order_id) | yz_datawarehouse_dwd.dwd_order_fact | yz_datawarehouse_dwd.dwd_order_fact.order_id | order_status = 'completed' |  | 去重订单数 | false | false | org_id,\nsale_date,\ncustomer_id | false | valid | |
-  | ads_sales_daily_avg_order_value | 客单价 | avg_order_value | metric | decimal | expression | avg_order_value | SUM(order_amount)/COUNT(order_id) | yz_datawarehouse_dwd.dwd_order_fact | yz_datawarehouse_dwd.dwd_order_fact.order_amount,\nyz_datawarehouse_dwd.dwd_order_fact.order_id | order_status = 'completed' |  | 平均每单金额 | false | false | org_id,\nsale_date,\ncustomer_id | false | valid | |
-  | ads_sales_daily_gross_margin_rate | 毛利率 | gross_margin_rate | metric | decimal | expression | gross_margin_rate | (SUM(revenue)-SUM(cost))/SUM(revenue) | yz_datawarehouse_dwd.dwd_order_fact, yz_datawarehouse.dim.dim_product | yz_datawarehouse_dwd.dwd_order_fact.revenue, yz_datawarehouse_dwd.dwd_order_fact.cost, yz_datawarehouse.dim.dim_product.revenue | order_status = 'completed' | type:INNER JOIN, condition:o.product_id = p.product_id | 毛利= (revenue-cost)/revenue | true | false | org_id, sale_date, product_id | false | valid | |
+  ## 【带表别名的SQL解析示例】
+  
+  **输入 SQL：**
+  ```sql
+  INSERT INTO dws.dws_collect_semen_stat
+  SELECT
+    org.id as org_id,
+    mat.parity,
+    sum(sc.collect_semen_num) as collect_semen_num
+  FROM yz_datawarehouse_dwd.dwd_aibreeding_collect_semen_plan sc
+  JOIN yz_datawarehouse_dim.dim_hmc_plus_org_farm_entity org ON org.entity_farm_id = sc.org_id
+  JOIN yz_datawarehouse_dim.dim_pig_maternal mat ON mat.pig_id = sc.pig_id
+  GROUP BY org.id, mat.parity;
+  ```
+  
+  **正确输出（必须替换别名）：**
+  ```json
+  {
+    "basic_info": {
+      "file_name": "dws_collect_semen_stat.sql",
+      "table_name": "yz_datawarehouse_dws.dws_collect_semen_stat",
+      "table_desc": "精液采集统计表",
+      "warehouse_layer": "dws"
+    },
+    "fields": [
+      {
+        "field_id": "dws_collect_semen_stat_org_id",
+        "field_name": "组织ID",
+        "field_name_en": "org_id",
+        "field_type": "public_dim",
+        "data_type": "string",
+        "calculation_type": "direct",
+        "target_field": "org_id",
+        "formula": "yz_datawarehouse_dim.dim_hmc_plus_org_farm_entity.id",
+        "source_tables": ["yz_datawarehouse_dim.dim_hmc_plus_org_farm_entity"],
+        "source_fields": ["yz_datawarehouse_dim.dim_hmc_plus_org_farm_entity.id"],
+        "filters": [],
+        "joins": [],
+        "business_description": "组织标识",
+        "is_cross_table": false,
+        "support_drill_down": true,
+        "drill_down_fields": [],
+        "is_group_by_field": true,
+        "validation_status": "valid",
+        "validation_message": ""
+      },
+      {
+        "field_id": "dws_collect_semen_stat_parity",
+        "field_name": "胎次",
+        "field_name_en": "parity",
+        "field_type": "private_dim",
+        "data_type": "int",
+        "calculation_type": "direct",
+        "target_field": "parity",
+        "formula": "yz_datawarehouse_dim.dim_pig_maternal.parity",
+        "source_tables": ["yz_datawarehouse_dim.dim_pig_maternal"],
+        "source_fields": ["yz_datawarehouse_dim.dim_pig_maternal.parity"],
+        "filters": [],
+        "joins": [],
+        "business_description": "母猪胎次",
+        "is_cross_table": false,
+        "support_drill_down": true,
+        "drill_down_fields": [],
+        "is_group_by_field": true,
+        "validation_status": "valid",
+        "validation_message": ""
+      },
+      {
+        "field_id": "dws_collect_semen_stat_collect_semen_num",
+        "field_name": "采集精液数",
+        "field_name_en": "collect_semen_num",
+        "field_type": "metric",
+        "data_type": "decimal",
+        "calculation_type": "aggregation",
+        "target_field": "collect_semen_num",
+        "formula": "sum(yz_datawarehouse_dwd.dwd_aibreeding_collect_semen_plan.collect_semen_num)",
+        "source_tables": ["yz_datawarehouse_dwd.dwd_aibreeding_collect_semen_plan"],
+        "source_fields": ["yz_datawarehouse_dwd.dwd_aibreeding_collect_semen_plan.collect_semen_num"],
+        "filters": [],
+        "joins": [],
+        "business_description": "采集精液总数",
+        "is_cross_table": false,
+        "support_drill_down": false,
+        "drill_down_fields": [],
+        "is_group_by_field": false,
+        "validation_status": "valid",
+        "validation_message": ""
+      }
+    ]
+  }
+  ```
+  
+  **关键说明：**
+  - ❌ 错误：`"formula": "sum(sc.collect_semen_num)"` （使用了别名 `sc`）
+  - ✅ 正确：`"formula": "sum(yz_datawarehouse_dwd.dwd_aibreeding_collect_semen_plan.collect_semen_num)"` （使用物理表名）
+  - ❌ 错误：`"formula": "mat.parity"` （使用了别名 `mat`）
+  - ✅ 正确：`"formula": "yz_datawarehouse_dim.dim_pig_maternal.parity"` （使用物理表名）
 
   ## 【校验规则】
   1. 嵌套聚合检测：formula 含 SUM(SUM、COUNT(COUNT 等 → validation_status: invalid
   2. 跨表检测：source_tables 数量>1 或 joins 非空 → is_cross_table: true
   3. 下钻支持：维度字段 support_drill_down: true，指标字段 support_drill_down: false
   4. GROUP BY 标识：用于 GROUP BY 的字段 is_group_by_field: true
-  5. 字段类型：维度字段 field_type: dimension，指标字段 field_type: metric
+  5. 字段类型：public_dim（公共维度）、private_dim（私有维度）、metric（指标）、normal（普通字段）
   6. 表名规范：所有表名必须含完整表名（schema.表）
-  7. 布尔值规范：必须用 true/false，禁止用 是/否/支持/不支持
-  8. 时间格式：必须使用 ISO8601 格式（YYYY-MM-DDTHH:MM:SSZ）
-  9. 完整性校验：字段清单必须覆盖 SELECT 子句中的所有字段
+  7. **⚠️ formula 字段别名替换**：如果 SQL 中使用表别名（如 `mat.parity`），必须在 formula 中替换为物理表名（如 `yz_datawarehouse_dim.dim_hmc_plus_org_farm_entity.parity`）
+  8. 布尔值规范：必须用 true/false，禁止用 是/否/支持/不支持
+  9. 时间格式：必须使用 ISO8601 格式（YYYY-MM-DDTHH:MM:SSZ）
+  10. 完整性校验：fields 数组必须覆盖 SELECT 子句中的所有字段
 
   ## 【待解析 SQL】
   
