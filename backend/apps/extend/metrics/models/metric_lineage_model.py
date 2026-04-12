@@ -8,7 +8,7 @@ from sqlmodel import SQLModel, Field
 
 class MetricLineage(SQLModel, table=True):
     """指标血缘表模型"""
-    __tablename__ = "metric_lineage"
+    __tablename__ = "metric_lineage2"
     
     metric_column: str = Field(sa_column=Column(String(100), primary_key=True, nullable=False))
     table_name: str = Field(sa_column=Column(String(100), primary_key=True, nullable=False))

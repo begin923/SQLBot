@@ -40,8 +40,8 @@ from apps.datasource.models.datasource import CoreDatasource, CoreTable
 from apps.db.db import exec_sql, get_version, check_connection, get_fields
 from apps.extend.chat_manager.services.chat_service import ChatService
 from apps.extend.drilldown.drill_agg_rule_engine import DrillAggRuleEngine
-from apps.extend.metric_metadata.curd.metric_lineage import search_metric_dimensions
-from apps.extend.metric_metadata.curd.metric_metadata import get_metric_metadata_by_names
+from apps.extend.metrics.curd.metric_lineage import search_metric_dimensions
+from apps.extend.metrics.curd.metric_metadata import get_metric_metadata_by_names
 
 from apps.extend.sql_engine.sql_validator import SQLValidator
 from apps.system.crud.assistant import AssistantOutDs, AssistantOutDsFactory, get_assistant_ds

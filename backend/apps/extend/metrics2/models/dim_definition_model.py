@@ -14,6 +14,7 @@ class DimDict(SQLModel, table=True):
     dim_type: str = Field(sa_column=Column(VARCHAR(16), nullable=False, comment='维度类型：普通维度/时间维度/区域维度'))
     is_valid: Optional[int] = Field(sa_column=Column(Integer, default=1, comment='是否启用：1启用/0禁用'))
     create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, comment='创建时间'))
+    modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, onupdate=datetime.now, comment='修改时间'))
 
     __table_args__ = (
         {"comment": "维度定义表"},
@@ -27,3 +28,5 @@ class DimDictInfo(SQLModel):
     dim_code: Optional[str] = None
     dim_type: Optional[str] = None
     is_valid: Optional[bool] = True
+    create_time: Optional[datetime] = None
+    modify_time: Optional[datetime] = None

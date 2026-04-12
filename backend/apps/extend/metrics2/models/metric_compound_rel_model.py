@@ -14,6 +14,7 @@ class MetricCompoundRel(SQLModel, table=True):
     cal_operator: str = Field(sa_column=Column(VARCHAR(8), nullable=False, comment='运算符号：+ - * /（复合指标仅支持二元运算）'))
     sort: int = Field(sa_column=Column(TINYINT, nullable=False, comment='计算顺序：1、2、3...（按运算优先级排序）'))
     create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, comment='创建时间'))
+    modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, onupdate=datetime.now, comment='修改时间'))
 
     __table_args__ = (
         {"comment": "复合指标子指标关联表"},
@@ -27,3 +28,5 @@ class MetricCompoundRelInfo(SQLModel):
     sub_metric_id: Optional[str] = None
     cal_operator: Optional[str] = None
     sort: Optional[int] = None
+    create_time: Optional[datetime] = None
+    modify_time: Optional[datetime] = None

@@ -362,7 +362,7 @@ class ChatService:
 ### 4. 指标元数据管理
 
 ```python
-# apps/extend/metric_metadata/
+# apps/extend/metrics/
 
 # 支持：
 # - 指标定义（名称、计算逻辑、数据来源）

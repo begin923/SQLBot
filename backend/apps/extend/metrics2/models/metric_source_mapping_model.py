@@ -20,7 +20,7 @@ class MetricSourceMapping(SQLModel, table=True):
     is_valid: int = Field(sa_column=Column(TINYINT, nullable=False, default=1, comment='是否启用：1启用/0禁用'))
     source_level: str = Field(sa_column=Column(VARCHAR(16), nullable=False, comment='源等级：AUTHORITY（权威）/STANDBY（备用）/DISCARD（废弃）'))
     create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, comment='创建时间'))
-    update_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, onupdate=datetime.now, comment='更新时间'))
+    modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, onupdate=datetime.now, comment='修改时间'))
 
     __table_args__ = (
         {"comment": "指标多源物理映射表"},
@@ -40,3 +40,5 @@ class MetricSourceMappingInfo(SQLModel):
     priority: Optional[int] = None
     is_valid: Optional[bool] = True
     source_level: Optional[str] = None
+    create_time: Optional[datetime] = None
+    modify_time: Optional[datetime] = None

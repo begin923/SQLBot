@@ -16,6 +16,7 @@ class FieldLineage(SQLModel, table=True):
     target_field_mark: str = Field(default='normal', sa_column=Column(VARCHAR(16), nullable=False, server_default='normal', comment='目标字段标记：public_dim/private_dim/metric/normal'))
     dim_id: Optional[str] = Field(default=None, sa_column=Column(VARCHAR(32), nullable=True, comment='公共维度绑定ID'))
     create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, comment='创建时间'))
+    modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, onupdate=datetime.now, comment='修改时间'))
 
     __table_args__ = (
         {"comment": "字段映射校验表(含指标/维度标记，区分指标/公共/私有维度)"},
@@ -32,3 +33,5 @@ class FieldLineageInfo(SQLModel):
     target_field: Optional[str] = None
     target_field_mark: Optional[str] = 'normal'  # public_dim/private_dim/metric/normal
     dim_id: Optional[str] = None  # 仅公共维度有值
+    create_time: Optional[datetime] = None
+    modify_time: Optional[datetime] = None

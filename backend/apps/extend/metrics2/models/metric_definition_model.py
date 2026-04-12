@@ -16,6 +16,7 @@ class MetricDefinition(SQLModel, table=True):
     unit: Optional[str] = Field(sa_column=Column(VARCHAR(16), default=None, comment='指标单位（如次、率、头）'))
     status: Optional[int] = Field(sa_column=Column(SmallInteger, default=1, comment='状态：1启用/0禁用'))
     create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, comment='创建时间'))
+    modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, onupdate=datetime.now, comment='修改时间'))
 
     __table_args__ = (
         {"comment": "统一指标语义定义表"},
@@ -32,3 +33,5 @@ class MetricDefinitionInfo(SQLModel):
     cal_logic: Optional[str] = None
     unit: Optional[str] = None
     status: Optional[bool] = True
+    create_time: Optional[datetime] = None
+    modify_time: Optional[datetime] = None

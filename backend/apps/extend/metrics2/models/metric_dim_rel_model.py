@@ -13,6 +13,7 @@ class MetricDimRel(SQLModel, table=True):
     dim_id: str = Field(sa_column=Column(VARCHAR(32), nullable=False, comment='关联维度ID（dim_dict主键）'))
     is_required: int = Field(sa_column=Column(TINYINT, default=0, comment='是否必选维度：1必选/0可选（如胎次号、统计日期为必选）'))
     create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, comment='创建时间'))
+    modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, onupdate=datetime.now, comment='修改时间'))
 
     __table_args__ = (
         {"comment": "指标维度关联表"},
@@ -25,3 +26,5 @@ class MetricDimRelInfo(SQLModel):
     metric_id: Optional[str] = None
     dim_id: Optional[str] = None
     is_required: Optional[bool] = False
+    create_time: Optional[datetime] = None
+    modify_time: Optional[datetime] = None

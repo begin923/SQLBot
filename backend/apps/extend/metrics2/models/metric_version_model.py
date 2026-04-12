@@ -8,7 +8,7 @@ class MetricVersion(SQLModel, table=True):
     """指标版本管理表 - 历史口径回溯"""
     __tablename__ = "metric_version"
 
-    version_id: str = Field(sa_column=Column(VARCHAR(32), primary_key=True, comment='版本ID(V001)'))
+    version_id: str = Field(sa_column=Column(VARCHAR(32), primary_key=True, comment='版本ID(V000001)'))
     metric_id: str = Field(sa_column=Column(VARCHAR(32), nullable=False, comment='指标ID'))
     cal_logic: str = Field(sa_column=Column(TEXT, nullable=False, comment='历史口径'))
     version: int = Field(sa_column=Column(Integer, nullable=False, comment='版本号'))

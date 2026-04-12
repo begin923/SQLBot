@@ -223,7 +223,6 @@ class MetricsPlatformService:
 
             # 2. 解析SQL内容
             parsed_results = self._parse_sql_files(file_result.get('results', []))
-            print(f"parsed_results:{parsed_results}")
             if not parsed_results or not any(r.get('success', False) for r in parsed_results):
                 return {"success": False, "message": "SQL解析失败或未解析到有效数据"}
 
@@ -273,7 +272,25 @@ class MetricsPlatformService:
             if self.session.in_transaction():
                 try:
                     self.session.commit()
-                    logger.info("[流程结束] 已提交最终事务")
+                    
+                    # 输出简洁的业务总结日志
+                    layer_type = processed_results[0].get('layer_type', 'UNKNOWN') if processed_results else 'UNKNOWN'
+                    file_name = Path(str(input_path)).name if not is_directory else f"{len(file_paths)}个文件"
+                    
+                    if layer_type == "DIM":
+                        dim_count = sum(r.get('dimensions_count', 0) for r in processed_results)
+                        logger.info(f"✅ DIM层 | {file_name} | 维度ETL解析成功，数据写入成功 (维度数: {dim_count})")
+                    elif layer_type == "DWD":
+                        logger.info(f"✅ DWD层 | {file_name} | 明细ETL解析成功，数据写入成功")
+                    elif layer_type == "METRIC":
+                        metric_count = sum(r.get('metrics_count', 0) for r in processed_results)
+                        table_lineage_count = len(table_data.get('table_lineage', []))
+                        field_lineage_count = len(table_data.get('field_lineage', []))
+                        metric_lineage_count = len(table_data.get('metric_lineage', []))
+                        logger.info(f"✅ METRIC层 | {file_name} | 指标+维度解析成功，血缘数据写入成功 (指标: {metric_count}, 表血缘: {table_lineage_count}, 字段血缘: {field_lineage_count}, 指标血缘: {metric_lineage_count})")
+                    else:
+                        logger.info(f"✅ 解析成功 | {file_name}")
+                    
                 except Exception as commit_error:
                     logger.error(f"[流程结束] 提交事务失败: {str(commit_error)}")
                     self.session.rollback()
@@ -554,29 +571,11 @@ class MetricsPlatformService:
             # 将 fields 转换为 metrics 和 dimensions
             metrics, dimensions = self.etl_processor.convert_fields_to_metrics_and_dimensions(parsed_json['fields'])
             
-            logger.info(f"[AI解析] 转换完成 - 指标: {len(metrics)}, 维度: {len(dimensions)}")
+            logger.debug(f"[AI解析] 转换完成 - 指标: {len(metrics)}, 维度: {len(dimensions)}")
             
             # 打印前3个指标的详细信息
             for i, metric in enumerate(metrics[:3], 1):
                 logger.info(f"[AI解析] 指标 #{i}: {metric.get('metric_name')} ({metric.get('metric_code')}) - 类型: {metric.get('metric_type')}")
-
-            # ⚠️ 关键判断：如果没有 GROUP BY，说明这是 DWD 层的简单 INSERT，无法提取指标/维度
-            has_group_by = self._check_has_group_by(sql_content)
-            if not has_group_by and len(metrics) == 0:
-                logger.warning(f"[AI解析] 检测到无 GROUP BY 且无指标，可能是 DWD 层 ETL，仅提取血缘关系")
-                return {
-                    "success": True,
-                    "parsed_data": {
-                        "basic_info": {
-                            **parsed_json.get('basic_info', {}),
-                            'sql_content': sql_content  # ⚠️ 保存原始 SQL 内容用于后续校验
-                        },
-                        "fields": parsed_json.get('fields', []),  # ⚠️ 保留原始 fields 用于血缘分析
-                        "metrics": [],  # 无指标
-                        "dimensions": [],  # 无维度
-                        "is_lineage_only": True  # ⚠️ 标记为仅血缘模式
-                    }
-                }
 
             return {
                 "success": True,
@@ -653,6 +652,12 @@ class MetricsPlatformService:
                     processed_dimensions = self._process_dimensions(dimensions)
                     logger.info(f"[规则引擎] 维度处理完成: {len(processed_dimensions)} 个")
                     
+                    # ⚠️ 校验：DIM 层必须有维度数据
+                    if not processed_dimensions:
+                        error_msg = f"❌ DIM 层文件 {file_path} 未提取到任何维度数据，请检查 SQL 是否正确"
+                        logger.error(error_msg)
+                        raise ValueError(error_msg)
+                    
                     processed_results.append({
                         "file_path": file_path,
                         "success": True,
@@ -661,11 +666,28 @@ class MetricsPlatformService:
                         "parsed_data": parsed_data,
                         "processed_data": {
                             "dimensions": processed_dimensions,
-                            "metrics": []  # DIM 层不处理指标
+                            "metrics": [],  # DIM 层不处理指标
+                            "dimensions_count": len(processed_dimensions)
+                        }
+                    })
+                elif layer_type == "DWD":
+                    # DWD 层：只提取血缘关系，不处理指标/维度
+                    logger.info(f"[规则引擎] DWD 层模式：只提取血缘关系")
+                    
+                    processed_results.append({
+                        "file_path": file_path,
+                        "success": True,
+                        "message": "DWD层规则处理成功（仅血缘）",
+                        "layer_type": "DWD",
+                        "parsed_data": parsed_data,
+                        "processed_data": {
+                            "dimensions": [],
+                            "metrics": [],
+                            "is_lineage_only": True  # 标记为仅血缘模式
                         }
                     })
                 else:
-                    # METRIC 层（dwd/dws/ads）：处理指标并引用已有维度
+                    # METRIC 层（dws/ads）：处理指标并引用已有维度
                     logger.info(f"[规则引擎] METRIC 层模式：处理指标并引用已有维度")
                     
                     # 1. 维度处理：只查询已有维度，不创建新维度
@@ -684,7 +706,9 @@ class MetricsPlatformService:
                         "parsed_data": parsed_data,
                         "processed_data": {
                             "dimensions": processed_dimensions,
-                            "metrics": processed_metrics
+                            "metrics": processed_metrics,
+                            "metrics_count": len(processed_metrics),
+                            "dimensions_count": len(processed_dimensions)
                         }
                     })
 
@@ -976,16 +1000,16 @@ class MetricsPlatformService:
 
                 # 根据层级类型决定收集策略
                 if is_lineage_only:
-                    # ⚠️ 仅血缘模式：只收集表血缘和字段血缘，不收集指标/维度
-                    logger.info(f"[SQL生成] 仅血缘模式：收集表血缘和字段血缘")
+                    # ⚠️ DWD 层仅血缘模式：只收集表血缘和字段血缘，不收集指标/维度
+                    logger.info(f"[SQL生成] DWD 层仅血缘模式：收集表血缘和字段血缘")
                     # 1. 先收集表级血缘
                     self._collect_table_lineage_data(processed_result, table_data)
                     # 2. 再收集字段级血缘（依赖 table_lineage）
                     has_group_by = self._check_has_group_by_from_processed_result(processed_result)
                     self._collect_field_lineage_data(processed_result, table_data, has_group_by)
                 elif layer_type == "DIM":
-                    # DIM 层：收集维度定义 + 维度字段映射
-                    logger.info(f"[SQL生成] DIM 层模式：收集维度定义和维度字段映射")
+                    # DIM 层：只收集维度定义 + 维度字段映射，不收集血缘
+                    logger.info(f"[SQL生成] DIM 层模式：只收集维度定义和维度字段映射")
                     for d_idx, dim in enumerate(dimensions, 1):
                         if not dim.get('is_existing', False) and dim.get('dim_info'):
                             self._collect_dimension_data(dim, table_data)
@@ -993,6 +1017,16 @@ class MetricsPlatformService:
                     
                     # DIM 层也要收集维度字段映射（dim_field_mapping）
                     self._collect_dim_field_mapping_data_for_dim_layer(dimensions, processed_result, table_data)
+                    
+                    # ⚠️ 校验：DIM 层必须有 dim_definition 和 dim_field_mapping 数据
+                    if not table_data['dim_definition']:
+                        error_msg = f"❌ DIM 层文件 {file_path} 未生成 dim_definition 数据"
+                        logger.error(error_msg)
+                        raise ValueError(error_msg)
+                    if not table_data['dim_field_mapping']:
+                        error_msg = f"❌ DIM 层文件 {file_path} 未生成 dim_field_mapping 数据"
+                        logger.error(error_msg)
+                        raise ValueError(error_msg)
                 else:
                     # METRIC 层：收集维度和指标数据
                     logger.info(f"[SQL生成] METRIC 层模式：收集指标及关联维度")
@@ -1058,15 +1092,15 @@ class MetricsPlatformService:
                     # 特殊处理：dim_field_mapping 需要根据联合主键 (db_table, dim_field) 去重
                     if table_name == 'dim_field_mapping':
                         deduplicated_data = self._deduplicate_dim_field_mapping(data_list)
-                        logger.info(f"[SQL生成] 表 {table_name}: 去重前 {len(data_list)} 条，去重后 {len(deduplicated_data)} 条")
+                        logger.debug(f"[SQL生成] 表 {table_name}: 去重前 {len(data_list)} 条，去重后 {len(deduplicated_data)} 条")
                         data_list = deduplicated_data
                     
                     batch_sql = self._generate_batch_insert_sql(table_name, data_list)
                     if batch_sql:
                         insert_sqls.append(batch_sql)
-                        logger.info(f"[SQL生成] 表 {table_name}: 生成批量 INSERT ({len(data_list)} 条记录)")
+                        logger.debug(f"[SQL生成] 表 {table_name}: 生成批量 INSERT ({len(data_list)} 条记录)")
 
-            logger.info(f"[SQL生成] 完成 - 共生成 {len(insert_sqls)} 条批量 INSERT SQL")
+            logger.debug(f"[SQL生成] 完成 - 共生成 {len(insert_sqls)} 条批量 INSERT SQL")
             return insert_sqls
 
         except Exception as e:
@@ -1233,7 +1267,7 @@ class MetricsPlatformService:
                 for row in result:
                     key = (row[1], row[2])  # (source_table, target_table)
                     existing_table_lineage[key] = row[0]  # lineage_id
-                logger.info(f"[SQL生成-表血缘] 从数据库加载 {len(existing_table_lineage)} 条已有记录")
+                logger.debug(f"[SQL生成-表血缘] 从数据库加载 {len(existing_table_lineage)} 条已有记录")
             except Exception as e:
                 logger.warning(f"[SQL生成-表血缘] 查询已有表血缘失败: {str(e)}")
             
@@ -1257,7 +1291,7 @@ class MetricsPlatformService:
                     'target_table': tgt_table
                 })
             
-            logger.info(f"[SQL生成-表血缘] 收集完成: {len(table_data['table_lineage'])} 条记录")
+            logger.debug(f"[SQL生成-表血缘] 收集完成: {len(table_data['table_lineage'])} 条记录")
             
         except Exception as e:
             logger.error(f"[SQL生成-表血缘] 收集失败: {str(e)}")
@@ -1421,7 +1455,7 @@ class MetricsPlatformService:
                 if dim_code and dim_id:
                     dim_code_to_id[dim_code] = dim_id
             
-            logger.info(f"[SQL生成-字段血缘] 维度映射: {len(dim_code_to_id)} 个, 有GROUP BY: {has_group_by}")
+            logger.debug(f"[SQL生成-字段血缘] 维度映射: {len(dim_code_to_id)} 个, 有GROUP BY: {has_group_by}")
             
             # 构建业务唯一键 -> lineage_id 的映射（从数据库查询已有数据）
             # 业务唯一键: (source_table, source_field, target_table, target_field)
@@ -1433,7 +1467,7 @@ class MetricsPlatformService:
                 for row in result:
                     key = (row[1], row[2], row[3], row[4])  # (source_table, source_field, target_table, target_field)
                     existing_field_lineage[key] = row[0]  # lineage_id
-                logger.info(f"[SQL生成-字段血缘] 从数据库加载 {len(existing_field_lineage)} 条已有记录")
+                logger.debug(f"[SQL生成-字段血缘] 从数据库加载 {len(existing_field_lineage)} 条已有记录")
             except Exception as e:
                 logger.warning(f"[SQL生成-字段血缘] 查询已有字段血缘失败: {str(e)}")
             
@@ -1504,7 +1538,7 @@ class MetricsPlatformService:
                             final_field_type = 'public_dim'
                         else:
                             # ⚠️ 未找到 dim_id，降级为 private_dim（避免违反 CHECK 约束）
-                            logger.warning(f"[SQL生成-字段血缘] 公共维度 {target_field} (source: {source_fields}) 未找到对应的 dim_id，降级为 private_dim")
+                            logger.debug(f"[SQL生成-字段血缘] 公共维度 {target_field} (source: {source_fields}) 未找到对应的 dim_id，降级为 private_dim")
                             final_field_type = 'private_dim'
                     
                     table_data['field_lineage'].append({
@@ -1520,7 +1554,7 @@ class MetricsPlatformService:
                     
                     logger.debug(f"[SQL生成-字段血缘] {source_table}.{source_field} -> {target_table}.{target_field} (type: {field_type}, lineage_id: {lineage_id}, table_lineage_id: {table_lineage_id})")
             
-            logger.info(f"[SQL生成-字段血缘] 收集完成: {len(table_data['field_lineage'])} 条记录")
+            logger.debug(f"[SQL生成-字段血缘] 收集完成: {len(table_data['field_lineage'])} 条记录")
             
         except Exception as e:
             logger.error(f"[SQL生成-字段血缘] 收集失败: {str(e)}")
@@ -2161,9 +2195,9 @@ VALUES ('{metric_id}', '{sub_metric_code}', '{operator}', {i + 1});
             in_transaction = self.session.in_transaction()
             if not in_transaction:
                 self.session.begin()
-                logger.info("[SQL执行] 已开启新事务")
+                logger.debug("[事务] 开启新事务")
             else:
-                logger.info("[SQL执行] 使用现有事务")
+                logger.debug("[事务] 使用现有事务")
 
             try:
                 for i, sql in enumerate(insert_sqls, 1):
@@ -2171,7 +2205,7 @@ VALUES ('{metric_id}', '{sub_metric_code}', '{operator}', {i + 1});
                         # 执行SQL - 使用 text() 包装原始 SQL
                         self.session.execute(text(sql))
                         executed_count += 1
-                        logger.info(f"[SQL执行] SQL #{i} 执行成功")
+                        logger.debug(f"[SQL执行] SQL #{i} 执行成功")
                     except Exception as e:
                         failed_count += 1
                         error_msg = f"SQL #{i} 执行失败: {str(e)}"
@@ -2185,7 +2219,7 @@ VALUES ('{metric_id}', '{sub_metric_code}', '{operator}', {i + 1});
                         # 回滚当前事务，然后重新开始新事务以继续执行后续 SQL
                         try:
                             self.session.rollback()
-                            logger.info(f"[SQL执行] 已回滚事务，准备继续执行下一条 SQL")
+                            logger.debug(f"[事务] 已回滚，准备继续执行下一条 SQL")
                             # 重新开启事务
                             if not in_transaction:
                                 self.session.begin()
@@ -2198,16 +2232,16 @@ VALUES ('{metric_id}', '{sub_metric_code}', '{operator}', {i + 1});
                 if failed_count == 0:
                     if not in_transaction:
                         self.session.commit()
-                        logger.info("[SQL执行] 所有SQL执行成功，已提交事务")
+                        logger.debug("[事务] 所有SQL执行成功，已提交事务")
                     else:
-                        logger.info("[SQL执行] 所有SQL执行成功，事务由调用方提交")
+                        logger.debug("[事务] 所有SQL执行成功，事务由调用方提交")
                 else:
                     # 如果有失败的SQL，不自动提交，让调用方决定如何处理
                     if not in_transaction:
                         self.session.rollback()
-                        logger.warning("[SQL执行] 存在失败的SQL，已回滚事务")
+                        logger.warning("[事务] 存在失败的SQL，已回滚事务")
                     else:
-                        logger.warning("[SQL执行] 存在失败的SQL，事务未提交，需要手动处理")
+                        logger.warning("[事务] 存在失败的SQL，事务未提交，需要手动处理")
 
                 if failed_count > 0:
                     return {
@@ -2232,9 +2266,9 @@ VALUES ('{metric_id}', '{sub_metric_code}', '{operator}', {i + 1});
                 if not in_transaction:
                     try:
                         self.session.rollback()
-                        logger.info(f"[SQL执行] 发生异常，已回滚事务")
+                        logger.debug(f"[事务] 发生异常，已回滚事务")
                     except Exception as rollback_error:
-                        logger.error(f"[SQL执行] 回滚失败: {str(rollback_error)}")
+                        logger.error(f"[事务] 回滚失败: {str(rollback_error)}")
                 raise e
 
         except Exception as e:

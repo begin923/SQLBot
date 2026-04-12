@@ -1,8 +1,15 @@
 import os
+import sys
+import logging
+import traceback
 from pathlib import Path
 from typing import Dict
 
 import yaml
+from openai import OpenAI
+from apps.extend.format.config import config
+
+logger = logging.getLogger(__name__)
 
 
 class Utils:
@@ -23,6 +30,138 @@ class Utils:
             raise FileNotFoundError(f"提示词文件不存在：{yaml_file}")
 
 
+class ModelClient:
+    """AI 模型客户端 - 简化版"""
+
+    def __init__(self):
+        # 统一从配置文件读取配置
+        try:
+            self.api_key = config.dashscope_api_key or os.getenv("DASHSCOPE_API_KEY")
+            self.base_url = config.dashscope_base_url or os.getenv("DASHSCOPE_BASE_URL")
+            self.model = config.dashscope_code_model or os.getenv("DASHSCOPE_CODE_MODEL")
+        except ImportError:
+            # 如果 config 模块不存在，直接使用环境变量
+            self.api_key = os.getenv("DASHSCOPE_API_KEY")
+            self.base_url = os.getenv("DASHSCOPE_BASE_URL")
+            self.model = os.getenv("DASHSCOPE_CODE_MODEL", "qwen3-coder-plus")
+
+        # 初始化 OpenAI 客户端
+        if self.api_key and self.base_url:
+            self.client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url
+            )
+        else:
+            logger.warning(f"⚠️  [ModelClient] AI 配置缺失 - API Key: {'✅' if self.api_key else '❌'}, Base URL: {'✅' if self.base_url else '❌'}")
+            self.client = None
+
+    def call_ai(self, template_name: str, sql_content: str, sql_file: str = "") -> str:
+        """
+        调用 AI 大模型，返回 MD 格式
+
+        Args:
+            template_name: 模板名称
+            sql_content: SQL 内容
+            sql_file: SQL 文件名
+
+        Returns:
+            MD 格式的字符串
+        """
+        try:
+            # 加载提示词配置（使用静态方法）
+            prompt_config = Utils.load_prompt_template_static(template_name)
+
+            # 获取 system 提示词
+            system_prompt = prompt_config.get('system', '')
+
+            # 获取 metric_blood 提示词
+            user_prompt_template = prompt_config.get('metric_blood', '')
+
+            if not user_prompt_template:
+                raise ValueError("找不到 metric_blood 类型的提示词模板")
+
+            # 替换占位符
+            user_prompt = user_prompt_template.replace("{sql_content}", sql_content)
+            if sql_file:
+                user_prompt = user_prompt.replace("{sql_file}", sql_file)
+
+            # 构建消息列表
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            else:
+                messages.append({"role": "system",
+                                 "content": "You are a helpful data assistant that outputs Markdown format."})
+
+            messages.append({"role": "user", "content": user_prompt})
+
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.1
+            )
+
+            result = completion.choices[0].message.content
+            logger.info(f"[AI] 收到 AI 响应，长度：{len(result) if result else 0} 字符")
+
+            if result:
+                logger.debug(f"[AI] AI 返回内容预览：{result[:200]}...")
+
+            if not result or not result.strip():
+                logger.error("[AI] AI 返回空内容")
+                return None
+
+            return result
+
+        except Exception as e:
+            # 获取详细的错误位置信息
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            file_name = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+            line_number = exc_tb.tb_lineno
+            function_name = exc_tb.tb_frame.f_code.co_name
+            module_name = exc_tb.tb_frame.f_globals.get('__name__', 'unknown')
+            
+            # 构建详细错误日志
+            error_msg = f"""
+{'='*80}
+❌ [AI] AI 调用失败
+{'='*80}
+📍 错误位置：
+   • 模块：{module_name}
+   • 文件：{file_name}
+   • 函数：{function_name}
+   • 行号：{line_number}
+
+🔍 调用上下文：
+   • 模板名称：{template_name}
+   • SQL 内容长度：{len(sql_content)} 字符
+   • SQL 文件名：{sql_file or 'N/A'}
+
+⚠️  客户端状态：
+   • API Key：{'✅ 已设置' if self.api_key else '❌ 未设置'}
+   • Base URL：{'✅ 已设置' if self.base_url else '❌ 未设置'}
+   • Model：{self.model or '❌ 未设置'}
+   • Client：{'✅ 已初始化' if self.client else '❌ None'}
+
+💥 异常信息：
+   • 类型：{type(e).__name__}
+   • 消息：{str(e)}
+
+📋 完整堆栈跟踪：
+{traceback.format_exc()}
+{'='*80}
+"""
+            
+            # 输出到日志和控制台
+            logger.error(error_msg)
+            print(error_msg)
+            
+            raise
+
+
+class DBUtils:
+    """数据库工具类"""
+
     @staticmethod
     def create_local_session():
         """
@@ -34,7 +173,6 @@ class Utils:
         """
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
-        import os
         from dotenv import load_dotenv
 
         # 加载根目录的.env 文件
@@ -73,6 +211,7 @@ class Utils:
 
         llm_instance = LLMFactory.create_llm(config)
         return llm_instance.llm
+
 
 if __name__ == "__main__":
     print(Utils.load_prompt_template_static("rule_keyword"))

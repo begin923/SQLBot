@@ -11,6 +11,7 @@ class DimFieldMapping(SQLModel, table=True):
     db_table: str = Field(sa_column=Column(VARCHAR(128), primary_key=True, nullable=False, comment='物理表'))
     dim_field: str = Field(sa_column=Column(VARCHAR(64), primary_key=True, nullable=False, comment='维度字段'))
     create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, comment='创建时间'))
+    modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, onupdate=datetime.now, comment='修改时间'))
 
     __table_args__ = (
         {"comment": "维度-物理字段映射表"},
@@ -22,3 +23,5 @@ class DimFieldMappingInfo(SQLModel):
     dim_id: Optional[str] = None
     db_table: Optional[str] = None
     dim_field: Optional[str] = None
+    create_time: Optional[datetime] = None
+    modify_time: Optional[datetime] = None
