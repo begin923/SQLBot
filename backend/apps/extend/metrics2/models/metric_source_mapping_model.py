@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Optional
 from sqlmodel import SQLModel, Field, Column, VARCHAR, TEXT, DATETIME, Integer
 from sqlalchemy.dialects.mysql import TINYINT
+from sqlalchemy import Index
 
 
 class MetricSourceMapping(SQLModel, table=True):
@@ -23,6 +24,7 @@ class MetricSourceMapping(SQLModel, table=True):
     modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, onupdate=datetime.now, comment='修改时间'))
 
     __table_args__ = (
+        Index('idx_metric_source_unique', 'metric_id', 'db_table', 'metric_column', unique=True),  # ⚠️ 唯一约束：指标+表+字段
         {"comment": "指标多源物理映射表"},
     )
 

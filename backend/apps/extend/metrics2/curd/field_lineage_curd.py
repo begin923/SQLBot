@@ -42,7 +42,8 @@ def create_field_lineage(session: Session, info: FieldLineageInfo):
         target_table=info.target_table.strip(),
         target_field=info.target_field.strip(),
         target_field_mark=info.target_field_mark.strip() if info.target_field_mark else 'normal',
-        dim_id=info.dim_id.strip() if info.dim_id else None
+        dim_id=info.dim_id.strip() if info.dim_id else None,
+        formula=info.formula.strip() if info.formula else None
     )
 
     session.add(lineage)
@@ -121,7 +122,8 @@ def get_field_lineage_by_id(session: Session, lineage_id: str) -> Optional[Field
         target_table=field_lineage.target_table,
         target_field=field_lineage.target_field,
         target_field_mark=field_lineage.target_field_mark,
-        dim_id=field_lineage.dim_id
+        dim_id=field_lineage.dim_id,
+        formula=field_lineage.formula
     )
 
 
@@ -141,7 +143,8 @@ def get_field_lineage_by_lineage_id(session: Session, lineage_id: str) -> List[F
             target_table=lineage.target_table,
             target_field=lineage.target_field,
             target_field_mark=lineage.target_field_mark,
-            dim_id=lineage.dim_id
+            dim_id=lineage.dim_id,
+            formula=lineage.formula
         ))
 
     return _list
@@ -188,7 +191,8 @@ def get_field_lineage_by_target_field(session: Session, target_table: str, targe
             target_table=lineage.target_table,
             target_field=lineage.target_field,
             target_field_mark=lineage.target_field_mark,
-            dim_id=lineage.dim_id
+            dim_id=lineage.dim_id,
+            formula=lineage.formula
         ))
 
     return _list
@@ -216,7 +220,8 @@ def get_all_field_lineage(session: Session, table_lineage_id: Optional[str] = No
             target_table=lineage.target_table,
             target_field=lineage.target_field,
             target_field_mark=lineage.target_field_mark,
-            dim_id=lineage.dim_id
+            dim_id=lineage.dim_id,
+            formula=lineage.formula
         ))
 
     return _list

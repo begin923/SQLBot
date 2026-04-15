@@ -22,11 +22,9 @@ from apps.extend.metrics2.api.metric_compound_rel_api import router as metric_co
 # 版本管理层 API
 from apps.extend.metrics2.api.version_management_api import router as version_management_router
 
-# 血缘分析 API
-from apps.extend.metrics2.api.lineage_analysis_api import router as lineage_analysis_router
+# ⚠️ 血缘分析 API（已废弃，LineageAnalysisService 已删除）
+# from apps.extend.metrics2.api.lineage_analysis_api import router as lineage_analysis_router
 
-from apps.extend.metrics2.services.metric_service import MetricService
-from apps.extend.metrics2.services.dim_field_mapping_service import DimFieldMappingService
 from apps.extend.metrics2.services.service_factory import ServiceFactory
 
 __all__ = [
@@ -36,8 +34,5 @@ __all__ = [
     "metric_source_mapping_router",
     "metric_compound_rel_router",
     "version_management_router",
-    "lineage_analysis_router",
-    "MetricService",
-    "DimFieldMappingService",
     "ServiceFactory"
 ]

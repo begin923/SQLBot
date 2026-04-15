@@ -21,7 +21,6 @@ class Utils:
         current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         yaml_path = os.path.join(current_dir, "yaml")
         yaml_file = os.path.join(yaml_path, f"{template_name}.yaml")
-        print(yaml_file)
 
         if os.path.exists(yaml_file):
             with open(yaml_file, "r", encoding="utf-8") as f:
@@ -55,7 +54,7 @@ class ModelClient:
             logger.warning(f"⚠️  [ModelClient] AI 配置缺失 - API Key: {'✅' if self.api_key else '❌'}, Base URL: {'✅' if self.base_url else '❌'}")
             self.client = None
 
-    def call_ai(self, template_name: str, sql_content: str, sql_file: str = "") -> str:
+    def call_ai(self, template_name: str, sql_content: str, sql_file: str = "", layer_type: str = "METRIC") -> str:
         """
         调用 AI 大模型，返回 MD 格式
 
@@ -63,6 +62,7 @@ class ModelClient:
             template_name: 模板名称
             sql_content: SQL 内容
             sql_file: SQL 文件名
+            layer_type: 数仓层级类型（DIM/DWD/METRIC），用于选择不同的提示词
 
         Returns:
             MD 格式的字符串
@@ -74,16 +74,30 @@ class ModelClient:
             # 获取 system 提示词
             system_prompt = prompt_config.get('system', '')
 
-            # 获取 metric_blood 提示词
-            user_prompt_template = prompt_config.get('metric_blood', '')
+            # ⚠️ 根据层级类型选择不同的 system + user 提示词组合
+            if layer_type == "DIM":
+                # DIM 层：使用 dim_layer.system + dim_layer.user
+                layer_config = prompt_config.get('dim_layer', {})
+                system_prompt = layer_config.get('system', '')
+                user_prompt_template = layer_config.get('user', '')
+                        
+            elif layer_type == "DWD":
+                # DWD 层：使用 dwd_layer.system + dwd_layer.user
+                layer_config = prompt_config.get('dwd_layer', {})
+                system_prompt = layer_config.get('system', '')
+                user_prompt_template = layer_config.get('user', '')
+                        
+            else:
+                # METRIC/DWS/ADS 层（默认）：使用 dws_ads_layer.system + dws_ads_layer.user
+                layer_config = prompt_config.get('dws_ads_layer', {})
+                system_prompt = layer_config.get('system', '')
+                user_prompt_template = layer_config.get('user', '')
 
             if not user_prompt_template:
-                raise ValueError("找不到 metric_blood 类型的提示词模板")
+                raise ValueError("找不到任何可用的提示词模板")
 
-            # 替换占位符
+            # 替换占位符（只替换 sql_content）
             user_prompt = user_prompt_template.replace("{sql_content}", sql_content)
-            if sql_file:
-                user_prompt = user_prompt.replace("{sql_file}", sql_file)
 
             # 构建消息列表
             messages = []

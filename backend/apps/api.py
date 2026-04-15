@@ -17,7 +17,7 @@ from apps.extend.metrics2 import (
     metric_source_mapping_router,
     metric_compound_rel_router,
     version_management_router,
-    lineage_analysis_router
+    # lineage_analysis_router  # ⚠️ 已废弃
 )
 
 api_router = APIRouter()
@@ -44,4 +44,4 @@ api_router.include_router(metric_dim_rel_router)
 api_router.include_router(metric_source_mapping_router)
 api_router.include_router(metric_compound_rel_router)
 api_router.include_router(version_management_router)
-api_router.include_router(lineage_analysis_router)
+# api_router.include_router(lineage_analysis_router)  # ⚠️ 已废弃
