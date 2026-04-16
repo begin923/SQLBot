@@ -9,20 +9,25 @@
 import sys
 import os
 import logging
+import json
+import time
+from pathlib import Path
 
 # 配置日志（避免重复输出）
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,  # ⚠️ 默认只输出 WARNING 及以上级别
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     force=True  # 强制重新配置，避免重复handler
 )
 
-# 设置特定logger的级别，减少冗余日志
-logging.getLogger("httpx").setLevel(logging.WARNING)  # HTTP请求日志
-logging.getLogger("MetricsPlatformService").setLevel(logging.INFO)
-logging.getLogger("LineageService").setLevel(logging.INFO)
-logging.getLogger("MetricsService").setLevel(logging.INFO)
-logging.getLogger("DimService").setLevel(logging.INFO)
+# 设置特定logger的级别
+logging.getLogger("httpx").setLevel(logging.ERROR)  # HTTP请求日志
+logging.getLogger("MetricsPlatformService").setLevel(logging.INFO)  # 保留关键信息
+logging.getLogger("LineageService").setLevel(logging.WARNING)  # ⚠️ 关闭血缘服务的详细日志
+logging.getLogger("MetricsService").setLevel(logging.WARNING)
+logging.getLogger("DimService").setLevel(logging.WARNING)
+logging.getLogger("sqlalchemy.engine").setLevel(logging.ERROR)  # ⚠️ 关闭SQLAlchemy的SQL日志
+logging.getLogger("sqlalchemy.pool").setLevel(logging.ERROR)  # ⚠️ 关闭连接池日志
 
 # 添加项目根目录到 Python 路径
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
@@ -31,10 +36,69 @@ if project_root not in sys.path:
 
 from apps.extend.metrics2.services import MetricsPlatformService
 from apps.extend.utils.utils import DBUtils
+from apps.extend.metrics2.curd.sql_parse_failure_log_curd import get_failure_statistics, get_failure_logs
+from apps.extend.metrics2.curd.sql_parse_success_log_curd import (
+    create_or_update_success_log,
+    get_success_file_paths,
+    get_success_statistics
+)
+import json
+import time
+from pathlib import Path
+
+# 断点续传配置文件路径
+CHECKPOINT_FILE = os.path.join(os.path.dirname(__file__), '.checkpoint.json')
+
+# 明确失败的错误类型（这些错误短期内无法修复，应该跳过）
+PERMANENT_FAILURE_ERRORS = [
+    'DIM 层未生成任何 dim_definition 数据',  # AI 解析失败
+    '❌ DIM 层未生成任何 dim_definition 数据',
+]
 
 
 
-def test_layer(sql_file_path: str, layer_type: str = "AUTO", session=None):
+def save_checkpoint(execution_order: list, current_index: int):
+    """
+    保存执行进度到检查点文件
+    
+    Args:
+        execution_order: 完整的执行顺序列表
+        current_index: 当前处理到的索引（下一个要处理的）
+    """
+    checkpoint_data = {
+        'execution_order': execution_order,
+        'current_index': current_index,
+        'timestamp': time.time()
+    }
+    with open(CHECKPOINT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(checkpoint_data, f, ensure_ascii=False, indent=2)
+
+
+def load_checkpoint() -> dict:
+    """
+    加载检查点文件
+    
+    Returns:
+        检查点数据，如果不存在则返回 None
+    """
+    if not os.path.exists(CHECKPOINT_FILE):
+        return None
+    
+    try:
+        with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"⚠️  加载检查点文件失败: {e}")
+        return None
+
+
+def clear_checkpoint():
+    """清除检查点文件"""
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+
+
+def test_layer(sql_file_path: str, layer_type: str = "AUTO", session=None, skip_success: bool = True) -> tuple:
     """
     测试单个层级的 SQL 文件解析
     
@@ -42,7 +106,24 @@ def test_layer(sql_file_path: str, layer_type: str = "AUTO", session=None):
         sql_file_path: SQL 文件路径
         layer_type: 层级类型（AUTO/DIM/DWD/METRIC），默认 AUTO 自动识别
         session: 数据库会话
+        skip_success: 是否跳过已成功处理的文件
+        
+    Returns:
+        (success: bool, skipped: bool) - 成功标志和是否跳过
     """
+    # ⚠️ 检查是否已成功处理
+    if skip_success:
+        from apps.extend.metrics2.curd.sql_parse_success_log_curd import get_success_log
+        success_log = get_success_log(session, sql_file_path)
+        if success_log:
+            print(f"\n⏭️  跳过已成功处理的文件")
+            print(f"   - 层级类型: {success_log.layer_type}")
+            print(f"   - 目标表: {success_log.target_table or 'N/A'}")
+            print(f"   - 处理时间: {success_log.parse_time}")
+            if success_log.processing_duration:
+                print(f"   - 耗时: {success_log.processing_duration:.2f}秒")
+            return True, True  # 成功且跳过
+    
     print("\n" + "=" * 80)
     print(f"🔍 测试 {layer_type} 层")
     print("=" * 80)
@@ -52,7 +133,9 @@ def test_layer(sql_file_path: str, layer_type: str = "AUTO", session=None):
     # 检查文件是否存在
     if not os.path.exists(sql_file_path):
         print(f"\n❌ 文件不存在：{sql_file_path}")
-        return False
+        return False, False
+    
+    start_time = time.time()
     
     try:
         # 创建服务实例
@@ -66,165 +149,84 @@ def test_layer(sql_file_path: str, layer_type: str = "AUTO", session=None):
             layer_type=layer_type
         )
         
+        processing_duration = time.time() - start_time
+        
         # 打印结果
         if result.get('success'):
             print(f"✅ {layer_type} 层解析成功！")
+            print(f"⏱️  耗时: {processing_duration:.2f}秒")
             
-            # ⚠️ 如果是 AUTO 模式，显示实际识别的层级类型
-            if layer_type == "AUTO":
-                parsed_results = result.get('parsed_results', [])
-                if parsed_results:
-                    first_result = parsed_results[0]
-                    parsed_data = first_result.get('parsed_data', {})
-                    basic_info = parsed_data.get('basic_info', {})
-                    actual_layer = basic_info.get('warehouse_layer', 'UNKNOWN').upper()
-                    print(f"🎯 自动识别为: {actual_layer} 层")
+            # ⚠️ 如果这个文件之前在失败记录中，标记为已解决
+            from apps.extend.metrics2.curd.sql_parse_failure_log_curd import get_failure_logs, mark_as_resolved
+            unresolved_failures = get_failure_logs(session, is_resolved=False, limit=1000)
+            for failure_log in unresolved_failures:
+                if failure_log.file_path == sql_file_path:
+                    mark_as_resolved(session, failure_log.id)
+                    print(f"✅ 已标记失败记录为已解决 (ID: {failure_log.id})")
+                    break
             
-            # 从 parsed_results 中获取详细信息
+            # ⚠️ 记录成功日志（service 层已记录详细信息）
             parsed_results = result.get('parsed_results', [])
             if parsed_results:
                 first_result = parsed_results[0]
                 parsed_data = first_result.get('parsed_data', {})
                 basic_info = parsed_data.get('basic_info', {})
-                
-                print(f"\n📊 统计信息：")
-                print(f"   - 目标表：{basic_info.get('target_table', 'N/A')}")
-                print(f"   - 表描述：{basic_info.get('table_desc', 'N/A')}")
-                
-                # ⚠️ 调试：打印 AI 返回的血缘数据量
-                table_lineage_raw = parsed_data.get('table_lineage', [])
-                field_lineage_raw = parsed_data.get('field_lineage', [])
-                print(f"\n🔍 AI 原始解析结果：")
-                print(f"   - table_lineage: {len(table_lineage_raw)} 条")
-                print(f"   - field_lineage: {len(field_lineage_raw)} 条")
-                if table_lineage_raw:
-                    first_tl = table_lineage_raw[0]
-                    print(f"   - 示例: source_table={first_tl.get('source_table')}, target_table={first_tl.get('target_table')}")
-                if field_lineage_raw:
-                    first_fl = field_lineage_raw[0]
-                    print(f"   - 示例: source_field={first_fl.get('source_field')}, target_field={first_fl.get('target_field')}")
-                
-                # 根据层级类型显示不同的统计信息
-                # ⚠️ 注意：AUTO 模式下，需要从 basic_info 中获取实际的层级类型
                 actual_layer = basic_info.get('warehouse_layer', layer_type).upper()
-                
-                if actual_layer == "DWD":
-                    # DWD 层：显示字段数量和血缘信息
-                    fields = parsed_data.get('fields', [])
-                    table_lineage = parsed_data.get('table_lineage', [])
-                    field_lineage = parsed_data.get('field_lineage', [])
-                    
-                    print(f"   - 字段数：{len(fields)}")
-                    print(f"   - 表血缘数：{len(table_lineage)}")
-                    print(f"   - 字段血缘数：{len(field_lineage)}")
-                    
-                    # 显示字段列表（前5个）
-                    if fields:
-                        print(f"\n📋 识别的字段（前5个）：")
-                        for i, field in enumerate(fields[:5], 1):
-                            print(f"   {i}. {field.get('field_name', 'N/A')} ({field.get('field_en', 'N/A')}) - {field.get('field_type', 'N/A')}")
-                        if len(fields) > 5:
-                            print(f"   ... 还有 {len(fields) - 5} 个字段")
-                    
-                    # 显示表血缘（前3个）
-                    if table_lineage:
-                        print(f"\n🔗 表血缘关系（前3个）：")
-                        for i, tl in enumerate(table_lineage[:3], 1):
-                            source_name = tl.get('source_table_name', '')
-                            target_name = tl.get('target_table_name', '')
-                            name_info = f" ({source_name} -> {target_name})" if source_name and target_name else ""
-                            print(f"   {i}. {tl.get('source_table', 'N/A')} -> {tl.get('target_table', 'N/A')}{name_info}")
-                        if len(table_lineage) > 3:
-                            print(f"   ... 还有 {len(table_lineage) - 3} 条表血缘")
-                    
-                    # ⚠️ 显示字段血缘示例（前3个）
-                    if field_lineage:
-                        print(f"\n📊 字段血缘示例（前3个）：")
-                        for i, fl in enumerate(field_lineage[:3], 1):
-                            source_field_name = fl.get('source_field_name', '')
-                            target_field_name = fl.get('target_field_name', '')
-                            field_mark = fl.get('target_field_mark', 'normal')
-                            print(f"   {i}. [{field_mark}] {fl.get('source_field', 'N/A')}")
-                            if source_field_name:
-                                print(f"      → {fl.get('target_field', 'N/A')} ({target_field_name})")
-                            else:
-                                print(f"      → {fl.get('target_field', 'N/A')}")
-                        if len(field_lineage) > 3:
-                            print(f"   ... 还有 {len(field_lineage) - 3} 条字段血缘")
-                            
-                elif actual_layer == "DIM":
-                    # DIM 层：显示字段数量
-                    fields = parsed_data.get('fields', [])
-                    print(f"   - 字段数：{len(fields)}")
-                    
-                    # 显示字段列表（前5个）
-                    if fields:
-                        print(f"\n📋 维度字段（前5个）：")
-                        for i, field in enumerate(fields[:5], 1):
-                            print(f"   {i}. {field.get('field_name', 'N/A')} ({field.get('field_en', 'N/A')}) - {field.get('dim_type', 'N/A')}")
-                        if len(fields) > 5:
-                            print(f"   ... 还有 {len(fields) - 5} 个字段")
-                            
-                else:  # METRIC (DWS/ADS)
-                    # METRIC 层：显示字段数量
-                    fields = parsed_data.get('fields', [])
-                    print(f"   - 字段数：{len(fields)}")
-                    
-                    # 显示字段列表（前5个）
-                    if fields:
-                        print(f"\n📋 指标/维度字段（前5个）：")
-                        for i, field in enumerate(fields[:5], 1):
-                            field_type = field.get('field_type', 'N/A')
-                            print(f"   {i}. {field.get('field_name', 'N/A')} ({field.get('field_en', 'N/A')}) - {field_type}")
-                        if len(fields) > 5:
-                            print(f"   ... 还有 {len(fields) - 5} 个字段")
-                
-                # ⚠️ 显示各表的数据量统计
+                target_table = basic_info.get('target_table', '')
                 execution_result = result.get('execution_result', {})
                 table_stats = execution_result.get('table_stats', {})
-                if table_stats:
-                    print(f"\n💾 数据写入统计：")
-                    for table_name, count in sorted(table_stats.items()):
-                        # 根据表名添加图标
-                        icon_map = {
-                            'dim_definition': '📏',
-                            'dim_field_mapping': '🔗',
-                            'table_lineage': '🔗',
-                            'field_lineage': '📊',
-                            'metric_definition': '📈',
-                            'metric_source_mapping': '🎯',
-                            'metric_dim_rel': '🔀',
-                            'metric_compound_rel': '🧩',
-                            'metric_lineage': '🌳'
-                        }
-                        icon = icon_map.get(table_name, '📄')
-                        print(f"   {icon} {table_name}: {count} 条")
+                
+                create_or_update_success_log(
+                    session=session,
+                    file_path=sql_file_path,
+                    file_name=os.path.basename(sql_file_path),
+                    layer_type=actual_layer,
+                    target_table=target_table,
+                    table_stats=table_stats,
+                    processing_duration=processing_duration
+                )
+                print(f"💾 已记录成功日志")
             
-            return True
+            return True, False
             
         else:
             print(f"❌ {layer_type} 层解析失败！")
             error_msg = result.get('message', '未知错误')
             print(f"错误信息：{error_msg}")
             
-            # ⚠️ 特殊处理：SELECT * 需要改进 SQL
-            if result.get('needs_sql_improvement'):
-                matched_pattern = result.get('matched_pattern', '未知通配符')
-                print("\n" + "=" * 80)
-                print("💡 改进建议")
-                print("=" * 80)
-                print(f"检测到 SQL 中存在通配符：**{matched_pattern}**")
-                print("\n这会导致字段解析不准确，AI 无法知道通配符展开后的具体字段。")
-                print("\n请修改 SQL，将所有通配符展开为明确的字段列表。")
-                print("=" * 80)
-            
-            return False
+            return False, False
     
     except Exception as e:
         print(f"\n❌ {layer_type} 层解析异常：{str(e)}")
         import traceback
         traceback.print_exc()
-        return False
+        return False, False
+
+
+def should_skip_permanent_failure(session, file_path: str) -> bool:
+    """
+    判断文件是否属于明确失败（永久失败），应该跳过
+    
+    Args:
+        session: 数据库会话
+        file_path: 文件路径
+        
+    Returns:
+        True 如果是永久失败，应该跳过
+    """
+    from apps.extend.metrics2.curd.sql_parse_failure_log_curd import get_failure_logs
+    
+    # 获取该文件的最新失败记录
+    unresolved_failures = get_failure_logs(session, is_resolved=False, limit=1000)
+    for failure_log in unresolved_failures:
+        if failure_log.file_path == file_path:
+            error_msg = failure_log.failure_reason or ''  # ⚠️ 修正：使用 failure_reason
+            # 检查是否属于永久失败类型
+            for permanent_error in PERMANENT_FAILURE_ERRORS:
+                if permanent_error in error_msg:
+                    return True
+    
+    return False
 
 
 def test_all_layers():
@@ -270,35 +272,157 @@ def test_all_layers():
     session = DBUtils.create_local_session()
     
     results = {}
+    skipped_count = 0
     
     try:
+        # ⚠️ 显示失败统计
+        print("\n" + "=" * 80)
+        print("📊 历史失败统计")
+        print("=" * 80)
+        failure_stats = get_failure_statistics(session)
+        print(f"   - 总失败数: {failure_stats['total_failures']}")
+        print(f"   - 未解决: {failure_stats['unresolved_count']}")
+        print(f"   - 已解决: {failure_stats['resolved_count']}")
+        print(f"   - 解决率: {failure_stats['resolution_rate']}")
+        if failure_stats['error_type_distribution']:
+            print(f"\n   错误类型分布:")
+            for error_type, count in sorted(failure_stats['error_type_distribution'].items()):
+                print(f"      - {error_type}: {count}")
+        
+        # ⚠️ 显示成功统计
+        print("\n" + "=" * 80)
+        print("📊 历史成功统计")
+        print("=" * 80)
+        success_stats = get_success_statistics(session)
+        print(f"   - 总成功数: {success_stats['total_success']}")
+        if success_stats['layer_type_distribution']:
+            print(f"\n   层级类型分布:")
+            for layer_type, count in sorted(success_stats['layer_type_distribution'].items()):
+                print(f"      - {layer_type}: {count}")
+        print(f"   - 平均耗时: {success_stats['avg_processing_duration']}")
+        
+        # ⚠️ 获取已成功处理的文件列表
+        success_file_paths = get_success_file_paths(session)
+        remaining_files = [f for f in test_files if f not in success_file_paths]
+        
+        # ⚠️ 获取未解决的失败记录，优先处理
+        unresolved_failures = get_failure_logs(session, is_resolved=False, limit=1000)
+        failed_file_paths = {log.file_path for log in unresolved_failures}
+        
+        # ⚠️ 过滤掉明确失败的文件（永久失败）
+        permanent_failure_files = set()
+        for file_path in remaining_files:
+            if should_skip_permanent_failure(session, file_path):
+                permanent_failure_files.add(file_path)
+        
+        # 将失败文件放在最前面优先处理（排除永久失败）
+        priority_files = [f for f in remaining_files if f in failed_file_paths and f not in permanent_failure_files]
+        normal_files = [f for f in remaining_files if f not in failed_file_paths and f not in permanent_failure_files]
+        skipped_permanent = len(permanent_failure_files)
+        
+        # 合并：优先文件 + 正常文件
+        execution_order = priority_files + normal_files
+        
+        # ⚠️ 检查是否有检查点（断点续传）
+        checkpoint = load_checkpoint()
+        start_index = 0
+        if checkpoint and checkpoint.get('execution_order') == execution_order:
+            start_index = checkpoint.get('current_index', 0)
+            print(f"\n🔄 检测到检查点，从第 {start_index + 1}/{len(execution_order)} 个文件继续执行")
+            print(f"   - 上次执行时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(checkpoint.get('timestamp', 0)))}")
+        else:
+            # 如果没有检查点或执行顺序不同，从头开始
+            if checkpoint:
+                print(f"\n⚠️  执行顺序已变化，重新开始执行")
+            clear_checkpoint()
+        
+        print("\n" + "=" * 80)
+        print(f"📋 本次执行计划")
+        print("=" * 80)
+        print(f"   - 总文件数: {len(test_files)}")
+        print(f"   - 已成功: {len(success_file_paths)}")
+        print(f"   - 永久失败（跳过）: {skipped_permanent}")
+        print(f"   - 待处理: {len(remaining_files) - skipped_permanent}")
+        if priority_files:
+            print(f"   - 🔄 优先处理失败文件: {len(priority_files)} 个")
+            print(f"   - 📄 普通文件: {len(normal_files)} 个")
+        print("=" * 80)
+        
         # 按顺序测试所有文件（使用 AUTO 模式自动识别）
-        for idx, file_path in enumerate(test_files, 1):
+        for idx, file_path in enumerate(execution_order, 1):
+            # ⚠️ 跳过检查点之前的文件
+            if idx <= start_index:
+                continue
+            
+            # 标记是否是优先处理的失败文件
+            is_priority = file_path in failed_file_paths
+            priority_tag = " 🔄[优先]" if is_priority else ""
+            
             print(f"\n{'='*80}")
-            print(f"📋 测试文件 {idx}/{len(test_files)}")
+            print(f"📋 测试文件 {idx}/{len(execution_order)}{priority_tag}")
             print(f"{'='*80}")
             
-            success = test_layer(file_path, layer_type="AUTO", session=session)
+            success, skipped = test_layer(file_path, layer_type="AUTO", session=session, skip_success=True)
             results[file_path] = success
+            
+            if skipped:
+                skipped_count += 1
+            
+            # ⚠️ 每处理一个文件就保存检查点
+            save_checkpoint(execution_order, idx)
         
         # 打印总结
         print("\n" + "=" * 80)
         print("📊 测试总结")
         print("=" * 80)
-        for file_path, success in results.items():
-            file_name = os.path.basename(file_path)
-            status = "✅ 成功" if success else "❌ 失败"
-            print(f"   {file_name}: {status}")
         
-        all_success = all(results.values())
-        if all_success:
-            print("\n🎉 所有文件测试通过！")
+        success_count = sum(1 for v in results.values() if v)
+        failed_count = len(results) - success_count
+        
+        print(f"   - 总文件数: {len(test_files)}")
+        print(f"   - 跳过成功: {skipped_count}")
+        print(f"   - 本次成功: {success_count - skipped_count}")
+        print(f"   - 本次失败: {failed_count}")
+        
+        if failed_count > 0:
+            print(f"\n⚠️  以下文件测试失败:")
+            for file_path, success in results.items():
+                if not success:
+                    file_name = os.path.basename(file_path)
+                    is_priority = file_path in failed_file_paths
+                    tag = " 🔄[曾失败]" if is_priority else ""
+                    print(f"   ❌ {file_name}{tag}")
         else:
-            failed_files = [os.path.basename(path) for path, success in results.items() if not success]
-            print(f"\n⚠️  以下文件测试失败: {', '.join(failed_files)}")
+            print("\n🎉 所有文件测试通过！")
+        
+        # ⚠️ 再次显示失败统计，对比变化
+        print("\n" + "=" * 80)
+        print("📊 最新失败统计")
+        print("=" * 80)
+        failure_stats_after = get_failure_statistics(session)
+        print(f"   - 总失败数: {failure_stats_after['total_failures']}")
+        print(f"   - 未解决: {failure_stats_after['unresolved_count']}")
+        print(f"   - 已解决: {failure_stats_after['resolved_count']}")
+        print(f"   - 解决率: {failure_stats_after['resolution_rate']}")
+        
+        # ⚠️ 对比分析
+        new_failures = failure_stats_after['total_failures'] - failure_stats['total_failures']
+        resolved_failures = failure_stats['unresolved_count'] - failure_stats_after['unresolved_count']
+        
+        print("\n" + "=" * 80)
+        print("📈 本次执行效果分析")
+        print("=" * 80)
+        print(f"   - 新增失败: {new_failures} 个")
+        print(f"   - 解决失败: {resolved_failures} 个")
+        if resolved_failures > 0:
+            print(f"   ✅ 成功解决了 {resolved_failures} 个之前的失败问题！")
+        if new_failures == 0 and resolved_failures >= 0:
+            print(f"   🎉 没有新增失败，问题解决进展良好！")
         
     finally:
         session.close()
+        # ⚠️ 执行完成后清除检查点
+        clear_checkpoint()
         print("\n" + "=" * 80)
 
 

@@ -127,7 +127,7 @@ def get_failure_logs(
     statement = statement.order_by(SqlParseFailureLog.parse_time.desc())
     statement = statement.offset(offset).limit(limit)
     
-    return session.exec(statement).all()
+    return session.execute(statement).scalars().all()
 
 
 def mark_as_resolved(session: Session, log_id: int) -> bool:
@@ -151,7 +151,7 @@ def mark_as_resolved(session: Session, log_id: int) -> bool:
         )
     )
     
-    result = session.exec(statement)
+    result = session.execute(statement)
     session.commit()
     
     return result.rowcount > 0
@@ -177,7 +177,7 @@ def increment_retry_count(session: Session, log_id: int) -> bool:
         )
     )
     
-    result = session.exec(statement)
+    result = session.execute(statement)
     session.commit()
     
     return result.rowcount > 0
@@ -193,22 +193,26 @@ def get_failure_statistics(session: Session) -> dict:
     Returns:
         统计信息字典
     """
+    from sqlalchemy import func
+    
     # 总失败数
-    total_statement = select(SqlParseFailureLog)
-    total_count = len(session.exec(total_statement).all())
+    total_count = session.execute(
+        select(func.count()).select_from(SqlParseFailureLog)
+    ).scalar()
     
     # 未解决数
-    unresolved_statement = select(SqlParseFailureLog).where(
-        SqlParseFailureLog.is_resolved == False
-    )
-    unresolved_count = len(session.exec(unresolved_statement).all())
+    unresolved_count = session.execute(
+        select(func.count()).select_from(SqlParseFailureLog).where(
+            SqlParseFailureLog.is_resolved == False
+        )
+    ).scalar()
     
     # 已解决数
     resolved_count = total_count - unresolved_count
     
     # 按错误类型统计
     error_type_stats = {}
-    all_logs = session.exec(select(SqlParseFailureLog)).all()
+    all_logs = session.execute(select(SqlParseFailureLog)).scalars().all()
     for log in all_logs:
         error_type = log.error_type or "UNKNOWN"
         if error_type not in error_type_stats:

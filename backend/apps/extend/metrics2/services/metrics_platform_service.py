@@ -2,6 +2,7 @@ from typing import List, Dict, Any, Optional, Union
 from pathlib import Path
 import logging
 import json
+import re
 from sqlalchemy.orm import Session
 from apps.extend.metrics2.services.dim_service import DimService
 from apps.extend.metrics2.services.lineage_service import LineageService
@@ -492,48 +493,47 @@ class MetricsPlatformService:
 
     def _check_select_star(self, sql_content: str) -> Dict[str, Any]:
         """
-        使用正则表达式检查 SQL 中是否存在 SELECT * 或 表别名.*
+        【极简版】只拦截最极端的 SELECT * 情况
+        
+        策略：
+        1. 只拦截 INSERT INTO ... SELECT * FROM （最危险且明确的情况）
+        2. 其他情况交给 AI 解析，AI 解析失败会记录到 sql_parse_failure_log
+        3. 人工干预处理异常情况
         
         Args:
             sql_content: SQL 内容
             
         Returns:
             {
-                'has_select_star': bool,  # 是否包含通配符
-                'matched_pattern': str     # 匹配到的模式（如 'a.*' 或 'SELECT *'）
+                'has_select_star': bool,  # 是否包含极端通配符
+                'matched_pattern': str     # 匹配到的模式
             }
         """
         import re
         
-        # 移除注释（单行注释 -- 和 /* */）
+        # 移除注释
         sql_cleaned = re.sub(r'--.*?$', '', sql_content, flags=re.MULTILINE)
         sql_cleaned = re.sub(r'/\*.*?\*/', '', sql_cleaned, flags=re.DOTALL)
         
-        # 提取 SELECT 子句（从 SELECT 到 FROM）
-        select_pattern = r'SELECT\s+(.*?)\s+FROM'
-        match = re.search(select_pattern, sql_cleaned, re.IGNORECASE | re.DOTALL)
+        # ⚠️ 只拦截最明显的危险模式：INSERT INTO table SELECT * FROM
+        # 这是最危险且无争议的情况，必须拦截
+        dangerous_patterns = [
+            r'INSERT\s+INTO\s+\w+\s+SELECT\s+\*\s+FROM',  # INSERT INTO t SELECT * FROM
+            r'INSERT\s+INTO\s+\w+\s+SELECT\s+\w+\.\*\s+FROM',  # INSERT INTO t SELECT a.* FROM
+        ]
         
-        if not match:
-            return {'has_select_star': False, 'matched_pattern': ''}
+        for pattern in dangerous_patterns:
+            match = re.search(pattern, sql_cleaned, re.IGNORECASE)
+            if match:
+                matched_text = match.group(0)
+                # 提取通配符模式
+                if '.*' in matched_text:
+                    alias_match = re.search(r'(\w+)\.\*', matched_text)
+                    if alias_match:
+                        return {'has_select_star': True, 'matched_pattern': f'{alias_match.group(1)}.*'}
+                return {'has_select_star': True, 'matched_pattern': 'SELECT *'}
         
-        select_clause = match.group(1)
-        
-        # 检测模式1：单独的 *
-        if re.search(r'\bSELECT\s+\*', sql_cleaned, re.IGNORECASE):
-            return {'has_select_star': True, 'matched_pattern': 'SELECT *'}
-        
-        # 检测模式2：表别名.* （如 a.*, b.*, t1.*）
-        alias_star_match = re.search(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.\*', select_clause, re.IGNORECASE)
-        if alias_star_match:
-            alias = alias_star_match.group(1)
-            return {'has_select_star': True, 'matched_pattern': f'{alias}.*'}
-        
-        # 检测模式3：表名.* （完整表名，如 schema.table.*）
-        table_star_match = re.search(r'\b([a-zA-Z_][a-zA-Z0-9_.]*)\.\*', select_clause, re.IGNORECASE)
-        if table_star_match:
-            table_name = table_star_match.group(1)
-            return {'has_select_star': True, 'matched_pattern': f'{table_name}.*'}
-        
+        # 其他情况放行，交给 AI 解析
         return {'has_select_star': False, 'matched_pattern': ''}
 
     def _log_parse_failure(
@@ -592,7 +592,7 @@ class MetricsPlatformService:
         exception: Optional[Exception] = None
     ):
         """
-        记录 Service 层处理失败日志
+        记录 Service 层处理失败日志（简洁版）
         
         Args:
             parsed_results: 解析结果列表
@@ -613,26 +613,63 @@ class MetricsPlatformService:
                 file_path = result.get('file_path', '')
                 file_name = os.path.basename(file_path) if file_path else "unknown.sql"
                 
-                # 获取 SQL 内容
+                # ⚠️ 不获取 SQL 内容，避免占用资源
                 sql_content = None
-                parsed_data = result.get('parsed_data', {})
-                if parsed_data and 'basic_info' in parsed_data:
-                    sql_content = parsed_data['basic_info'].get('sql_content')
                 
-                # 截断 SQL 内容（避免过大）
-                if sql_content and len(sql_content) > 5000:
-                    sql_content = sql_content[:5000] + "... [truncated]"
-                
-                # 构建详细错误信息
+                # ⚠️ 构建简洁的错误信息
                 detailed_error = f"[{service_name}] {error_message}"
-                if exception:
-                    detailed_error += f"\n异常类型: {type(exception).__name__}"
-                    detailed_error += f"\n异常详情: {str(exception)}"
                 
-                # 确定错误类型
-                error_type = "SERVICE_ERROR"
+                # 如果是数据库异常，提取关键信息
                 if exception:
-                    error_type = f"SERVICE_{type(exception).__name__.upper()}"
+                    exc_type = type(exception).__name__
+                    exc_msg = str(exception)
+                    
+                    # 提取关键错误信息（去除完整 SQL）
+                    if 'StringDataRightTruncation' in exc_msg:
+                        # 字符串截断错误
+                        detailed_error += f"\n异常类型: {exc_type}"
+                        detailed_error += f"\n原因: 字段值超过数据库定义长度"
+                        # 尝试提取表名和字段信息
+                        if 'INSERT INTO' in exc_msg:
+                            table_match = re.search(r'INSERT INTO (\w+)', exc_msg)
+                            if table_match:
+                                detailed_error += f"\n异常表: {table_match.group(1)}"
+                    elif 'CardinalityViolation' in exc_msg:
+                        # ON CONFLICT 冲突
+                        detailed_error += f"\n异常类型: {exc_type}"
+                        detailed_error += f"\n原因: 批量插入数据中存在重复的冲突键值"
+                    else:
+                        # 其他异常，只显示前200字符
+                        detailed_error += f"\n异常类型: {exc_type}"
+                        detailed_error += f"\n异常详情: {exc_msg[:200]}..."
+                
+                # ⚠️ 确定错误类型（细化分类）
+                error_type = "SERVICE_ERROR"  # 默认
+                
+                if exception:
+                    exc_type = type(exception).__name__
+                    exc_msg = str(exception)
+                    
+                    # 1. 数据库唯一约束冲突
+                    if 'UniqueViolation' in exc_msg or 'CardinalityViolation' in exc_msg:
+                        error_type = "DB_UNIQUE_VIOLATION"
+                    # 2. 数据库字段长度超限
+                    elif 'StringDataRightTruncation' in exc_msg:
+                        error_type = "DB_FIELD_LENGTH_EXCEEDED"
+                    # 3. 其他数据库异常
+                    elif 'psycopg2' in exc_msg or 'sqlalchemy' in exc_msg.lower():
+                        error_type = "DB_ERROR"
+                    # 4. 其他异常
+                    else:
+                        error_type = f"SERVICE_{exc_type.upper()}"
+                else:
+                    # 没有异常对象，根据错误消息判断
+                    if '未生成任何 dim_definition' in error_message:
+                        error_type = "DIM_AI_PARSE_FAILED"
+                    elif '未生成任何 table_lineage' in error_message:
+                        error_type = "LINEAGE_TABLE_NOT_FOUND"
+                    elif '未生成任何 field_lineage' in error_message:
+                        error_type = "LINEAGE_FIELD_NOT_FOUND"
                 
                 create_failure_log(
                     session=self.session,
@@ -641,7 +678,7 @@ class MetricsPlatformService:
                     failure_reason=detailed_error,
                     layer_type=layer_type,
                     error_type=error_type,
-                    sql_content=sql_content
+                    sql_content=sql_content  # ⚠️ 不存储 SQL 内容
                 )
                 
                 logger.info(f"[失败日志] 已记录 Service 失败: {file_name} - {error_type}")
