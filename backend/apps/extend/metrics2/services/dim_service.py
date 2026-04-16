@@ -5,6 +5,13 @@
 import logging
 from typing import Dict, List, Any
 from datetime import datetime
+from sqlalchemy import text
+
+# ⚠️ 导入工具类
+from apps.extend.metrics2.utils.id_generator import IdGenerator
+from apps.extend.metrics2.utils.batch_query import BatchQueryHelper
+from apps.extend.metrics2.utils.sql_generator import SqlGenerator
+from apps.extend.metrics2.utils.timezone_helper import get_now_utc8
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +35,8 @@ class DimService:
             session: 数据库会话
         """
         self.session = session
-        self._dim_id_counter = 0  # 实例级别的计数器，避免重复生成 ID
+        # ⚠️ 使用 IdGenerator 替代手动计数器
+        self.dim_id_gen = IdGenerator(session, 'dim_definition', 'D')
     
     def process(self, processed_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -109,7 +117,7 @@ class DimService:
             existing_dims = self._batch_query_existing_dims(fields)
             
             # 2. 处理每个字段，生成维度定义和字段映射
-            now = datetime.now()
+            now = get_now_utc8()  # ⚠️ 统一使用 UTC+8 时区
             self._process_fields(fields, target_table, existing_dims, now, table_data)
             
             logger.info(f"[DIM服务] 收集完成 - dim_definition: {len(table_data['dim_definition'])} 条, dim_field_mapping: {len(table_data['dim_field_mapping'])} 条")
@@ -135,8 +143,8 @@ class DimService:
             if field_en:
                 all_dim_codes.append(field_en)
         
-        # 第二步：批量查询已存在的 dim_id
-        existing_dims = self._batch_get_dim_ids(all_dim_codes)
+        # 第二步：批量查询已存在的 dim_id（使用工具类）
+        existing_dims = BatchQueryHelper.query_existing_dim_ids(self.session, all_dim_codes)
         logger.debug(f"[DIM服务] 批量查询到 {len(existing_dims)} 个已有维度")
         return existing_dims
     
@@ -182,7 +190,9 @@ class DimService:
                 'dim_id': dim_id,
                 'db_table': target_table,
                 'field': field_en,
-                'field_name': field_name
+                'field_name': field_name,
+                'create_time': now,
+                'modify_time': now
             })
     
     def _get_or_create_dim_id(self, dim_code: str, existing_dims: Dict[str, str]) -> str:
@@ -200,73 +210,15 @@ class DimService:
             dim_id = existing_dims[dim_code]
             logger.debug(f"[DIM服务] 复用已有 dim_id: {dim_id} for {dim_code}")
         else:
-            # 生成新的 dim_id
-            dim_id = self._get_next_dim_id()
+            # 生成新的 dim_id（使用 IdGenerator）
+            dim_id = self.dim_id_gen.get_next_id()
             logger.debug(f"[DIM服务] 生成新 dim_id: {dim_id} for {dim_code}")
         
         return dim_id
     
-
-    def _get_next_dim_id(self) -> str:
-        """
-        生成下一个 dim_id（使用实例计数器避免重复）
-        
-        Returns:
-            新的 dim_id (格式: D000001, D000002, ...)
-        """
-        # 首次调用时，从数据库查询最大 ID
-        if self._dim_id_counter == 0:
-            try:
-                from sqlalchemy import text
-                result = self.session.execute(
-                    text("SELECT MAX(CAST(SUBSTRING(id FROM 2) AS INTEGER)) FROM dim_definition")
-                ).fetchone()
-                
-                max_num = result[0] if result and result[0] else 0
-                self._dim_id_counter = int(max_num)
-                logger.debug(f"[DIM服务] 初始化 dim_id 计数器: {self._dim_id_counter}")
-            except Exception as e:
-                logger.warning(f"[DIM服务] 查询最大 dim_id 失败，从 0 开始: {str(e)}")
-                self._dim_id_counter = 0
-        
-        # 递增计数器并生成新 ID
-        self._dim_id_counter += 1
-        return f"D{self._dim_id_counter:06d}"
-    
-    def _batch_get_dim_ids(self, dim_codes: List[str]) -> Dict[str, str]:
-        """
-        批量查询已存在的 dim_id
-        
-        Args:
-            dim_codes: 维度编码列表
-            
-        Returns:
-            {dim_code: dim_id} 字典
-        """
-        if not dim_codes:
-            return {}
-        
-        # 去重
-        unique_codes = list(set(dim_codes))
-        
-        try:
-            from sqlalchemy import text
-            result = self.session.execute(
-                text("SELECT code, id FROM dim_definition WHERE code IN :codes"),
-                {"codes": tuple(unique_codes)}
-            ).fetchall()
-            
-            # 构建字典
-            existing_dims = {row[0]: row[1] for row in result}
-            logger.debug(f"[DIM服务] 批量查询到 {len(existing_dims)} 个已有维度")
-            return existing_dims
-        except Exception as e:
-            logger.warning(f"[DIM服务] 批量查询 dim_id 失败: {str(e)}")
-            return {}
-    
     def _execute_insert(self, table_data: Dict[str, List]) -> Dict[str, Any]:
         """
-        执行数据库插入操作
+        执行数据库插入操作（使用 SqlGenerator）
         
         Args:
             table_data: 表数据收集字典
@@ -275,59 +227,37 @@ class DimService:
             执行结果
         """
         try:
-            from sqlalchemy import text
+            # 定义各表的配置
+            table_configs = {
+                'dim_definition': {
+                    'columns': ['id', 'name', 'code', 'type', 'is_valid', 'create_time', 'modify_time'],
+                    'conflict_target': '(code)'
+                },
+                'dim_field_mapping': {
+                    'columns': ['db_table', 'field', 'dim_id', 'field_name', 'create_time', 'modify_time'],
+                    'conflict_target': '(db_table, field)'
+                }
+            }
             
             table_stats = {}
             
-            # 批量插入 dim_definition
+            # 批量插入 dim_definition（使用 SqlGenerator）
             if table_data['dim_definition']:
-                values_list = []
-                for item in table_data['dim_definition']:
-                    name_escaped = item.get('name', '').replace("'", "''")
-                    values_list.append(
-                        f"('{item['id']}', '{name_escaped}', '{item['code']}', "
-                        f"'{item['type']}', {item['is_valid']}, "
-                        f"'{item['create_time']}', '{item['modify_time']}')"
-                    )
-                
-                values_str = ',\n'.join(values_list)
-                sql = f"""
-                    INSERT INTO dim_definition (id, name, code, type, is_valid, create_time, modify_time)
-                    VALUES {values_str}
-                    ON CONFLICT (code) DO UPDATE SET
-                        id = EXCLUDED.id,
-                        name = EXCLUDED.name,
-                        type = EXCLUDED.type,
-                        is_valid = EXCLUDED.is_valid,
-                        modify_time = EXCLUDED.modify_time
-                """
-                
-                self.session.execute(text(sql))
-                table_stats['dim_definition'] = len(table_data['dim_definition'])
-                logger.info(f"[DIM服务] 批量插入 dim_definition: {len(table_data['dim_definition'])} 条")
+                config = table_configs['dim_definition']
+                sql = SqlGenerator.generate_batch_upsert('dim_definition', config, table_data['dim_definition'])
+                if sql:
+                    self.session.execute(text(sql))
+                    table_stats['dim_definition'] = len(table_data['dim_definition'])
+                    logger.info(f"[DIM服务] 批量插入 dim_definition: {len(table_data['dim_definition'])} 条")
             
-            # 批量插入 dim_field_mapping
+            # 批量插入 dim_field_mapping（使用 SqlGenerator）
             if table_data['dim_field_mapping']:
-                values_list = []
-                for item in table_data['dim_field_mapping']:
-                    field_name_escaped = item.get('field_name', '').replace("'", "''")
-                    values_list.append(
-                        f"('{item['db_table']}', '{item['field']}', '{item['dim_id']}', '{field_name_escaped}')"
-                    )
-                
-                values_str = ',\n'.join(values_list)
-                sql = f"""
-                    INSERT INTO dim_field_mapping (db_table, field, dim_id, field_name)
-                    VALUES {values_str}
-                    ON CONFLICT (db_table, field) DO UPDATE SET
-                        dim_id = EXCLUDED.dim_id,
-                        field_name = EXCLUDED.field_name,
-                        modify_time = EXCLUDED.modify_time
-                """
-                
-                self.session.execute(text(sql))
-                table_stats['dim_field_mapping'] = len(table_data['dim_field_mapping'])
-                logger.info(f"[DIM服务] 批量插入 dim_field_mapping: {len(table_data['dim_field_mapping'])} 条")
+                config = table_configs['dim_field_mapping']
+                sql = SqlGenerator.generate_batch_upsert('dim_field_mapping', config, table_data['dim_field_mapping'])
+                if sql:
+                    self.session.execute(text(sql))
+                    table_stats['dim_field_mapping'] = len(table_data['dim_field_mapping'])
+                    logger.info(f"[DIM服务] 批量插入 dim_field_mapping: {len(table_data['dim_field_mapping'])} 条")
             
             # 提交事务
             self.session.commit()

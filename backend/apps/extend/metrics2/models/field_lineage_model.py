@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Optional
+from sqlalchemy import func
 from sqlmodel import SQLModel, Field, Column, VARCHAR, DATETIME
 
 
@@ -16,8 +17,8 @@ class FieldLineage(SQLModel, table=True):
     target_field_mark: str = Field(default='normal', sa_column=Column(VARCHAR(16), nullable=False, server_default='normal', comment='目标字段标记：public_dim/private_dim/metric/normal'))
     dim_id: Optional[str] = Field(default=None, sa_column=Column(VARCHAR(32), nullable=True, comment='公共维度绑定ID'))
     formula: Optional[str] = Field(default=None, sa_column=Column(VARCHAR(500), nullable=True, comment='字段计算公式/表达式'))
-    create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, comment='创建时间'))
-    modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, onupdate=datetime.now, comment='修改时间'))
+    create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, server_default=func.now(), comment='创建时间'))
+    modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, server_default=func.now(), onupdate=func.now(), comment='修改时间'))
 
     __table_args__ = (
         {"comment": "字段映射校验表(含指标/维度标记，区分指标/公共/私有维度)"},

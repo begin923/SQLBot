@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
+from sqlalchemy import func
 from sqlmodel import SQLModel, Field, Column, VARCHAR, DATETIME, Integer
 
 
@@ -13,8 +14,8 @@ class DimDict(SQLModel, table=True):
     code: str = Field(sa_column=Column(VARCHAR(64), nullable=False, unique=True, index=True, comment='维度英文编码（如field_id、parity_no），唯一索引'))
     type: str = Field(sa_column=Column(VARCHAR(16), nullable=False, comment='维度类型：普通维度/时间维度/区域维度'))
     is_valid: Optional[int] = Field(sa_column=Column(Integer, default=1, comment='是否启用：1启用/0禁用'))
-    create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, comment='创建时间'))
-    modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, onupdate=datetime.now, comment='修改时间'))
+    create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, server_default=func.now(), comment='创建时间'))
+    modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, server_default=func.now(), onupdate=func.now(), comment='修改时间'))
 
     __table_args__ = (
         {"comment": "维度定义表"},

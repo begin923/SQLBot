@@ -3,6 +3,12 @@ import logging
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
+# ⚠️ 导入工具类
+from apps.extend.metrics2.utils.id_generator import IdGenerator
+from apps.extend.metrics2.utils.batch_query import BatchQueryHelper
+from apps.extend.metrics2.utils.sql_generator import SqlGenerator
+from apps.extend.metrics2.utils.timezone_helper import get_now_utc8
+
 logger = logging.getLogger("MetricsService")
 
 
@@ -17,8 +23,9 @@ class MetricsService:
             session: 数据库会话
         """
         self.session = session
-        self._metric_id_counter = 0
-        self._map_id_counter = 0
+        # ⚠️ 使用 IdGenerator 替代手动计数器
+        self.metric_id_gen = IdGenerator(session, 'metric_definition', 'M')  # metric_definition 的主键是 id
+        self.map_id_gen = IdGenerator(session, 'metric_source_mapping', 'S')  # ⚠️ metric_source_mapping 的 ID 前缀已改为 S
         # ⚠️ 创建 LineageService 实例处理血缘数据
         from .lineage_service import LineageService
         self.lineage_service = LineageService(session)
@@ -186,24 +193,42 @@ class MetricsService:
         logger.debug(f"[指标服务] 从 LineageService 获取 - 表血缘: {len(lineage_table_data['table_lineage'])}, "
                     f"字段血缘: {len(lineage_table_data['field_lineage'])}")
     
-    def _collect_metric_definitions(self, parsed_data: Dict[str, Any], table_data: Dict[str, List]):
+    def _collect_metric_definitions(self, parsed_data: Dict[str, Any], table_data: Dict[str, List], now=None):
         """
         收集指标定义和源映射
             
         Args:
             parsed_data: AI 解析后的数据
             table_data: 表数据收集字典
+            now: 当前时间（UTC+8）
         """
         ai_metric_definitions = parsed_data.get('metric_definition', [])
         ai_source_mappings = parsed_data.get('metric_source_mapping', [])
         
-        # ⚠️ 批量查询已存在的 metric_id
-        existing_metrics = self._batch_get_metric_ids(ai_metric_definitions)
+        # ⚠️ 去重 - 基于 metric_en (code)
+        seen_codes = set()
+        unique_metric_defs = []
+        duplicate_count = 0
+        
+        for metric_def in ai_metric_definitions:
+            metric_en = metric_def.get('metric_en', '')
+            if metric_en and metric_en not in seen_codes:
+                seen_codes.add(metric_en)
+                unique_metric_defs.append(metric_def)
+            elif metric_en:
+                duplicate_count += 1
+                logger.warning(f"[指标服务] ⚠️ AI 输出中发现重复指标: {metric_en}")
+        
+        if duplicate_count > 0:
+            logger.info(f"[指标服务] ⚠️ AI 输出中去重: 原始 {len(ai_metric_definitions)} 条, 去重后 {len(unique_metric_defs)} 条, 跳过 {duplicate_count} 条重复")
+        
+        # ⚠️ 批量查询已存在的 metric_id（使用去重后的数据）
+        existing_metrics = self._batch_get_metric_ids(unique_metric_defs)
         
         # ⚠️ 构建 metric_en 到 metric_id 的映射（包括新生成的）
         metric_en_to_id = {}
             
-        for metric_def in ai_metric_definitions:
+        for metric_def in unique_metric_defs:
             metric_name = metric_def.get('metric_name', '')
             metric_en = metric_def.get('metric_en', '')
             metric_type_raw = metric_def.get('metric_type', 'atomic')
@@ -224,7 +249,7 @@ class MetricsService:
             if metric_en in existing_metrics:
                 metric_id = existing_metrics[metric_en]
             else:
-                metric_id = self._get_next_metric_id()
+                metric_id = self.metric_id_gen.get_next_id()  # ⚠️ 使用 IdGenerator
             
             # 记录映射关系
             metric_en_to_id[metric_en] = metric_id
@@ -238,7 +263,9 @@ class MetricsService:
                 'biz_domain': biz_domain,
                 'cal_logic': cal_logic,
                 'unit': unit or '',
-                'status': status
+                'status': status,
+                'create_time': get_now_utc8(),  # ⚠️ 直接使用工具函数
+                'modify_time': get_now_utc8()
             })
         
         # ⚠️ 批量收集所有指标的源映射（一次性查询）
@@ -258,9 +285,33 @@ class MetricsService:
         if not ai_source_mappings:
             return
         
-        # ⚠️ 第一步：按 metric_id 分组源映射
-        mappings_by_metric = {}  # {metric_id: [mappings]}
+        # ⚠️ 去重 - 基于 (metric_id, db_table, metric_column)
+        seen_keys = set()
+        unique_mappings = []
+        duplicate_count = 0
+        
         for mapping in ai_source_mappings:
+            metric_column = mapping.get('metric_column', '')
+            if not metric_column or metric_column not in metric_en_to_id:
+                continue
+            
+            metric_id = metric_en_to_id[metric_column]
+            db_table = mapping.get('db_table', '')
+            key = (metric_id, db_table, metric_column or '')
+            
+            if key not in seen_keys:
+                seen_keys.add(key)
+                unique_mappings.append(mapping)
+            else:
+                duplicate_count += 1
+                logger.warning(f"[指标服务] ⚠️ AI 输出中发现重复源映射: {key}")
+        
+        if duplicate_count > 0:
+            logger.info(f"[指标服务] ⚠️ 源映射去重: 原始 {len(ai_source_mappings)} 条, 去重后 {len(unique_mappings)} 条, 跳过 {duplicate_count} 条重复")
+        
+        # ⚠️ 第一步：按 metric_id 分组源映射（使用去重后的数据）
+        mappings_by_metric = {}  # {metric_id: [mappings]}
+        for mapping in unique_mappings:
             metric_column = mapping.get('metric_column', '')
             if not metric_column or metric_column not in metric_en_to_id:
                 continue
@@ -293,7 +344,7 @@ class MetricsService:
                 
                 # 批量查询
                 result = self.session.execute(
-                    text("SELECT map_id, metric_id, db_table, COALESCE(metric_column, '') as metric_column FROM metric_source_mapping WHERE metric_id IN :metric_ids AND db_table IN :db_tables AND COALESCE(metric_column, '') IN :metric_columns"),
+                    text("SELECT id, metric_id, db_table, COALESCE(metric_column, '') as metric_column FROM metric_source_mapping WHERE metric_id IN :metric_ids AND db_table IN :db_tables AND COALESCE(metric_column, '') IN :metric_columns"),
                     {"metric_ids": tuple(all_metric_ids), "db_tables": tuple(db_tables), "metric_columns": tuple(metric_columns)}
                 ).fetchall()
                 
@@ -324,10 +375,10 @@ class MetricsService:
                 if unique_key in all_existing_maps:
                     map_id = all_existing_maps[unique_key]
                 else:
-                    map_id = self._get_next_map_id()
+                    map_id = self.map_id_gen.get_next_id()  # ⚠️ 使用 IdGenerator
                     
                 table_data['metric_source_mapping'].append({
-                    'map_id': map_id,
+                    'id': map_id,  # ⚠️ 改为 id
                     'metric_id': metric_id,
                     'source_type': source_type,
                     'datasource': datasource,
@@ -337,7 +388,9 @@ class MetricsService:
                     'agg_func': agg_func,
                     'priority': priority,
                     'is_valid': is_valid,
-                    'source_level': source_level
+                    'source_level': source_level,
+                    'create_time': get_now_utc8(),  # ⚠️ 直接使用工具函数
+                    'modify_time': get_now_utc8()
                 })
         
     def _collect_compound_relations(self, parsed_data: Dict[str, Any], table_data: Dict[str, List]):
@@ -355,11 +408,42 @@ class MetricsService:
         if not ai_compound_rels:
             return
         
-        # ⚠️ 第一步：收集所有需要的 metric_en（主指标 + 子指标）
+        # ⚠️ 第一步：去重 - 基于 (main_metric_en, sub_metric_en)
+        seen_keys = set()
+        unique_compound_rels = []
+        duplicate_count = 0
+        
+        for rel in ai_compound_rels:
+            main_metric_field = rel.get('metric_en', '')
+            sub_metric_fields = rel.get('sub_metric_fields', [])
+            
+            if not main_metric_field:
+                logger.warning(f"[指标服务] 复合指标缺少 metric_en 字段，跳过")
+                continue
+            
+            # 从 main_metric_field 中提取 metric_en
+            main_metric_en = main_metric_field.split('.')[-1] if '.' in main_metric_field else main_metric_field
+            
+            # 为每个子指标生成唯一键
+            for sub_field in sub_metric_fields:
+                sub_metric_en = sub_field.split('.')[-1] if '.' in sub_field else sub_field
+                key = (main_metric_en, sub_metric_en)
+                
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    unique_compound_rels.append(rel)
+                else:
+                    duplicate_count += 1
+                    logger.warning(f"[指标服务] ⚠️ AI 输出中发现重复复合关系: {key}")
+        
+        if duplicate_count > 0:
+            logger.info(f"[指标服务] ⚠️ 复合关系去重: 原始 {len(ai_compound_rels)} 条, 去重后 {len(unique_compound_rels)} 条, 跳过 {duplicate_count} 条重复")
+        
+        # ⚠️ 第二步：收集所有需要的 metric_en（主指标 + 子指标）
         all_metric_ens = set()
         compound_info = []  # 保存复合关系信息
         
-        for rel in ai_compound_rels:
+        for rel in unique_compound_rels:
             metric_name = rel.get('metric_name', '')
             main_metric_field = rel.get('metric_en', '')
             sub_metric_fields = rel.get('sub_metric_fields', [])
@@ -427,7 +511,9 @@ class MetricsService:
                     'metric_id': main_metric_id,
                     'sub_metric_id': sub_metric_id,
                     'cal_operator': cal_operator,
-                    'sort': sort
+                    'sort': sort,
+                    'create_time': get_now_utc8(),  # ⚠️ 直接使用工具函数
+                    'modify_time': get_now_utc8()
                 })
     
     def _batch_get_metric_ids(self, metric_definitions: List[Dict]) -> Dict[str, str]:
@@ -448,19 +534,10 @@ class MetricsService:
         if not codes:
             return {}
         
-        try:
-            result = self.session.execute(
-                text("SELECT code, id FROM metric_definition WHERE code IN :codes"),
-                {"codes": tuple(codes)}
-            ).fetchall()
-            
-            # 构建字典
-            existing_metrics = {row[0]: row[1] for row in result}
-            logger.debug(f"[指标服务] 批量查询到 {len(existing_metrics)} 个已有指标")
-            return existing_metrics
-        except Exception as e:
-            logger.warning(f"[指标服务] 批量查询 metric_id 失败: {str(e)}")
-            return {}
+        # ⚠️ 使用工具类批量查询
+        existing_metrics = BatchQueryHelper.query_existing_metric_ids(self.session, codes)
+        logger.debug(f"[指标服务] 批量查询到 {len(existing_metrics)} 个已有指标")
+        return existing_metrics
     
     def _batch_get_metric_ids_by_ens(self, metric_ens: List[str]) -> Dict[str, str]:
         """
@@ -475,19 +552,10 @@ class MetricsService:
         if not metric_ens:
             return {}
         
-        try:
-            result = self.session.execute(
-                text("SELECT metric_en, metric_id FROM metric_definition WHERE metric_en IN :metric_ens"),
-                {"metric_ens": tuple(metric_ens)}
-            ).fetchall()
-            
-            # 构建字典
-            existing_metrics = {row[0]: row[1] for row in result}
-            logger.debug(f"[指标服务-复合指标] 批量查询到 {len(existing_metrics)} 个已有指标")
-            return existing_metrics
-        except Exception as e:
-            logger.warning(f"[指标服务-复合指标] 批量查询 metric_id 失败: {str(e)}")
-            return {}
+        # ⚠️ 使用工具类批量查询
+        existing_metrics = BatchQueryHelper.query_existing_metric_ids(self.session, metric_ens)
+        logger.debug(f"[指标服务-复合指标] 批量查询到 {len(existing_metrics)} 个已有指标")
+        return existing_metrics
     
     def _get_or_create_metric_id_batch(self, metric_en: str, metric_name: str = '', 
                                        existing_metrics: Dict[str, str] = None,
@@ -524,7 +592,7 @@ class MetricsService:
                     return metric_id
         
         # 3. 都不存在，创建新的指标定义（使用默认值）
-        new_metric_id = self._get_next_metric_id()
+        new_metric_id = self.metric_id_gen.get_next_id()  # ⚠️ 使用 IdGenerator
         display_name = metric_name if metric_name else metric_en
         logger.info(f"[指标服务] ⚠️ 自动创建复合指标定义: {metric_en} ({display_name}) -> {new_metric_id}")
         
@@ -538,7 +606,9 @@ class MetricsService:
                 'biz_domain': '',
                 'cal_logic': '',
                 'unit': '',
-                'status': 1
+                'status': 1,
+                'create_time': get_now_utc8(),  # ⚠️ 直接使用工具函数
+                'modify_time': get_now_utc8()
             })
         
         return new_metric_id
@@ -608,7 +678,9 @@ class MetricsService:
                 table_data['metric_dim_rel'].append({
                     'metric_id': metric_id,
                     'dim_id': dim_id,
-                    'is_required': 0  # 默认为非必填
+                    'is_required': 0,  # 默认为非必填
+                    'create_time': get_now_utc8(),  # ⚠️ 直接使用工具函数
+                    'modify_time': get_now_utc8()
                 })
                 rel_count += 1
         
@@ -648,63 +720,64 @@ class MetricsService:
             if matched_metric_id and field_lineage_id:
                 table_data['metric_lineage'].append({
                     'metric_id': matched_metric_id,  # ⚠️ metric_id 在其他表中保持不变
-                    'field_lineage_id': field_lineage_id  # ⚠️ 注意：这里应该是 field_lineage 的 id，不是 lineage_id
+                    'field_lineage_id': field_lineage_id,  # ⚠️ 注意：这里应该是 field_lineage 的 id，不是 lineage_id
+                    'create_time': get_now_utc8(),  # ⚠️ 直接使用工具函数
+                    'modify_time': get_now_utc8()
                 })
                 lineage_count += 1
         
         logger.info(f"[指标服务-metric_lineage] ✅ 收集完成: {lineage_count} 条记录")
     
 
-    def _get_next_metric_id(self) -> str:
-        """生成下一个唯一的指标ID"""
-        if self._metric_id_counter == 0:
-            try:
-                result = self.session.execute(
-                    text("SELECT MAX(CAST(SUBSTRING(id FROM 2) AS INTEGER)) FROM metric_definition")  # ⚠️ 改为 id
-                ).scalar()
-                
-                if result is not None:
-                    self._metric_id_counter = int(result)
-                else:
-                    self._metric_id_counter = 0
-            except Exception as e:
-                logger.warning(f"[指标服务] 查询最大metric_id失败: {str(e)}，从0开始")
-                self._metric_id_counter = 0
-        
-        self._metric_id_counter += 1
-        return f"M{self._metric_id_counter:06d}"
-    
-    def _get_next_map_id(self) -> str:
-        """生成下一个唯一的映射ID"""
-        if self._map_id_counter == 0:
-            try:
-                result = self.session.execute(
-                    text("SELECT MAX(CAST(SUBSTRING(map_id FROM 4) AS INTEGER)) FROM metric_source_mapping")
-                ).scalar()
-                
-                if result is not None:
-                    self._map_id_counter = int(result)
-                else:
-                    self._map_id_counter = 0
-            except Exception as e:
-                logger.warning(f"[指标服务] 查询最大map_id失败: {str(e)}，从0开始")
-                self._map_id_counter = 0
-        
-        self._map_id_counter += 1
-        return f"MAP{self._map_id_counter:06d}"
-    
-
     def _execute_insert(self, table_data: Dict[str, List]) -> Dict[str, Any]:
-        """执行数据库插入操作"""
+        """执行数据库插入操作（使用 SqlGenerator）"""
         table_stats = {}
         
         try:
-            # 批量插入各表数据
+            # 定义各表的配置
+            table_configs = {
+                'metric_definition': {
+                    'columns': ['id', 'name', 'code', 'metric_type', 'biz_domain', 'cal_logic', 'unit', 'status', 'create_time', 'modify_time'],
+                    'conflict_target': '(code)'
+                },
+                'metric_dim_rel': {
+                    'columns': ['metric_id', 'dim_id', 'is_required', 'create_time', 'modify_time'],
+                    'conflict_target': '(metric_id, dim_id)'
+                },
+                'metric_source_mapping': {
+                    'columns': ['id', 'metric_id', 'source_type', 'datasource', 'db_table', 'metric_column', 'filter_condition', 'agg_func', 'priority', 'is_valid', 'source_level', 'create_time', 'modify_time'],  # ⚠️ map_id 改为 id
+                    'conflict_target': '(metric_id, db_table, metric_column)'
+                },
+                'metric_compound_rel': {
+                    'columns': ['metric_id', 'sub_metric_id', 'cal_operator', 'sort', 'create_time', 'modify_time'],
+                    'conflict_target': '(metric_id, sub_metric_id)'
+                },
+                'table_lineage': {
+                    'columns': ['id', 'source_table', 'source_table_name', 'target_table', 'target_table_name', 'create_time', 'modify_time'],
+                    'conflict_target': '(id)'
+                },
+                'field_lineage': {
+                    'columns': ['id', 'table_lineage_id', 'source_table', 'source_table_name', 'source_field', 'source_field_name', 'target_table', 'target_table_name', 'target_field', 'target_field_name', 'target_field_mark', 'dim_id', 'formula', 'create_time', 'modify_time'],
+                    'conflict_target': '(source_table, source_field, target_table, target_field)'
+                },
+                'metric_lineage': {
+                    'columns': ['metric_id', 'field_lineage_id', 'create_time', 'modify_time'],
+                    'conflict_target': '(metric_id, field_lineage_id)'
+                }
+            }
+            
+            # 批量插入各表数据（使用 SqlGenerator）
             for table_name, data_list in table_data.items():
                 if not data_list:
                     continue
                 
-                sql = self._generate_batch_upsert_sql(table_name, data_list)
+                config = table_configs.get(table_name)
+                if not config:
+                    logger.warning(f"[指标服务] 未知的表名: {table_name}")
+                    continue
+                
+                # ⚠️ 使用 SqlGenerator 生成 SQL
+                sql = SqlGenerator.generate_batch_upsert(table_name, config, data_list)
                 if sql:
                     self.session.execute(text(sql))
                     table_stats[table_name] = len(data_list)
@@ -744,7 +817,7 @@ class MetricsService:
                     'conflict_target': '(metric_id, dim_id)'
                 },
                 'metric_source_mapping': {
-                    'columns': ['map_id', 'metric_id', 'source_type', 'datasource', 'db_table', 'metric_column', 'filter_condition', 'agg_func', 'priority', 'is_valid', 'source_level'],
+                    'columns': ['id', 'metric_id', 'source_type', 'datasource', 'db_table', 'metric_column', 'filter_condition', 'agg_func', 'priority', 'is_valid', 'source_level'],  # ⚠️ map_id 改为 id
                     'conflict_target': '(metric_id, db_table, metric_column)'  # ⚠️ 使用唯一约束键
                 },
                 'metric_compound_rel': {
@@ -793,8 +866,8 @@ class MetricsService:
             # 构建 UPDATE 子句（排除主键和冲突键）
             conflict_columns = [col.strip() for col in conflict_target.strip('()').split(',')]
             
-            # ⚠️ 额外排除主键字段（如 map_id, id 等），即使它们不在冲突键中
-            primary_key_columns = ['map_id', 'id']  # ⚠️ lineage_id 改为 id
+            # ⚠️ 额外排除主键字段（如 id），即使它们不在冲突键中
+            primary_key_columns = ['id']  # ⚠️ 所有表的主键统一为 id
             update_columns = [col for col in columns if col not in conflict_columns and col not in primary_key_columns]
             
             # ⚠️ 如果所有字段都是冲突键，使用 DO NOTHING

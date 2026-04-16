@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Optional
+from sqlalchemy import func
 from sqlmodel import SQLModel, Field, Column, VARCHAR, TEXT, DATETIME, SmallInteger
 from sqlalchemy import Index
 
@@ -16,8 +17,8 @@ class MetricDefinition(SQLModel, table=True):
     cal_logic: Optional[str] = Field(sa_column=Column(TEXT, default=None, comment='口径计算逻辑（纯业务描述，如"单胎次内有效配种事件总次数"）'))
     unit: Optional[str] = Field(sa_column=Column(VARCHAR(16), default=None, comment='指标单位（如次、率、头）'))
     status: Optional[int] = Field(sa_column=Column(SmallInteger, default=1, comment='状态：1启用/0禁用'))
-    create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, comment='创建时间'))
-    modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, default=datetime.now, onupdate=datetime.now, comment='修改时间'))
+    create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, server_default=func.now(), comment='创建时间'))
+    modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, server_default=func.now(), onupdate=func.now(), comment='修改时间'))
 
     __table_args__ = (
         Index('idx_code_unique', 'code', unique=True),  # ⚠️ code 唯一约束

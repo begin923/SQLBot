@@ -4,7 +4,13 @@
 
 import logging
 from typing import Dict, List, Any, Tuple
-from datetime import datetime
+from sqlalchemy import text
+
+# ⚠️ 导入工具类
+from apps.extend.metrics2.utils.id_generator import IdGenerator
+from apps.extend.metrics2.utils.batch_query import BatchQueryHelper
+from apps.extend.metrics2.utils.sql_generator import SqlGenerator
+from apps.extend.metrics2.utils.timezone_helper import get_now_utc8
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +34,9 @@ class LineageService:
             session: 数据库会话
         """
         self.session = session
-        self._table_lineage_counter = 0
-        self._field_lineage_counter = 0
+        # ⚠️ 使用 IdGenerator 替代手动计数器
+        self.table_lineage_id_gen = IdGenerator(session, 'table_lineage', 'T')
+        self.field_lineage_id_gen = IdGenerator(session, 'field_lineage', 'F')
     
     def process(self, processed_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -129,10 +136,33 @@ class LineageService:
         ai_table_lineage = parsed_data.get('table_lineage', [])
         logger.info(f"[血缘服务] AI 输出 table_lineage 数量: {len(ai_table_lineage)}")
         
-        # ⚠️ 第一步：收集所有源表和目标表
+        # ⚠️ 第一步：去重 - 基于 (source_table, target_table)
+        seen_keys = set()
+        unique_table_lineage = []
+        duplicate_count = 0
+        
+        for tl in ai_table_lineage:
+            source_table = tl.get('source_table', '')
+            tgt_table = tl.get('target_table', target_table)
+            
+            if not source_table:
+                continue
+            
+            key = (source_table, tgt_table)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                unique_table_lineage.append(tl)
+            else:
+                duplicate_count += 1
+                logger.warning(f"[血缘服务] ⚠️ AI 输出中发现重复表血缘: {key}")
+        
+        if duplicate_count > 0:
+            logger.info(f"[血缘服务] ⚠️ AI 输出中去重: 原始 {len(ai_table_lineage)} 条, 去重后 {len(unique_table_lineage)} 条, 跳过 {duplicate_count} 条重复")
+        
+        # ⚠️ 第二步：收集所有源表和目标表（使用去重后的数据）
         all_source_tables = []
         all_target_tables = []
-        for tl in ai_table_lineage:
+        for tl in unique_table_lineage:
             source_table = tl.get('source_table', '')
             tgt_table = tl.get('target_table', target_table)
             if source_table:
@@ -140,15 +170,17 @@ class LineageService:
             if tgt_table:
                 all_target_tables.append(tgt_table)
         
-        # ⚠️ 第二步：批量查询已有记录
-        existing_table_lineage = self._load_existing_table_lineage(all_source_tables, all_target_tables)
+        # ⚠️ 第三步：批量查询已有记录（使用工具类）
+        existing_table_lineage = BatchQueryHelper.query_existing_table_lineage(
+            self.session, all_source_tables, all_target_tables
+        )
         logger.debug(f"[血缘服务] 数据库中已存在 {len(existing_table_lineage)} 条表血缘记录")
         
-        # 第三步：为所有表对生成或复用 lineage_id（包括已存在的）
+        # 第四步：为所有表对生成或复用 lineage_id（包括已存在的）
         new_count = 0
         skipped_count = 0
         
-        for tl in ai_table_lineage:
+        for tl in unique_table_lineage:
             source_table = tl.get('source_table', '')
             tgt_table = tl.get('target_table', target_table)
             
@@ -159,10 +191,10 @@ class LineageService:
             
             # 检查是否已存在
             if key in existing_table_lineage:
-                # ⚠️ 即使已存在，也要添加到 table_data，供 field_lineage 使用
+                # ⚠️ 已存在的记录不需要插入数据库，但需要保留在 table_data 中供 field_lineage 查找
                 lineage_id = existing_table_lineage[key]
                 skipped_count += 1
-                logger.debug(f"[血缘服务] 表血缘已存在，复用: {source_table} -> {tgt_table} (ID: {lineage_id})")
+                logger.debug(f"[血缘服务] 表血缘已存在，跳过插入: {source_table} -> {tgt_table} (ID: {lineage_id})")
                 
                 table_data['table_lineage'].append({
                     'id': lineage_id,
@@ -170,12 +202,14 @@ class LineageService:
                     'source_table_name': tl.get('source_table_name', ''),
                     'target_table': tgt_table,
                     'target_table_name': tl.get('target_table_name', ''),
-                    'is_exists': True  # ⚠️ 标记为已存在
+                    'create_time': get_now_utc8(),  # ⚠️ 直接使用工具函数
+                    'modify_time': get_now_utc8(),
+                    'is_exists': True  # ⚠️ 标记为已存在，_execute_insert 会过滤
                 })
                 continue
             
-            # 生成新的 lineage_id
-            lineage_id = self._get_next_table_lineage_id()
+            # 生成新的 lineage_id（使用 IdGenerator）
+            lineage_id = self.table_lineage_id_gen.get_next_id()
             new_count += 1
             logger.debug(f"[血缘服务] 生成新表血缘ID: {source_table} -> {tgt_table} (ID: {lineage_id})")
             
@@ -185,6 +219,8 @@ class LineageService:
                 'source_table_name': tl.get('source_table_name', ''),
                 'target_table': tgt_table,
                 'target_table_name': tl.get('target_table_name', ''),
+                'create_time': get_now_utc8(),  # ⚠️ 直接使用工具函数
+                'modify_time': get_now_utc8(),
                 'is_exists': False  # ⚠️ 标记为新记录
             })
         
@@ -283,7 +319,7 @@ class LineageService:
         logger.info(f"[血缘服务] 字段血缘数据规范化完成: {len(normalized_field_lineage)} 条")
         return normalized_field_lineage
     
-    def _collect_field_lineage(self, parsed_data: Dict[str, Any], target_table: str, table_data: Dict[str, List]):
+    def _collect_field_lineage(self, parsed_data: Dict[str, Any], target_table: str, table_data: Dict[str, List], now=None):
         """
         收集字段级血缘数据
         
@@ -291,6 +327,7 @@ class LineageService:
             parsed_data: AI 解析后的数据
             target_table: 目标表名
             table_data: 表数据收集字典
+            now: 当前时间（UTC+8）
         """
         ai_field_lineage = parsed_data.get('field_lineage', [])
         logger.info(f"[血缘服务] AI 输出 field_lineage 数量: {len(ai_field_lineage)}")
@@ -298,7 +335,7 @@ class LineageService:
         # ⚠️ 去重和空值填充
         normalized_field_lineage = self._dedup_and_normalize_field_lineage(ai_field_lineage, target_table)
         
-        # ⚠️ 批量查询数据库中已有的字段血缘记录（用于复用 lineage_id）
+        # ⚠️ 批量查询数据库中已有的字段血缘记录（使用工具类）
         # 构建 (source_table, target_table) 组合列表，避免笛卡尔积查询
         # ⚠️ 只添加 source_table 和 target_table 都不为空的记录
         table_pairs = list(set([
@@ -306,7 +343,7 @@ class LineageService:
             for fl in normalized_field_lineage
             if (fl.get('source_table') or '') and (fl.get('target_table', target_table))
         ]))
-        existing_field_lineage = self._load_existing_field_lineage(table_pairs)
+        existing_field_lineage = BatchQueryHelper.query_existing_field_lineage(self.session, table_pairs)
         
         # ⚠️ 遍历 normalized_field_lineage，查找对应的 table_lineage_id 并组装 field_lineage 数据
         for fl in normalized_field_lineage:
@@ -357,8 +394,8 @@ class LineageService:
                 lineage_id = existing_field_lineage[business_key]
                 logger.debug(f"[血缘服务] 复用已有字段血缘ID: {business_key} (ID: {lineage_id})")
             else:
-                # 生成新的 lineage_id
-                lineage_id = self._get_next_field_lineage_id()
+                # 生成新的 lineage_id（使用 IdGenerator）
+                lineage_id = self.field_lineage_id_gen.get_next_id()
                 logger.debug(f"[血缘服务] 生成新字段血缘ID: {business_key} (ID: {lineage_id})")
             
             table_data['field_lineage'].append({
@@ -374,7 +411,9 @@ class LineageService:
                 'target_field_name': target_field_name,  # ⚠️ 新增
                 'target_field_mark': target_field_mark,  # ⚠️ 添加 target_field_mark
                 'dim_id': dim_id,  # ⚠️ 添加 dim_id
-                'formula': formula
+                'formula': formula,
+                'create_time': now,
+                'modify_time': now
             })
         
         logger.info(f"[血缘服务] field_lineage 收集完成: {len(table_data['field_lineage'])} 条\n 详情:{table_data['field_lineage']}")
@@ -431,90 +470,6 @@ class LineageService:
         
         return ''
     
-    def _load_existing_table_lineage(self, source_tables: List[str], target_tables: List[str]) -> Dict[Tuple[str, str], str]:
-        """
-        从数据库加载已有的表血缘记录（批量查询优化版）
-        
-        Args:
-            source_tables: 源表列表
-            target_tables: 目标表列表
-            
-        Returns:
-            {(source_table, target_table): lineage_id}
-        """
-        if not source_tables or not target_tables:
-            return {}
-        
-        try:
-            from sqlalchemy import text
-            
-            # 去重
-            unique_sources = list(set(source_tables))
-            unique_targets = list(set(target_tables))
-            
-            result = self.session.execute(
-                text("SELECT id, source_table, target_table FROM table_lineage WHERE source_table IN :sources AND target_table IN :targets"),
-                {"sources": tuple(unique_sources), "targets": tuple(unique_targets)}
-            ).fetchall()
-            
-            existing = {}
-            for row in result:
-                key = (row[1], row[2])
-                existing[key] = row[0]
-            
-            logger.debug(f"[血缘服务] 批量加载已有表血缘: {len(existing)} 条")
-            return existing
-        except Exception as e:
-            logger.warning(f"[血缘服务] 批量查询已有表血缘失败: {str(e)}")
-            return {}
-    
-    def _load_existing_field_lineage(
-        self, 
-        table_pairs: List[Tuple[str, str]]
-    ) -> Dict[Tuple[str, str, str, str], str]:
-        """
-        从数据库加载已有的字段血缘记录（批量查询优化版）
-        
-        Args:
-            table_pairs: (source_table, target_table) 组合列表
-            
-        Returns:
-            {(source_table, source_field, target_table, target_field): lineage_id}
-        """
-        if not table_pairs:
-            return {}
-        
-        try:
-            from sqlalchemy import text
-            
-            # ⚠️ 使用元组 IN 语法，避免笛卡尔积，更简洁高效
-            # 例如：WHERE (source_table, target_table) IN (('t1', 't2'), ('t3', 't4'))
-            values_list = []
-            params = {}
-            for idx, (src_tbl, tgt_tbl) in enumerate(table_pairs):
-                param_src = f'src_{idx}'
-                param_tgt = f'tgt_{idx}'
-                values_list.append(f'(:{param_src}, :{param_tgt})')
-                params[param_src] = src_tbl
-                params[param_tgt] = tgt_tbl
-            
-            values_clause = ', '.join(values_list)
-            sql = f"SELECT id, source_table, source_field, target_table, target_field FROM field_lineage WHERE (source_table, target_table) IN ({values_clause})"
-            logger.debug(f"[血缘服务] 批量查询字段血缘 SQL: {sql}")
-            logger.debug(f"[血缘服务] 查询参数: {params}")
-            result = self.session.execute(text(sql), params).fetchall()
-            
-            existing = {}
-            for row in result:
-                key = (row[1], row[2], row[3], row[4])
-                existing[key] = row[0]
-            
-            logger.debug(f"[血缘服务] 批量加载已有字段血缘: {len(existing)} 条")
-            return existing
-        except Exception as e:
-            logger.warning(f"[血缘服务] 批量查询已有字段血缘失败: {str(e)}")
-            return {}
-    
     def _collect_table_lineage_ids(
         self, 
         source_table: str, 
@@ -551,59 +506,9 @@ class LineageService:
         
         return table_lineage_ids
     
-    def _get_next_table_lineage_id(self) -> str:
-        """
-        生成下一个表血缘ID
-        
-        Returns:
-            新的表血缘ID (格式: T000001, T000002, ...)
-        """
-        if self._table_lineage_counter == 0:
-            try:
-                from sqlalchemy import text
-                result = self.session.execute(
-                    text("SELECT MAX(CAST(SUBSTRING(id FROM 2) AS INTEGER)) FROM table_lineage")
-                ).scalar()
-                
-                if result is not None:
-                    self._table_lineage_counter = int(result)
-                else:
-                    self._table_lineage_counter = 0
-            except Exception as e:
-                logger.warning(f"[血缘服务] 查询最大 table_lineage ID 失败: {str(e)}")
-                self._table_lineage_counter = 0
-        
-        self._table_lineage_counter += 1
-        return f"T{self._table_lineage_counter:06d}"
-    
-    def _get_next_field_lineage_id(self) -> str:
-        """
-        生成下一个字段血缘ID
-        
-        Returns:
-            新的字段血缘ID (格式: F000001, F000002, ...)
-        """
-        if self._field_lineage_counter == 0:
-            try:
-                from sqlalchemy import text
-                result = self.session.execute(
-                    text("SELECT MAX(CAST(SUBSTRING(id FROM 2) AS INTEGER)) FROM field_lineage")
-                ).scalar()
-                
-                if result is not None:
-                    self._field_lineage_counter = int(result)
-                else:
-                    self._field_lineage_counter = 0
-            except Exception as e:
-                logger.warning(f"[血缘服务] 查询最大 field_lineage ID 失败: {str(e)}")
-                self._field_lineage_counter = 0
-        
-        self._field_lineage_counter += 1
-        return f"F{self._field_lineage_counter:06d}"
-    
     def _execute_insert(self, table_data: Dict[str, List]) -> Dict[str, Any]:
         """
-        执行数据库插入操作
+        执行数据库插入操作（使用 SqlGenerator）
         
         Args:
             table_data: 表数据收集字典
@@ -612,89 +517,46 @@ class LineageService:
             执行结果
         """
         try:
-            from sqlalchemy import text
+            # 定义各表的配置
+            table_configs = {
+                'table_lineage': {
+                    'columns': ['id', 'source_table', 'source_table_name', 'target_table', 'target_table_name', 'create_time', 'modify_time'],
+                    'conflict_target': '(source_table, target_table)'
+                },
+                'field_lineage': {
+                    'columns': ['id', 'table_lineage_id', 'source_table', 'source_table_name', 'source_field', 'source_field_name', 'target_table', 'target_table_name', 'target_field', 'target_field_name', 'target_field_mark', 'dim_id', 'formula', 'create_time', 'modify_time'],
+                    'conflict_target': '(source_table, source_field, target_table, target_field)'
+                }
+            }
             
             table_stats = {}
             
-            # 批量插入 table_lineage
+            # 批量插入 table_lineage（使用 SqlGenerator）
             # ⚠️ 过滤掉 is_exists=True 的记录（已存在于数据库）
             new_table_lineage = [item for item in table_data['table_lineage'] if not item.get('is_exists', False)]
             
             if new_table_lineage:
-                values_list = []
-                for item in new_table_lineage:
-                    # 转义单引号
-                    source_table_name_escaped = item.get('source_table_name', '').replace("'", "''")
-                    target_table_name_escaped = item.get('target_table_name', '').replace("'", "''")
-                    values_list.append(
-                        f"('{item['id']}', '{item['source_table']}', '{source_table_name_escaped}', "
-                        f"'{item['target_table']}', '{target_table_name_escaped}')"
-                    )
-                
-                values_str = ',\n'.join(values_list)
-                sql = f"""
-                    INSERT INTO table_lineage (id, source_table, source_table_name, target_table, target_table_name)
-                    VALUES {values_str}
-                    ON CONFLICT (source_table, target_table) DO NOTHING
-                """
-                
-                result = self.session.execute(text(sql))
-                inserted_count = result.rowcount if result.rowcount is not None else len(new_table_lineage)
-                skipped_count = len(new_table_lineage) - inserted_count
-                
-                table_stats['table_lineage'] = inserted_count
-                logger.info(f"[血缘服务] 批量插入 table_lineage: {inserted_count} 条新增, {skipped_count} 条已存在跳过")
+                config = table_configs['table_lineage']
+                sql = SqlGenerator.generate_batch_upsert('table_lineage', config, new_table_lineage)
+                if sql:
+                    result = self.session.execute(text(sql))
+                    inserted_count = result.rowcount if result.rowcount is not None else len(new_table_lineage)
+                    skipped_count = len(new_table_lineage) - inserted_count
+                    
+                    table_stats['table_lineage'] = inserted_count
+                    logger.info(f"[血缘服务] 批量插入 table_lineage: {inserted_count} 条新增, {skipped_count} 条已存在跳过")
             else:
                 table_stats['table_lineage'] = 0
                 logger.info(f"[血缘服务] 无需插入 table_lineage（所有记录均已存在）")
             
-            # 批量插入 field_lineage
+            # 批量插入 field_lineage（使用 SqlGenerator）
             if table_data['field_lineage']:
-                values_list = []
-                for item in table_data['field_lineage']:
-                    # 转义单引号
-                    source_table_name_escaped = item.get('source_table_name', '').replace("'", "''")
-                    source_field_name_escaped = item.get('source_field_name', '').replace("'", "''")
-                    target_table_name_escaped = item.get('target_table_name', '').replace("'", "''")
-                    target_field_name_escaped = item.get('target_field_name', '').replace("'", "''")
-                    formula_escaped = item['formula'].replace("'", "''") if item['formula'] else ''
-                    
-                    # ⚠️ 处理 dim_id（可能为 NULL）
-                    dim_id_value = item.get('dim_id')
-                    if dim_id_value:
-                        dim_id_str = f"'{dim_id_value}'"
-                    else:
-                        dim_id_str = 'NULL'
-                    
-                    values_list.append(
-                        f"('{item['id']}', '{item['table_lineage_id']}', "
-                        f"'{item['source_table']}', '{source_table_name_escaped}', "
-                        f"'{item['source_field']}', '{source_field_name_escaped}', "
-                        f"'{item['target_table']}', '{target_table_name_escaped}', "
-                        f"'{item['target_field']}', '{target_field_name_escaped}', "
-                        f"'{item.get('target_field_mark', 'normal')}', "
-                        f"{dim_id_str}, "
-                        f"'{formula_escaped}')"
-                    )
-                
-                values_str = ',\n'.join(values_list)
-                sql = f"""
-                    INSERT INTO field_lineage (id, table_lineage_id, source_table, source_table_name, source_field, source_field_name, target_table, target_table_name, target_field, target_field_name, target_field_mark, dim_id, formula)
-                    VALUES {values_str}
-                    ON CONFLICT (source_table, source_field, target_table, target_field) DO UPDATE SET
-                        table_lineage_id = EXCLUDED.table_lineage_id,
-                        source_table_name = EXCLUDED.source_table_name,
-                        source_field_name = EXCLUDED.source_field_name,
-                        target_table_name = EXCLUDED.target_table_name,
-                        target_field_name = EXCLUDED.target_field_name,
-                        target_field_mark = EXCLUDED.target_field_mark,
-                        dim_id = EXCLUDED.dim_id,
-                        formula = EXCLUDED.formula
-                """
-                
-                self.session.execute(text(sql))
-                table_stats['field_lineage'] = len(table_data['field_lineage'])
-                logger.info(f"[血缘服务] 批量插入 field_lineage: {len(table_data['field_lineage'])} 条")
+                config = table_configs['field_lineage']
+                sql = SqlGenerator.generate_batch_upsert('field_lineage', config, table_data['field_lineage'])
+                if sql:
+                    self.session.execute(text(sql))
+                    table_stats['field_lineage'] = len(table_data['field_lineage'])
+                    logger.info(f"[血缘服务] 批量插入 field_lineage: {len(table_data['field_lineage'])} 条")
             
             # 提交事务
             self.session.commit()

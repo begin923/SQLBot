@@ -151,42 +151,88 @@ class MetricsPlatformService:
             validation_result = None
             table_stats = {}
             
-            if layer_type == "DIM":
-                logger.info("[流程] DIM 层：使用 DimService 处理")
-                dim_result = self.dim_service.process(parsed_results)
-                if not dim_result.get('success', False):
-                    return dim_result
+            try:
+                if layer_type == "DIM":
+                    logger.info("[流程] DIM 层：使用 DimService 处理")
+                    dim_result = self.dim_service.process(parsed_results)
+                    if not dim_result.get('success', False):
+                        # ⚠️ 记录失败日志
+                        self._log_service_failure(
+                            parsed_results=parsed_results,
+                            service_name="DimService",
+                            error_message=dim_result.get('message', '未知错误'),
+                            layer_type=layer_type
+                        )
+                        return dim_result
+                    
+                    execution_result, insert_sqls, validation_result = self._build_execution_result(
+                        dim_result, 'DIM层处理成功', 'DIM层跳过SQL校验'
+                    )
+                    table_stats = dim_result.get('table_stats', {})
+                    
+                elif layer_type == "DWD":
+                    logger.info("[流程] DWD 层：使用 LineageService 处理")
+                    lineage_result = self.lineage_service.process(parsed_results)
+                    if not lineage_result.get('success', False):
+                        # ⚠️ 记录失败日志
+                        self._log_service_failure(
+                            parsed_results=parsed_results,
+                            service_name="LineageService",
+                            error_message=lineage_result.get('message', '未知错误'),
+                            layer_type=layer_type
+                        )
+                        return lineage_result
+                    
+                    execution_result, insert_sqls, validation_result = self._build_execution_result(
+                        lineage_result, 'DWD层处理成功', 'DWD层跳过SQL校验'
+                    )
+                    table_stats = lineage_result.get('table_stats', {})
+                    
+                elif layer_type == "METRIC":
+                    logger.info("[流程] METRIC 层：使用 MetricsService 处理")
+                    metrics_result = self.metrics_service.process(parsed_results)
+                    if not metrics_result.get('success', False):
+                        # ⚠️ 记录失败日志
+                        self._log_service_failure(
+                            parsed_results=parsed_results,
+                            service_name="MetricsService",
+                            error_message=metrics_result.get('message', '未知错误'),
+                            layer_type=layer_type
+                        )
+                        return metrics_result
+                    
+                    execution_result, insert_sqls, validation_result = self._build_execution_result(
+                        metrics_result, 'METRIC层处理成功', 'METRIC层跳过SQL校验'
+                    )
+                    table_stats = metrics_result.get('table_stats', {})
+                else:
+                    # 未知的层级类型
+                    error_msg = f"不支持的层级类型: {layer_type}"
+                    logger.error(error_msg)
+                    return {
+                        "success": False,
+                        "message": error_msg,
+                        "input_path": str(input_path)
+                    }
+            except Exception as service_error:
+                # ⚠️ 捕获 Service 层的未预期异常（如数据库约束冲突）
+                error_msg = f"{layer_type} 层处理异常: {str(service_error)}"
+                logger.error(f"[流程异常] {error_msg}", exc_info=True)
                 
-                execution_result, insert_sqls, validation_result = self._build_execution_result(
-                    dim_result, 'DIM层处理成功', 'DIM层跳过SQL校验'
+                # ⚠️ 记录失败日志
+                self._log_service_failure(
+                    parsed_results=parsed_results,
+                    service_name=f"{layer_type}Service",
+                    error_message=error_msg,
+                    layer_type=layer_type,
+                    exception=service_error
                 )
-                table_stats = dim_result.get('table_stats', {})
                 
-            elif layer_type == "DWD":
-                logger.info("[流程] DWD 层：使用 LineageService 处理")
-                lineage_result = self.lineage_service.process(parsed_results)
-                if not lineage_result.get('success', False):
-                    return lineage_result
+                # 回滚事务
+                if self.session.in_transaction():
+                    self.session.rollback()
+                    logger.info("[流程异常] 已回滚事务")
                 
-                execution_result, insert_sqls, validation_result = self._build_execution_result(
-                    lineage_result, 'DWD层处理成功', 'DWD层跳过SQL校验'
-                )
-                table_stats = lineage_result.get('table_stats', {})
-                
-            elif layer_type == "METRIC":
-                logger.info("[流程] METRIC 层：使用 MetricsService 处理")
-                metrics_result = self.metrics_service.process(parsed_results)
-                if not metrics_result.get('success', False):
-                    return metrics_result
-                
-                execution_result, insert_sqls, validation_result = self._build_execution_result(
-                    metrics_result, 'METRIC层处理成功', 'METRIC层跳过SQL校验'
-                )
-                table_stats = metrics_result.get('table_stats', {})
-            else:
-                # 未知的层级类型
-                error_msg = f"不支持的层级类型: {layer_type}"
-                logger.error(error_msg)
                 return {
                     "success": False,
                     "message": error_msg,
@@ -416,7 +462,7 @@ class MetricsPlatformService:
 
                 # 调用大模型解析SQL（传递层级类型）
                 parsed_data = self._parse_sql_with_ai(sql_content, file_path, layer_type)
-                logger.info(f"[大模型SQL生成-解析结果] {parsed_data}")
+                logger.debug(f"[大模型SQL生成-解析结果] {parsed_data}")
                 if not parsed_data or not parsed_data.get('success', False):
                     parsed_results.append({
                         "file_path": file_path,
@@ -536,6 +582,73 @@ class MetricsPlatformService:
         except Exception as e:
             # 日志记录失败不应影响主流程
             logger.error(f"[失败日志] 记录失败: {str(e)}")
+
+    def _log_service_failure(
+        self,
+        parsed_results: List[Dict[str, Any]],
+        service_name: str,
+        error_message: str,
+        layer_type: str,
+        exception: Optional[Exception] = None
+    ):
+        """
+        记录 Service 层处理失败日志
+        
+        Args:
+            parsed_results: 解析结果列表
+            service_name: Service 名称
+            error_message: 错误消息
+            layer_type: 层级类型
+            exception: 异常对象（可选）
+        """
+        try:
+            import os
+            from apps.extend.metrics2.curd.sql_parse_failure_log_curd import create_failure_log
+            
+            # 从 parsed_results 中提取文件信息
+            for result in parsed_results:
+                if not result.get('success', False):
+                    continue
+                
+                file_path = result.get('file_path', '')
+                file_name = os.path.basename(file_path) if file_path else "unknown.sql"
+                
+                # 获取 SQL 内容
+                sql_content = None
+                parsed_data = result.get('parsed_data', {})
+                if parsed_data and 'basic_info' in parsed_data:
+                    sql_content = parsed_data['basic_info'].get('sql_content')
+                
+                # 截断 SQL 内容（避免过大）
+                if sql_content and len(sql_content) > 5000:
+                    sql_content = sql_content[:5000] + "... [truncated]"
+                
+                # 构建详细错误信息
+                detailed_error = f"[{service_name}] {error_message}"
+                if exception:
+                    detailed_error += f"\n异常类型: {type(exception).__name__}"
+                    detailed_error += f"\n异常详情: {str(exception)}"
+                
+                # 确定错误类型
+                error_type = "SERVICE_ERROR"
+                if exception:
+                    error_type = f"SERVICE_{type(exception).__name__.upper()}"
+                
+                create_failure_log(
+                    session=self.session,
+                    file_path=file_path,
+                    file_name=file_name,
+                    failure_reason=detailed_error,
+                    layer_type=layer_type,
+                    error_type=error_type,
+                    sql_content=sql_content
+                )
+                
+                logger.info(f"[失败日志] 已记录 Service 失败: {file_name} - {error_type}")
+                
+        except Exception as e:
+            # 日志记录失败不应影响主流程
+            logger.error(f"[失败日志] 记录 Service 失败日志时出错: {str(e)}")
 
     def _handle_parse_error(
         self,

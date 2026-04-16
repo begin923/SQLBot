@@ -228,23 +228,42 @@ def test_layer(sql_file_path: str, layer_type: str = "AUTO", session=None):
 
 
 def test_all_layers():
-    """按顺序测试所有层级（DIM、DWD、DWS、ADS）"""
+    """按顺序测试所有层级（DIM、DWD、DWS、ADS）目录下的所有文件"""
     
     # ==================== 配置区域 ====================
-    # 配置各层的SQL文件路径（每层只需要1个文件）
-    # 注意：使用 AUTO 模式，系统会根据文件路径自动识别层级类型
-    # - DIM 路径包含 /dim/ → 自动识别为 DIM 层
-    # - DWD 路径包含 /dwd/ → 自动识别为 DWD 层
-    # - DWS/ADS 路径 → 自动识别为 METRIC 层
-    test_files = [
-        # r"D:\codes\yingzi-data-datawarehouse-release\source\sql\doris\fpf\hour\dim\dim_hmc_plus_org_farm_entity.sql"
-        # r"D:\codes\yingzi-data-datawarehouse-release\source\sql\doris\fpf\hour\dwd\dwd_aib_female_mating_detail_new.sql"
-        # r"D:\codes\yingzi-data-datawarehouse-release\source\sql\doris\fpf\hour\dws\dws_inb_pig_semen_product_breed_loc_day.sql"
-        # r"D:\codes\yingzi-data-datawarehouse-release\source\sql\doris\fpf\hour\ads\ads_anc_female_backfat_month_new2_data.sql"
+    # 配置根目录路径
+    base_dir = r"D:\codes\yingzi-data-datawarehouse-release\source\sql\doris\fpf\hour"
+    
+    # 定义各层子目录
+    layer_dirs = [
+        ("dim", os.path.join(base_dir, "dim")),
+        ("dwd", os.path.join(base_dir, "dwd")),
+        ("dws", os.path.join(base_dir, "dws")),
+        ("ads", os.path.join(base_dir, "ads"))
     ]
+    
+    # 收集所有 SQL 文件
+    test_files = []
+    for layer_name, layer_dir in layer_dirs:
+        if not os.path.exists(layer_dir):
+            print(f"⚠️  目录不存在：{layer_dir}")
+            continue
+        
+        # 遍历目录下所有 .sql 文件
+        for root, dirs, files in os.walk(layer_dir):
+            for file in sorted(files):  # 排序保证顺序一致
+                if file.endswith('.sql'):
+                    file_path = os.path.join(root, file)
+                    test_files.append(file_path)
+    
+    if not test_files:
+        print("❌ 未找到任何 SQL 文件")
+        return
     
     # ==================== 执行测试 ====================
     print("🚀 开始测试各层 SQL 文件解析")
+    print(f"📂 根目录：{base_dir}")
+    print(f"📄 共找到 {len(test_files)} 个 SQL 文件")
     print("=" * 80)
     
     # 获取数据库会话
@@ -253,7 +272,7 @@ def test_all_layers():
     results = {}
     
     try:
-        # 按顺序测试各层（使用 AUTO 模式自动识别）
+        # 按顺序测试所有文件（使用 AUTO 模式自动识别）
         for idx, file_path in enumerate(test_files, 1):
             print(f"\n{'='*80}")
             print(f"📋 测试文件 {idx}/{len(test_files)}")
@@ -261,11 +280,6 @@ def test_all_layers():
             
             success = test_layer(file_path, layer_type="AUTO", session=session)
             results[file_path] = success
-            
-            # 每个文件测试后暂停一下，方便查看结果
-            if idx < len(test_files):
-                print("\n⏸️  按回车继续测试下一个文件...")
-                input()
         
         # 打印总结
         print("\n" + "=" * 80)
