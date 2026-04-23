@@ -6,12 +6,9 @@
 2. 运行此脚本，会按顺序测试各层
 """
 
-import sys
-import os
 import logging
-import json
-import time
-from pathlib import Path
+import os
+import sys
 
 # 配置日志（避免重复输出）
 logging.basicConfig(
@@ -44,7 +41,6 @@ from apps.extend.metrics2.curd.sql_parse_success_log_curd import (
 )
 import json
 import time
-from pathlib import Path
 
 # 断点续传配置文件路径
 CHECKPOINT_FILE = os.path.join(os.path.dirname(__file__), '.checkpoint.json')
@@ -197,9 +193,22 @@ def test_layer(sql_file_path: str, layer_type: str = "AUTO", session=None, skip_
             return False, False
     
     except Exception as e:
-        print(f"\n❌ {layer_type} 层解析异常：{str(e)}")
-        import traceback
-        traceback.print_exc()
+        # ⚠️ 简化异常输出，不打印完整SQL
+        error_type = type(e).__name__
+        error_str = str(e)
+        
+        # 提取简短的错误信息
+        if 'StringDataRightTruncation' in error_str:
+            error_msg = f"字段长度超限 (VARCHAR(500))"
+        elif 'UniqueViolation' in error_str or 'CardinalityViolation' in error_str:
+            error_msg = f"唯一约束冲突"
+        elif 'StatementError' in error_str or 'InvalidRequestError' in error_str:
+            error_msg = f"SQL参数错误"
+        else:
+            error_msg = f"{error_type}"
+        
+        print(f"\n❌ {layer_type} 层解析异常：{error_msg}")
+        # ⚠️ 不打印 traceback，避免显示完整SQL
         return False, False
 
 
@@ -270,6 +279,13 @@ def test_all_layers():
     
     # 获取数据库会话
     session = DBUtils.create_local_session()
+    
+    # ⚠️ 方案 1：加载血缘数据缓存（一次性查询，避免重复）
+    from apps.extend.metrics2.utils.lineage_cache import LineageCache
+    cache = LineageCache()
+    cache.load_all(session)
+    cache_stats = cache.get_stats()
+    print(f"\n📦 缓存统计: {cache_stats['table_lineage_count']} 条表血缘, {cache_stats['field_lineage_count']} 条字段血缘")
     
     results = {}
     skipped_count = 0

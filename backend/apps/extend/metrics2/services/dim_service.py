@@ -47,8 +47,14 @@ class DimService:
             
         Returns:
             执行结果 {'success': bool, 'message': str, 'table_stats': dict}
+            
+        Raises:
+            Exception: 当数据处理失败时抛出异常，由主流程统一回滚
         """
         try:
+            # ⚠️ 批次级别统一时间戳，确保同一批次内所有记录时间一致
+            batch_time = get_now_utc8()
+            
             # 初始化表数据收集字典
             table_data = {
                 'dim_definition': [],
@@ -62,20 +68,20 @@ class DimService:
                     continue
                 
                 logger.debug(f"[DIM服务] 处理结果 #{idx}")
-                self._collect_dim_data(processed_result, table_data)
+                self._collect_dim_data(processed_result, table_data, batch_time)
             
             # 校验数据完整性
             if not table_data['dim_definition']:
                 error_msg = "❌ DIM 层未生成任何 dim_definition 数据"
                 logger.error(error_msg)
-                return {'success': False, 'message': error_msg}
+                raise ValueError(error_msg)  # ⚠️ 抛出异常
             
             if not table_data['dim_field_mapping']:
                 error_msg = "❌ DIM 层未生成任何 dim_field_mapping 数据"
                 logger.error(error_msg)
-                return {'success': False, 'message': error_msg}
+                raise ValueError(error_msg)  # ⚠️ 抛出异常
             
-            # 执行数据库插入
+            # 执行数据库插入（不提交事务，由主流程统一提交）
             execution_result = self._execute_insert(table_data)
             
             logger.info(f"[DIM服务] ✅ 处理完成 - 维度数: {len(table_data['dim_definition'])}")
@@ -86,18 +92,23 @@ class DimService:
                 'table_stats': execution_result.get('table_stats', {})
             }
             
+        except ValueError:
+            # ⚠️ 业务逻辑错误，直接向上抛出
+            raise
         except Exception as e:
             error_msg = f"[DIM服务] 处理失败: {str(e)}"
             logger.error(error_msg, exc_info=True)
-            return {'success': False, 'message': error_msg}
+            # ⚠️ 不再回滚，由主流程统一处理
+            raise  # ⚠️ 重新抛出异常
     
-    def _collect_dim_data(self, processed_result: Dict[str, Any], table_data: Dict[str, List]):
+    def _collect_dim_data(self, processed_result: Dict[str, Any], table_data: Dict[str, List], batch_time: datetime = None):
         """
         收集 DIM 层维度数据（总控方法）
         
         Args:
             processed_result: 单个文件的处理结果
             table_data: 表数据收集字典
+            batch_time: 批次统一时间戳（可选，不提供则实时获取）
         """
         try:
             parsed_data = processed_result.get('parsed_data', {})
@@ -117,7 +128,7 @@ class DimService:
             existing_dims = self._batch_query_existing_dims(fields)
             
             # 2. 处理每个字段，生成维度定义和字段映射
-            now = get_now_utc8()  # ⚠️ 统一使用 UTC+8 时区
+            now = batch_time if batch_time else get_now_utc8()  # ⚠️ 使用批次时间或实时获取
             self._process_fields(fields, target_table, existing_dims, now, table_data)
             
             logger.info(f"[DIM服务] 收集完成 - dim_definition: {len(table_data['dim_definition'])} 条, dim_field_mapping: {len(table_data['dim_field_mapping'])} 条")
@@ -250,7 +261,7 @@ class DimService:
                     table_stats['dim_definition'] = len(table_data['dim_definition'])
                     logger.info(f"[DIM服务] 批量插入 dim_definition: {len(table_data['dim_definition'])} 条")
             
-            # 批量插入 dim_field_mapping（使用 SqlGenerator）
+            # ⚠️ 批量插入 dim_field_mapping（使用 SqlGenerator）
             if table_data['dim_field_mapping']:
                 config = table_configs['dim_field_mapping']
                 sql = SqlGenerator.generate_batch_upsert('dim_field_mapping', config, table_data['dim_field_mapping'])
@@ -259,8 +270,8 @@ class DimService:
                     table_stats['dim_field_mapping'] = len(table_data['dim_field_mapping'])
                     logger.info(f"[DIM服务] 批量插入 dim_field_mapping: {len(table_data['dim_field_mapping'])} 条")
             
-            # 提交事务
-            self.session.commit()
+            # ⚠️ 不再提交事务，由主流程统一提交
+            logger.info("[DIM服务] 数据已准备就绪，等待主流程提交")
             
             return {
                 'success': True,
@@ -268,6 +279,6 @@ class DimService:
             }
             
         except Exception as e:
-            self.session.rollback()
             logger.error(f"[DIM服务] 数据库插入失败: {str(e)}", exc_info=True)
+            # ⚠️ 不再自行回滚，由主流程统一处理
             raise

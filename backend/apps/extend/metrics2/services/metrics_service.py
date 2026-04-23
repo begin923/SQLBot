@@ -15,20 +15,27 @@ logger = logging.getLogger("MetricsService")
 class MetricsService:
     """指标服务 - 专门处理 METRIC 层的指标数据"""
     
-    def __init__(self, session: Session):
+    def __init__(self, session: Session, lineage_service=None):
         """
         初始化指标服务
         
         Args:
             session: 数据库会话
+            lineage_service: 血缘服务实例（可选，用于复用缓存）
         """
         self.session = session
         # ⚠️ 使用 IdGenerator 替代手动计数器
         self.metric_id_gen = IdGenerator(session, 'metric_definition', 'M')  # metric_definition 的主键是 id
         self.map_id_gen = IdGenerator(session, 'metric_source_mapping', 'S')  # ⚠️ metric_source_mapping 的 ID 前缀已改为 S
-        # ⚠️ 创建 LineageService 实例处理血缘数据
-        from .lineage_service import LineageService
-        self.lineage_service = LineageService(session)
+        
+        # ⚠️ 通过依赖注入获取 LineageService，避免重复创建实例
+        if lineage_service is not None:
+            self.lineage_service = lineage_service
+            logger.info("[指标服务] 使用外部传入的 LineageService 实例（共享缓存）")
+        else:
+            from .lineage_service import LineageService
+            self.lineage_service = LineageService(session)
+            logger.warning("[指标服务] 未传入 LineageService 实例，创建了新的实例（可能产生缓存隔离）")
     
     def process(self, processed_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -39,38 +46,46 @@ class MetricsService:
             
         Returns:
             处理结果，包含成功状态、消息和表统计信息
+            
+        Raises:
+            Exception: 当数据处理失败时抛出异常，由主流程统一回滚
         """
-        # 初始化表数据收集字典
-        table_data = {
-            'metric_definition': [],
-            'metric_dim_rel': [],
-            'metric_source_mapping': [],
-            'metric_compound_rel': [],
-            'table_lineage': [],
-            'field_lineage': [],
-            'metric_lineage': []
-        }
-        
-        # 遍历所有处理结果，收集指标数据
-        for processed_result in processed_results:
-            self._collect_metric_data(processed_result, table_data)
-        
-        # ⚠️ 校验数据完整性
-        validation_result = self._validate_data_integrity(table_data)
-        if not validation_result['success']:
-            return {
-                'success': False,
-                'message': validation_result['message']
+        try:
+            # 初始化表数据收集字典
+            table_data = {
+                'metric_definition': [],
+                'metric_dim_rel': [],
+                'metric_source_mapping': [],
+                'metric_compound_rel': [],
+                'table_lineage': [],
+                'field_lineage': [],
+                'metric_lineage': []
             }
-        
-        # 执行数据库插入
-        execution_result = self._execute_insert(table_data)
-        
-        return {
-            'success': True,
-            'message': f"METRIC层处理成功，写入 {len(table_data['metric_definition'])} 个指标",
-            'table_stats': execution_result.get('table_stats', {})
-        }
+            
+            # 遍历所有处理结果，收集指标数据
+            for processed_result in processed_results:
+                self._collect_metric_data(processed_result, table_data)
+            
+            # ⚠️ 校验数据完整性（失败时抛出异常）
+            validation_result = self._validate_data_integrity(table_data)
+            if not validation_result['success']:
+                raise ValueError(validation_result['message'])  # ⚠️ 抛出异常
+            
+            # 执行数据库插入（不提交事务，由主流程统一提交）
+            execution_result = self._execute_insert(table_data)
+            
+            return {
+                'success': True,
+                'message': f"METRIC层处理成功，写入 {len(table_data['metric_definition'])} 个指标",
+                'table_stats': execution_result.get('table_stats', {})
+            }
+            
+        except ValueError:
+            # ⚠️ 业务逻辑错误，直接向上抛出
+            raise
+        except Exception as e:
+            logger.error(f"[指标服务] 处理失败: {str(e)}")
+            raise  # ⚠️ 重新抛出异常
     
     def _validate_data_integrity(self, table_data: Dict[str, List]) -> Dict[str, Any]:
         """
@@ -640,7 +655,7 @@ class MetricsService:
             logger.info(f"[指标服务-metric_dim_rel] ✅ 收集完成: 0 条记录（无公共维度）")
             return
         
-        # 批量查询 dim_field_mapping 表，获取对应的 dim_id
+        # 批量查询 dim_field_lineage 表，获取对应的 dim_id（关联到 dim_field_lineage.id）
         try:
             values_list = []
             params = {}
@@ -652,20 +667,21 @@ class MetricsService:
                 params[param_fld] = dim_fld
             
             values_clause = ', '.join(values_list)
-            sql = f"SELECT DISTINCT dim_id FROM dim_field_mapping WHERE (db_table, field) IN ({values_clause})"
-            logger.debug(f"[指标服务-metric_dim_rel] 批量查询维度映射 SQL: {sql}")
+            # ⚠️ 查询 dim_field_lineage 表的 id 字段（不是 dim_id）
+            sql = f"SELECT DISTINCT id FROM dim_field_lineage WHERE (db_table, field) IN ({values_clause})"
+            logger.debug(f"[指标服务-metric_dim_rel] 批量查询维度字段血缘ID SQL: {sql}")
             logger.debug(f"[指标服务-metric_dim_rel] 查询参数: {params}")
             
             result = self.session.execute(text(sql), params).fetchall()
-            valid_dim_ids = {row[0] for row in result}  # 直接提取 dim_id
+            valid_dim_ids = {row[0] for row in result}  # 提取 dim_field_lineage.id
             
             if not valid_dim_ids:
-                logger.info(f"[指标服务-metric_dim_rel] ✅ 收集完成: 0 条记录（dim_field_mapping 中无匹配数据）")
+                logger.info(f"[指标服务-metric_dim_rel] ✅ 收集完成: 0 条记录（dim_field_lineage 中无匹配数据）")
                 return
                 
-            logger.debug(f"[指标服务-metric_dim_rel] 找到 {len(valid_dim_ids)} 个公共维度ID: {valid_dim_ids}")
+            logger.debug(f"[指标服务-metric_dim_rel] 找到 {len(valid_dim_ids)} 个维度字段血缘ID: {valid_dim_ids}")
         except Exception as e:
-            logger.warning(f"[指标服务-metric_dim_rel] 批量查询 dim_field_mapping 失败: {str(e)}")
+            logger.warning(f"[指标服务-metric_dim_rel] 批量查询 dim_field_lineage 失败: {str(e)}")
             return
         
         # ⚠️ 第二步：为每个指标关联所有公共维度（不需要检查是否已存在）
@@ -766,7 +782,7 @@ class MetricsService:
                 }
             }
             
-            # 批量插入各表数据（使用 SqlGenerator）
+            # ⚠️ 批量插入各表数据（使用 SqlGenerator）
             for table_name, data_list in table_data.items():
                 if not data_list:
                     continue
@@ -783,9 +799,8 @@ class MetricsService:
                     table_stats[table_name] = len(data_list)
                     logger.info(f"[指标服务] 批量插入 {table_name}: {len(data_list)} 条")
             
-            # 提交事务
-            self.session.commit()
-            logger.info(f"[指标服务] ✅ 处理完成 - 共写入 {sum(table_stats.values())} 条记录")
+            # ⚠️ 不再提交事务，由主流程统一提交
+            logger.info(f"[指标服务] ✅ 处理完成 - 共写入 {sum(table_stats.values())} 条记录，等待主流程提交")
             
             return {
                 'success': True,
@@ -793,102 +808,6 @@ class MetricsService:
             }
             
         except Exception as e:
-            logger.error(f"[指标服务] 执行插入失败: {str(e)}")
-            self.session.rollback()
-            return {
-                'success': False,
-                'message': f'数据库插入失败: {str(e)}'
-            }
-    
-    def _generate_batch_upsert_sql(self, table_name: str, data_list: List[Dict]) -> Optional[str]:
-        """生成批量 UPSERT SQL"""
-        if not data_list:
-            return None
-        
-        try:
-            # 定义各表的字段映射和冲突键
-            table_config = {
-                'metric_definition': {
-                    'columns': ['id', 'name', 'code', 'metric_type', 'biz_domain', 'cal_logic', 'unit', 'status'],  # ⚠️ 改为新字段名
-                    'conflict_target': '(code)'  # ⚠️ 使用 code 作为唯一约束键
-                },
-                'metric_dim_rel': {
-                    'columns': ['metric_id', 'dim_id', 'is_required'],
-                    'conflict_target': '(metric_id, dim_id)'
-                },
-                'metric_source_mapping': {
-                    'columns': ['id', 'metric_id', 'source_type', 'datasource', 'db_table', 'metric_column', 'filter_condition', 'agg_func', 'priority', 'is_valid', 'source_level'],  # ⚠️ map_id 改为 id
-                    'conflict_target': '(metric_id, db_table, metric_column)'  # ⚠️ 使用唯一约束键
-                },
-                'metric_compound_rel': {
-                    'columns': ['metric_id', 'sub_metric_id', 'cal_operator', 'sort'],
-                    'conflict_target': '(metric_id, sub_metric_id)'
-                },
-                'table_lineage': {
-                    'columns': ['id', 'source_table', 'source_table_name', 'target_table', 'target_table_name'],  # ⚠️ lineage_id 改为 id
-                    'conflict_target': '(id)'  # ⚠️ 使用主键作为冲突键
-                },
-                'field_lineage': {
-                    'columns': ['id', 'table_lineage_id', 'source_table', 'source_table_name', 'source_field', 'source_field_name', 'target_table', 'target_table_name', 'target_field', 'target_field_name', 'target_field_mark', 'dim_id', 'formula'],  # ⚠️ lineage_id 改为 id
-                    'conflict_target': '(source_table, source_field, target_table, target_field)'  # ⚠️ 使用业务唯一键作为冲突键
-                },
-                'metric_lineage': {
-                    'columns': ['metric_id', 'field_lineage_id'],
-                    'conflict_target': '(metric_id, field_lineage_id)'
-                }
-            }
-            
-            config = table_config.get(table_name)
-            if not config:
-                logger.warning(f"[指标服务] 未知的表名: {table_name}")
-                return None
-            
-            columns = config['columns']
-            conflict_target = config['conflict_target']
-            
-            # 构建 VALUES 子句
-            values_list = []
-            for data in data_list:
-                values = []
-                for col in columns:
-                    value = data.get(col)
-                    if value is None:
-                        values.append('NULL')
-                    elif isinstance(value, str):
-                        escaped_value = value.replace("'", "''")
-                        values.append(f"'{escaped_value}'")
-                    else:
-                        values.append(str(value))
-                values_list.append(f"({', '.join(values)})")
-            
-            values_str = ',\n            '.join(values_list)
-            
-            # 构建 UPDATE 子句（排除主键和冲突键）
-            conflict_columns = [col.strip() for col in conflict_target.strip('()').split(',')]
-            
-            # ⚠️ 额外排除主键字段（如 id），即使它们不在冲突键中
-            primary_key_columns = ['id']  # ⚠️ 所有表的主键统一为 id
-            update_columns = [col for col in columns if col not in conflict_columns and col not in primary_key_columns]
-            
-            # ⚠️ 如果所有字段都是冲突键，使用 DO NOTHING
-            if not update_columns:
-                sql = f"""
-                INSERT INTO {table_name} ({', '.join(columns)})
-                VALUES {values_str}
-                ON CONFLICT {conflict_target} DO NOTHING
-                """
-            else:
-                # 否则使用 DO UPDATE SET
-                update_str = ', '.join([f"{col} = EXCLUDED.{col}" for col in update_columns])
-                sql = f"""
-                INSERT INTO {table_name} ({', '.join(columns)})
-                VALUES {values_str}
-                ON CONFLICT {conflict_target} DO UPDATE SET
-                    {update_str}
-                """
-            
-            return sql
-            
-        except Exception as e:
-            logger.error(f"[指标服务] 生成 SQL 失败: {str(e)}")
-            return None
+            logger.error(f"[指标服务] 执行插入失败: {str(e)}", exc_info=True)
+            # ⚠️ 不再返回失败字典，直接抛出异常由主流程统一回滚
+            raise

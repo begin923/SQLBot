@@ -11,6 +11,7 @@ from apps.extend.metrics2.utils.id_generator import IdGenerator
 from apps.extend.metrics2.utils.batch_query import BatchQueryHelper
 from apps.extend.metrics2.utils.sql_generator import SqlGenerator
 from apps.extend.metrics2.utils.timezone_helper import get_now_utc8
+from apps.extend.metrics2.utils.lineage_cache import LineageCache  # ⚠️ 新增缓存
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +35,14 @@ class LineageService:
             session: 数据库会话
         """
         self.session = session
+        # ⚠️ 使用全局缓存（单例模式）
+        self.cache = LineageCache()
+        
         # ⚠️ 使用 IdGenerator 替代手动计数器
         self.table_lineage_id_gen = IdGenerator(session, 'table_lineage', 'T')
         self.field_lineage_id_gen = IdGenerator(session, 'field_lineage', 'F')
+        
+        logger.info("[LineageService] 实例已创建（使用全局缓存）")
     
     def process(self, processed_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -66,14 +72,14 @@ class LineageService:
             
             # 校验数据完整性
             if not table_data['table_lineage']:
-                error_msg = "❌ DWD 层未生成任何 table_lineage 数据"
+                error_msg = "❌ WIDE 层（宽表/明细层）未生成任何 table_lineage 数据"
                 logger.error(error_msg)
-                return {'success': False, 'message': error_msg}
+                raise ValueError(error_msg)  # ⚠️ 抛出异常
             
             if not table_data['field_lineage']:
-                error_msg = "❌ DWD 层未生成任何 field_lineage 数据"
+                error_msg = "❌ WIDE 层（宽表/明细层）未生成任何 field_lineage 数据"
                 logger.error(error_msg)
-                return {'success': False, 'message': error_msg}
+                raise ValueError(error_msg)  # ⚠️ 抛出异常
             
             # 执行数据库插入
             execution_result = self._execute_insert(table_data)
@@ -82,19 +88,15 @@ class LineageService:
             
             return {
                 'success': True,
-                'message': f"DWD层处理成功，写入 {len(table_data['table_lineage'])} 条表血缘, {len(table_data['field_lineage'])} 条字段血缘",
+                'message': f"WIDE层处理成功，写入 {len(table_data['table_lineage'])} 条表血缘, {len(table_data['field_lineage'])} 条字段血缘",
                 'table_stats': execution_result.get('table_stats', {})
             }
             
+        except ValueError:
+            # ⚠️ 业务逻辑错误，直接向上抛出
+            raise
         except Exception as e:
-            # ⚠️ 确保异常时回滚事务，避免 PendingRollbackError
-            try:
-                self.session.rollback()
-                logger.warning("[血缘服务] 已回滚事务")
-            except Exception as rollback_error:
-                logger.error(f"[血缘服务] 回滚事务失败: {str(rollback_error)}")
-            
-            # ⚠️ 简化错误信息，不打印完整SQL
+            # ⚠️ 不再回滚，由主流程统一处理
             error_type = type(e).__name__
             if 'StringDataRightTruncation' in str(e):
                 error_msg = f"[血缘服务] 处理失败: 字段长度超限 (VARCHAR(500))"
@@ -105,8 +107,8 @@ class LineageService:
             else:
                 error_msg = f"[血缘服务] 处理失败: {error_type}"
             
-            logger.error(error_msg)  # ⚠️ 不使用 exc_info，避免打印完整SQL
-            return {'success': False, 'message': error_msg}
+            logger.error(error_msg)
+            raise  # ⚠️ 重新抛出异常
     
     def collect_lineage(self, processed_result: Dict[str, Any], table_data: Dict[str, List]):
         """
@@ -187,11 +189,23 @@ class LineageService:
             if tgt_table:
                 all_target_tables.append(tgt_table)
         
-        # ⚠️ 第三步：批量查询已有记录（使用工具类）
-        existing_table_lineage = BatchQueryHelper.query_existing_table_lineage(
-            self.session, all_source_tables, all_target_tables
-        )
-        logger.debug(f"[血缘服务] 数据库中已存在 {len(existing_table_lineage)} 条表血缘记录")
+        # ⚠️ 第三步：批量查询已有记录（优先使用缓存）
+        if self.cache.is_loaded:
+            # 从缓存中获取
+            existing_table_lineage = {}
+            for src_tbl in set(all_source_tables):
+                for tgt_tbl in set(all_target_tables):
+                    lineage_id = self.cache.get_table_lineage_id(src_tbl, tgt_tbl)
+                    if lineage_id:
+                        existing_table_lineage[(src_tbl, tgt_tbl)] = lineage_id
+            
+            logger.debug(f"[血缘服务] 从缓存中命中 {len(existing_table_lineage)} 条表血缘记录")
+        else:
+            # 降级到数据库查询
+            existing_table_lineage = BatchQueryHelper.query_existing_table_lineage(
+                self.session, all_source_tables, all_target_tables
+            )
+            logger.debug(f"[血缘服务] 数据库中已存在 {len(existing_table_lineage)} 条表血缘记录")
         
         # ⚠️ 第四步：为所有表对生成或复用 lineage_id（包括已存在的）
         new_count = 0
@@ -353,7 +367,7 @@ class LineageService:
         logger.info(f"[血缘服务] 字段血缘数据规范化完成: {len(normalized_field_lineage)} 条")
         return normalized_field_lineage
     
-    def _collect_field_lineage(self, parsed_data: Dict[str, Any], target_table: str, table_data: Dict[str, List], now=None):
+    def _collect_field_lineage(self, parsed_data: Dict[str, Any], target_table: str, table_data: Dict[str, List]):
         """
         收集字段级血缘数据
         
@@ -361,7 +375,6 @@ class LineageService:
             parsed_data: AI 解析后的数据
             target_table: 目标表名
             table_data: 表数据收集字典
-            now: 当前时间（UTC+8）
         """
         ai_field_lineage = parsed_data.get('field_lineage', [])
         logger.info(f"[血缘服务] AI 输出 field_lineage 数量: {len(ai_field_lineage)}")
@@ -407,21 +420,8 @@ class LineageService:
                     logger.debug(f"[血缘服务]   ✅ 找到匹配: {source_table} -> {tgt_table} (ID: {table_lineage_id})")
                     break
                     
-            # ⚠️ 只跳过“找不到表血缘”的情况
+            # ⚠️ 只跳过"找不到表血缘"的情况
             if not table_lineage_id:
-                # ⚠️ 记录失败的数据（不添加到 table_data['field_lineage']）
-                if 'failed_table_lineage' not in table_data:
-                    table_data['failed_table_lineage'] = []
-                table_data['failed_table_lineage'].append({
-                    'reason': '未找到表血缘',
-                    'source_table': source_table,
-                    'source_field': source_field,
-                    'target_table': tgt_table,
-                    'target_field': target_field,
-                    'target_field_mark': target_field_mark,
-                    'dim_id': dim_id,
-                    'formula': formula
-                })
                 continue  # ⚠️ 跳过这条记录
         
             # 构建业务唯一键（包含 table_lineage_id）
@@ -429,8 +429,8 @@ class LineageService:
                     
             # ⚠️ 检查是否在当前批次中已经处理过
             if business_key_with_tl in seen_business_keys:
-                logger.warning(f"[血缘服务] ⚠️ 当前批次中发现重复字段血缘: {business_key_with_tl}")
                 continue
+
             seen_business_keys.add(business_key_with_tl)
                     
             # 检查数据库中是否已存在
@@ -457,22 +457,11 @@ class LineageService:
                 'target_field_mark': target_field_mark,  # ⚠️ 添加 target_field_mark
                 'dim_id': dim_id,  # ⚠️ 添加 dim_id
                 'formula': formula,
-                'create_time': now,
-                'modify_time': now
+                'create_time': get_now_utc8(),  # ⚠️ 直接使用工具函数
+                'modify_time': get_now_utc8()   # ⚠️ 直接使用工具函数
             })
         
         logger.info(f"[血缘服务] field_lineage 收集完成: {len(table_data['field_lineage'])} 条")
-        
-        # ⚠️ 输出失败记录统计
-        if 'failed_table_lineage' in table_data and table_data['failed_table_lineage']:
-            failed_count = len(table_data['failed_table_lineage'])
-            logger.warning(f"[血缘服务] ⚠️ 共有 {failed_count} 条字段血缘因未找到表血缘")
-            for failed in table_data['failed_table_lineage']:
-                logger.warning(
-                    f"[血缘服务-未找到表血缘]   - {failed['source_table']}.{failed['source_field']} -> "
-                    f"{failed['target_table']}.{failed['target_field']} "
-                    f"(target_field_mark: {failed['target_field_mark']}, dim_id: {failed['dim_id']})"
-                )
     
     def _extract_target_table_from_sql(self, sql_content: str) -> str:
         """
@@ -588,6 +577,14 @@ class LineageService:
                     inserted_count = result.rowcount if result.rowcount is not None else len(new_table_lineage)
                     skipped_count = len(new_table_lineage) - inserted_count
                     
+                    # ⚠️ 更新缓存：将新插入的记录添加到缓存
+                    for item in new_table_lineage:
+                        self.cache.add_table_lineage(
+                            item['source_table'],
+                            item['target_table'],
+                            item['id']
+                        )
+                    
                     table_stats['table_lineage'] = inserted_count
                     logger.info(f"[血缘服务] 批量插入 table_lineage: {inserted_count} 条新增, {skipped_count} 条已存在跳过")
             else:
@@ -603,8 +600,8 @@ class LineageService:
                     table_stats['field_lineage'] = len(table_data['field_lineage'])
                     logger.info(f"[血缘服务] 批量插入 field_lineage: {len(table_data['field_lineage'])} 条")
             
-            # 提交事务
-            self.session.commit()
+            # ⚠️ 不再提交事务，由主流程统一提交
+            logger.info("[血缘服务] 数据已准备就绪，等待主流程提交")
             
             return {
                 'success': True,
@@ -612,6 +609,20 @@ class LineageService:
             }
             
         except Exception as e:
-            self.session.rollback()
-            logger.error(f"[血缘服务] 数据库插入失败: {str(e)}", exc_info=True)
+            # ⚠️ 不再回滚，由主流程统一处理
+            error_type = type(e).__name__
+            error_str = str(e)
+            
+            if 'StringDataRightTruncation' in error_str:
+                error_msg = f"[血缘服务] 处理失败: 字段长度超限 (VARCHAR(500))"
+            elif 'UniqueViolation' in error_str or 'CardinalityViolation' in error_str:
+                error_msg = f"[血缘服务] 处理失败: 唯一约束冲突"
+            elif 'PendingRollback' in error_str:
+                error_msg = f"[血缘服务] 处理失败: 事务状态异常"
+            elif 'StatementError' in error_str or 'InvalidRequestError' in error_str:
+                error_msg = f"[血缘服务] 处理失败: SQL参数错误 ({error_type})"
+            else:
+                error_msg = f"[血缘服务] 处理失败: {error_type}"
+            
+            logger.error(error_msg)
             raise

@@ -107,12 +107,13 @@ from apps.extend.metrics2.curd.metric_lineage_curd import (
     get_all_metric_lineage
 )
 
-from apps.extend.metrics2.curd.dim_field_mapping_curd import (
-    create_dim_field_mapping,
-    batch_create_dim_field_mapping,
-    get_dim_field_mapping_by_primary_key,
-    get_dim_field_mapping_by_dim_id,
-    get_dim_field_mapping_by_table,
-    delete_dim_field_mapping,
-    get_all_dim_field_mapping
+from apps.extend.metrics2.curd.dim_field_lineage_curd import (
+    create_dim_field_lineage,
+    batch_create_dim_field_lineage,
+    get_dim_field_lineage_by_id,
+    get_dim_field_lineage_by_db_table_and_field,
+    get_dim_field_lineage_by_dim_id,
+    get_dim_field_lineage_by_table,
+    delete_dim_field_lineage,
+    get_all_dim_field_lineage
 )

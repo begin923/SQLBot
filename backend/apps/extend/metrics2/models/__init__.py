@@ -50,9 +50,9 @@ from apps.extend.metrics2.models.metric_lineage_model import (
     MetricLineageInfo
 )
 
-from apps.extend.metrics2.models.dim_field_mapping_model import (
-    DimFieldMapping,
-    DimFieldMappingInfo
+from apps.extend.metrics2.models.dim_field_lineage_model import (
+    DimFieldLineage,
+    DimFieldLineageInfo
 )
 
 __all__ = [
@@ -70,5 +70,5 @@ __all__ = [
     'TableLineage', 'TableLineageInfo',
     'FieldLineage', 'FieldLineageInfo',
     'MetricLineage', 'MetricLineageInfo',
-    'DimFieldMapping', 'DimFieldMappingInfo',
+    'DimFieldLineage', 'DimFieldLineageInfo',
 ]

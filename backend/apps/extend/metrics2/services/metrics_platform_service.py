@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from apps.extend.metrics2.services.dim_service import DimService
 from apps.extend.metrics2.services.lineage_service import LineageService
 from apps.extend.metrics2.services.metrics_service import MetricsService
+from apps.extend.metrics2.services.exception_service import ExceptionService  # ⚠️ 重命名
 from apps.extend.utils.utils import ModelClient
 
 # 配置日志
@@ -26,9 +27,18 @@ class MetricsPlatformService:
         """
         self.session = session
         self.model_client = ModelClient()
-        self.dim_service = DimService(session)  # 新增领域服务
-        self.lineage_service = LineageService(session)  # 新增领域服务
-        self.metrics_service = MetricsService(session)  # 新增领域服务
+        
+        # ⚠️ 先创建 LineageService（共享实例）
+        self.lineage_service = LineageService(session)
+        
+        # ⚠️ 将 LineageService 实例传递给 MetricsService，实现缓存共享
+        self.dim_service = DimService(session)
+        self.metrics_service = MetricsService(session, lineage_service=self.lineage_service)
+        
+        # ⚠️ 创建异常服务（统一管理异常处理）
+        self.exception_service = ExceptionService(session)
+        
+        logger.info("[MetricsPlatformService] 初始化完成 - LineageService 已共享给 MetricsService")
         
 
     def process_metrics_from_sql(self, input_path: Union[str, Path], is_directory: bool = False, layer_type: str = "AUTO") -> Dict[str, Any]:
@@ -39,8 +49,10 @@ class MetricsPlatformService:
             input_path: 输入路径（文件路径或目录路径）
             is_directory: 是否为目录模式
             layer_type: 数仓层级类型
-                - "DIM": 维度定义层（只提取维度，写入 dim_dict）
-                - "METRIC": 指标层（dwd/dws/ads，提取指标并引用已有维度）
+                - "DIM": 维度定义层（只提取维度，写入 dim_definition/dim_field_mapping）
+                - "DWD": 明细数据层（直接走 LineageService，提取表血缘和字段血缘）
+                - "DWS": 汇总数据层（根据是否有 GROUP BY 决定走 MetricsService 还是 LineageService）
+                - "ADS": 应用数据层（根据是否有 GROUP BY 决定走 MetricsService 还是 LineageService）
                 - "AUTO": 自动识别（默认，根据文件路径判断）
 
         Returns:
@@ -60,13 +72,28 @@ class MetricsPlatformService:
                 layer_type = self._auto_detect_layer_type(input_path)
                 logger.info(f"[流程开始] 自动识别层级类型: {layer_type}")
             
+            # ⚠️ 0.5 自动识别层级类型（如果未指定）
+            if layer_type == "AUTO":
+                layer_type = self._auto_detect_layer_type(input_path)
+                logger.info(f"[流程开始] 自动识别层级类型: {layer_type}")
+            
+            # ⚠️ 0.6 DWS/ADS 层自动分流逻辑：根据是否有 GROUP BY 决定走 METRIC 还是 WIDE 流程
+            processing_flow = None
+            if layer_type in ["DWS", "ADS"]:
+                processing_flow = self._determine_processing_flow(input_path, is_directory)
+                logger.info(f"[{layer_type} 分流] 检测到 {'有' if processing_flow == 'METRIC' else '无'} GROUP BY，使用 {processing_flow} 流程")
+            
             # 1. 读取并处理SQL文件
             file_result = self._read_and_process_sql_files(input_path, is_directory)
             if not file_result.get('success', False):
                 return file_result
 
-            # ⚠️ 1.5 SELECT * 预检查（在调用 AI 之前）
-            if layer_type in ["DIM", "DWD"]:
+            # ⚠️ 1.5 SELECT * 预检查（在调用 AI 之前，针对 DIM 层和 DWD 层）
+            should_check_select_star = (layer_type == "DIM") or (
+                layer_type == "DWD"
+            )
+            
+            if should_check_select_star:
                 for file_data in file_result.get('results', []):
                     if file_data.get('success', False):
                         sql_content = file_data.get('sql_content', '')
@@ -78,13 +105,13 @@ class MetricsPlatformService:
                                 error_msg = (
                                     f"❌ SQL 中存在 SELECT * 或通配符（{select_star_check['matched_pattern']}），无法准确解析字段。\n"
                                     f"   文件：{file_path}\n"
-                                    f"   原因：DIM/DWD 层需要精确的字段信息，必须将所有通配符展开为明确的字段列表\n"
+                                    f"   原因：{'DIM' if layer_type == 'DIM' else 'DWD'} 层需要精确的字段信息，必须将所有通配符展开为明确的字段列表\n"
                                     f"   建议：修改 SQL，将 {select_star_check['matched_pattern']} 替换为具体的字段名"
                                 )
                                 logger.error(error_msg)
                                 
-                                # 记录失败日志
-                                self._log_parse_failure(
+                                # ⚠️ 记录失败日志（使用 ExceptionService）
+                                self.exception_service.log_parse_failure(
                                     file_path=file_path,
                                     failure_reason=error_msg,
                                     layer_type=layer_type,
@@ -100,46 +127,15 @@ class MetricsPlatformService:
                                     "input_path": str(input_path)
                                 }
                 
-                logger.info(f"[预检查] ✅ {layer_type} 层 SELECT * 校验通过")
+                check_target = "DIM 层" if layer_type == "DIM" else "DWD 层"
+                logger.info(f"[预检查] ✅ {check_target} SELECT * 校验通过")
 
-            # ⚠️ 1.6 DWS/ADS 层严格校验：检查是否有 GROUP BY（在调用 AI 之前）
-            if layer_type == "METRIC":
-                for file_data in file_result.get('results', []):
-                    if file_data.get('success', False):
-                        sql_content = file_data.get('sql_content', '')
-                        file_path = file_data.get('file_path', '')
-                        
-                        if sql_content:
-                            has_group_by = self._check_has_group_by(sql_content)
-                            if not has_group_by:
-                                error_msg = (
-                                    f"❌ DWS/ADS 层 ETL 脚本必须包含 GROUP BY 子句！\n"
-                                    f"   文件：{file_path}\n"
-                                    f"   原因：DWS/ADS 层是聚合层，必须通过 GROUP BY 进行数据聚合\n"
-                                    f"   建议：检查 SQL 是否缺少 GROUP BY，或者该脚本应该属于 DWD 明细层"
-                                )
-                                logger.error(error_msg)
-                                
-                                # 记录失败日志
-                                self._log_parse_failure(
-                                    file_path=file_path,
-                                    failure_reason=error_msg,
-                                    layer_type=layer_type,
-                                    error_type="MISSING_GROUP_BY",
-                                    sql_content=sql_content
-                                )
-                                
-                                return {
-                                    "success": False,
-                                    "message": error_msg,
-                                    "needs_sql_improvement": True,
-                                    "input_path": str(input_path)
-                                }
-                
-                logger.info(f"[预检查] ✅ METRIC 层 GROUP BY 校验通过")
+            # ⚠️ 1.6 移除原有的 GROUP BY 校验逻辑（已在 0.6 步处理）
 
             # 2. 解析SQL内容（传递层级类型）
-            parsed_results = self._parse_sql_files(file_result.get('results', []), layer_type)
+            # ⚠️ 对于 DWS/ADS 层，AI 解析时使用实际的 processing_flow（METRIC 或 WIDE）
+            ai_layer_type = processing_flow if layer_type in ["DWS", "ADS"] else layer_type
+            parsed_results = self._parse_sql_files(file_result.get('results', []), ai_layer_type)
             if not parsed_results or not any(r.get('success', False) for r in parsed_results):
                 return {"success": False, "message": "SQL解析失败或未解析到有效数据"}
 
@@ -156,76 +152,98 @@ class MetricsPlatformService:
                 if layer_type == "DIM":
                     logger.info("[流程] DIM 层：使用 DimService 处理")
                     dim_result = self.dim_service.process(parsed_results)
-                    if not dim_result.get('success', False):
-                        # ⚠️ 记录失败日志
-                        self._log_service_failure(
-                            parsed_results=parsed_results,
-                            service_name="DimService",
-                            error_message=dim_result.get('message', '未知错误'),
-                            layer_type=layer_type
-                        )
-                        return dim_result
                     
                     execution_result, insert_sqls, validation_result = self._build_execution_result(
                         dim_result, 'DIM层处理成功', 'DIM层跳过SQL校验'
                     )
                     table_stats = dim_result.get('table_stats', {})
                     
+                    # ⚠️ 验证DIM层解析完整性
+                    validation_msg = self._validate_parse_completeness(
+                        parsed_results=parsed_results,
+                        execution_result=dim_result,
+                        layer_type="DIM"
+                    )
+                    if validation_msg:
+                        logger.warning(f"[完整性校验] DIM层: {validation_msg}")
+                        # 注意：这里只记录警告，不中断流程
+                    
                 elif layer_type == "DWD":
                     logger.info("[流程] DWD 层：使用 LineageService 处理")
                     lineage_result = self.lineage_service.process(parsed_results)
-                    if not lineage_result.get('success', False):
-                        # ⚠️ 记录失败日志
-                        self._log_service_failure(
-                            parsed_results=parsed_results,
-                            service_name="LineageService",
-                            error_message=lineage_result.get('message', '未知错误'),
-                            layer_type=layer_type
-                        )
-                        return lineage_result
                     
                     execution_result, insert_sqls, validation_result = self._build_execution_result(
                         lineage_result, 'DWD层处理成功', 'DWD层跳过SQL校验'
                     )
                     table_stats = lineage_result.get('table_stats', {})
                     
-                elif layer_type == "METRIC":
-                    logger.info("[流程] METRIC 层：使用 MetricsService 处理")
-                    metrics_result = self.metrics_service.process(parsed_results)
-                    if not metrics_result.get('success', False):
-                        # ⚠️ 记录失败日志
-                        self._log_service_failure(
-                            parsed_results=parsed_results,
-                            service_name="MetricsService",
-                            error_message=metrics_result.get('message', '未知错误'),
-                            layer_type=layer_type
-                        )
-                        return metrics_result
-                    
-                    execution_result, insert_sqls, validation_result = self._build_execution_result(
-                        metrics_result, 'METRIC层处理成功', 'METRIC层跳过SQL校验'
+                    # ⚠️ 验证DWD层解析完整性
+                    validation_msg = self._validate_parse_completeness(
+                        parsed_results=parsed_results,
+                        execution_result=lineage_result,
+                        layer_type="WIDE"
                     )
-                    table_stats = metrics_result.get('table_stats', {})
+                    if validation_msg:
+                        logger.warning(f"[完整性校验] DWD层: {validation_msg}")
+                        # 注意：这里只记录警告，不中断流程
+                    
+                elif layer_type in ["DWS", "ADS"]:
+                    # ⚠️ DWS/ADS 层根据 processing_flow 分流
+                    if processing_flow == "WIDE":
+                        logger.info(f"[{layer_type} 层] 无 GROUP BY，使用 LineageService 处理")
+                        lineage_result = self.lineage_service.process(parsed_results)
+                        
+                        execution_result, insert_sqls, validation_result = self._build_execution_result(
+                            lineage_result, f'{layer_type}层(WIDE流程)处理成功', 'WIDE流程跳过SQL校验'
+                        )
+                        table_stats = lineage_result.get('table_stats', {})
+                        
+                        # ⚠️ 验证WIDE流程解析完整性
+                        validation_msg = self._validate_parse_completeness(
+                            parsed_results=parsed_results,
+                            execution_result=lineage_result,
+                            layer_type="WIDE"
+                        )
+                        if validation_msg:
+                            logger.warning(f"[完整性校验] {layer_type}(WIDE): {validation_msg}")
+                            # 注意：这里只记录警告，不中断流程（因为血缘已成功写入）
+                    else:  # processing_flow == "METRIC"
+                        logger.info(f"[{layer_type} 层] 有 GROUP BY，使用 MetricsService 处理")
+                        metrics_result = self.metrics_service.process(parsed_results)
+                        
+                        execution_result, insert_sqls, validation_result = self._build_execution_result(
+                            metrics_result, f'{layer_type}层(METRIC流程)处理成功', 'METRIC流程跳过SQL校验'
+                        )
+                        table_stats = metrics_result.get('table_stats', {})
+                        
+                        # ⚠️ 验证METRIC流程解析完整性
+                        validation_msg = self._validate_parse_completeness(
+                            parsed_results=parsed_results,
+                            execution_result=metrics_result,
+                            layer_type="METRIC"
+                        )
+                        if validation_msg:
+                            logger.warning(f"[完整性校验] {layer_type}(METRIC): {validation_msg}")
+                            # 注意：这里只记录警告，不中断流程
                 else:
                     # 未知的层级类型
                     error_msg = f"不支持的层级类型: {layer_type}"
                     logger.error(error_msg)
-                    return {
-                        "success": False,
-                        "message": error_msg,
-                        "input_path": str(input_path)
-                    }
+                    raise ValueError(error_msg)  # ⚠️ 抛出异常
+                    
             except Exception as service_error:
                 # ⚠️ 捕获 Service 层的未预期异常（如数据库约束冲突）
-                error_msg = f"{layer_type} 层处理异常: {str(service_error)}"
+                # ⚠️ 对于 DWS/ADS 层，使用 processing_flow；其他层直接使用 layer_type
+                actual_layer = processing_flow if (layer_type in ["DWS", "ADS"] and processing_flow) else layer_type
+                error_msg = f"{actual_layer} 层处理异常: {str(service_error)}"
                 logger.error(f"[流程异常] {error_msg}", exc_info=True)
                 
-                # ⚠️ 记录失败日志
-                self._log_service_failure(
+                # ⚠️ 记录失败日志（使用 ExceptionService）
+                recorded_count = self.exception_service.log_service_failure(
                     parsed_results=parsed_results,
-                    service_name=f"{layer_type}Service",
+                    service_name=f"{actual_layer}Service",
                     error_message=error_msg,
-                    layer_type=layer_type,
+                    layer_type=actual_layer,
                     exception=service_error
                 )
                 
@@ -240,24 +258,29 @@ class MetricsPlatformService:
                     "input_path": str(input_path)
                 }
             
-            # 7. 确保事务已提交
-            if self.session.in_transaction():
-                try:
-                    self.session.commit()
+            # 7. 统一提交事务（由主流程管理）
+            try:
+                self.session.commit()
+                logger.info("[流程结束] ✅ 主流程已提交事务")
+                
+                # ⚠️ 8. 只有处理成功时，才标记相关的失败日志为已解决
+                resolved_count = self.exception_service.mark_failures_as_resolved(file_result.get('results', []))
+                if resolved_count > 0:
+                    logger.info(f"[流程结束] ✅ 已标记 {resolved_count} 条失败记录为已解决")
+                
+                # 输出简洁的流程完成日志（详细统计由各 Service 输出）
+                file_paths_count = len(file_result.get('results', [])) if file_result.get('success') else 0
+                file_name = Path(str(input_path)).name if not is_directory else f"{file_paths_count}个文件"
+                logger.info(f"✅ 流程完成 | {file_name}")
                     
-                    # 输出简洁的流程完成日志（详细统计由各 Service 输出）
-                    file_paths_count = len(file_result.get('results', [])) if file_result.get('success') else 0
-                    file_name = Path(str(input_path)).name if not is_directory else f"{file_paths_count}个文件"
-                    logger.info(f"✅ 流程完成 | {file_name}")
-                    
-                except Exception as commit_error:
-                    logger.error(f"[流程结束] 提交事务失败: {str(commit_error)}")
-                    self.session.rollback()
-                    return {
-                        "success": False,
-                        "message": f"事务提交失败：{str(commit_error)}",
-                        "input_path": str(input_path)
-                    }
+            except Exception as commit_error:
+                logger.error(f"[流程结束] ❌ 提交事务失败: {str(commit_error)}")
+                self.session.rollback()
+                return {
+                    "success": False,
+                    "message": f"事务提交失败：{str(commit_error)}",
+                    "input_path": str(input_path)
+                }
 
             # 8. 返回总体结果
             return {
@@ -318,23 +341,23 @@ class MetricsPlatformService:
             input_path: 文件路径或目录路径
             
         Returns:
-            层级类型："DIM"、"DWD" 或 "METRIC"
-            - DIM: 维度定义层
-            - DWD: 明细层（只提取血缘，不提取指标/维度）
-            - METRIC: 指标层（dws/ads，需要提取指标和维度）
+            层级类型："DIM" / "DWD" / "DWS" / "ADS"
         """
         path_str = str(input_path).lower()
         
-        # 检查路径中是否包含 dim 关键词
-        if '/dim/' in path_str or '\\dim\\' in path_str or path_str.endswith('/dim') or path_str.endswith('\\dim'):
+        # 直接匹配路径中的关键词
+        if '/dim/' in path_str or '\\dim\\' in path_str:
             return "DIM"
-        
-        # 检查路径中是否包含 dwd 关键词（明细层）
-        if '/dwd/' in path_str or '\\dwd\\' in path_str or path_str.endswith('/dwd') or path_str.endswith('\\dwd'):
+        elif '/dwd/' in path_str or '\\dwd\\' in path_str:
             return "DWD"
+        elif '/dws/' in path_str or '\\dws\\' in path_str:
+            return "DWS"
+        elif '/ads/' in path_str or '\\ads\\' in path_str:
+            return "ADS"
         
-        # 其他情况默认为指标层（dws/ads）
-        return "METRIC"
+        # 其他情况默认为 DWD 层
+        logger.warning(f"[自动识别] 无法从路径识别层级: {input_path}，默认为 DWD")
+        return "DWD"
 
     def _check_has_group_by(self, sql_content: str) -> bool:
         """
@@ -434,13 +457,14 @@ class MetricsPlatformService:
                 "input_path": str(input_path)
             }
 
-    def _parse_sql_files(self, file_results: List[Dict[str, Any]], layer_type: str = "METRIC") -> List[Dict[str, Any]]:
+    def _parse_sql_files(self, file_results: List[Dict[str, Any]], layer_type: str = "METRIC", original_detected_layer: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         解析SQL文件内容
 
         Args:
             file_results: 文件处理结果列表
-            layer_type: 数仓层级类型（DIM/DWD/METRIC）
+            layer_type: 数仓层级类型（DIM/WIDE/METRIC）
+            original_detected_layer: 原始检测到的层级（用于修正AI判断错误）
 
         Returns:
             解析结果列表
@@ -462,7 +486,7 @@ class MetricsPlatformService:
                 file_path = file_result.get('file_path', '')
 
                 # 调用大模型解析SQL（传递层级类型）
-                parsed_data = self._parse_sql_with_ai(sql_content, file_path, layer_type)
+                parsed_data = self._parse_sql_with_ai(sql_content, file_path, layer_type, original_detected_layer)
                 logger.debug(f"[大模型SQL生成-解析结果] {parsed_data}")
                 if not parsed_data or not parsed_data.get('success', False):
                     parsed_results.append({
@@ -536,195 +560,7 @@ class MetricsPlatformService:
         # 其他情况放行，交给 AI 解析
         return {'has_select_star': False, 'matched_pattern': ''}
 
-    def _log_parse_failure(
-        self,
-        file_path: str,
-        failure_reason: str,
-        layer_type: Optional[str] = None,
-        error_type: Optional[str] = None,
-        sql_content: Optional[str] = None,
-        matched_pattern: Optional[str] = None
-    ):
-        """
-        记录 SQL 解析失败日志
-        
-        Args:
-            file_path: SQL 文件路径
-            failure_reason: 失败原因
-            layer_type: 层级类型
-            error_type: 错误类型
-            sql_content: SQL 内容
-            matched_pattern: 匹配到的模式
-        """
-        try:
-            from apps.extend.metrics2.curd.sql_parse_failure_log_curd import create_failure_log
-            import os
-            
-            file_name = os.path.basename(file_path) if file_path else "unknown.sql"
-            
-            # 截断 SQL 内容（避免过大）
-            if sql_content and len(sql_content) > 5000:
-                sql_content = sql_content[:5000] + "... [truncated]"
-            
-            create_failure_log(
-                session=self.session,
-                file_path=file_path,
-                file_name=file_name,
-                failure_reason=failure_reason,
-                layer_type=layer_type,
-                error_type=error_type,
-                sql_content=sql_content,
-                matched_pattern=matched_pattern
-            )
-            
-            logger.info(f"[失败日志] 已记录: {file_name} - {error_type}")
-            
-        except Exception as e:
-            # 日志记录失败不应影响主流程
-            logger.error(f"[失败日志] 记录失败: {str(e)}")
-
-    def _log_service_failure(
-        self,
-        parsed_results: List[Dict[str, Any]],
-        service_name: str,
-        error_message: str,
-        layer_type: str,
-        exception: Optional[Exception] = None
-    ):
-        """
-        记录 Service 层处理失败日志（简洁版）
-        
-        Args:
-            parsed_results: 解析结果列表
-            service_name: Service 名称
-            error_message: 错误消息
-            layer_type: 层级类型
-            exception: 异常对象（可选）
-        """
-        try:
-            import os
-            from apps.extend.metrics2.curd.sql_parse_failure_log_curd import create_failure_log
-            
-            # 从 parsed_results 中提取文件信息
-            for result in parsed_results:
-                if not result.get('success', False):
-                    continue
-                
-                file_path = result.get('file_path', '')
-                file_name = os.path.basename(file_path) if file_path else "unknown.sql"
-                
-                # ⚠️ 不获取 SQL 内容，避免占用资源
-                sql_content = None
-                
-                # ⚠️ 构建简洁的错误信息
-                detailed_error = f"[{service_name}] {error_message}"
-                
-                # 如果是数据库异常，提取关键信息
-                if exception:
-                    exc_type = type(exception).__name__
-                    exc_msg = str(exception)
-                    
-                    # 提取关键错误信息（去除完整 SQL）
-                    if 'StringDataRightTruncation' in exc_msg:
-                        # 字符串截断错误
-                        detailed_error += f"\n异常类型: {exc_type}"
-                        detailed_error += f"\n原因: 字段值超过数据库定义长度"
-                        # 尝试提取表名和字段信息
-                        if 'INSERT INTO' in exc_msg:
-                            table_match = re.search(r'INSERT INTO (\w+)', exc_msg)
-                            if table_match:
-                                detailed_error += f"\n异常表: {table_match.group(1)}"
-                    elif 'CardinalityViolation' in exc_msg:
-                        # ON CONFLICT 冲突
-                        detailed_error += f"\n异常类型: {exc_type}"
-                        detailed_error += f"\n原因: 批量插入数据中存在重复的冲突键值"
-                    else:
-                        # 其他异常，只显示前200字符
-                        detailed_error += f"\n异常类型: {exc_type}"
-                        detailed_error += f"\n异常详情: {exc_msg[:200]}..."
-                
-                # ⚠️ 确定错误类型（细化分类）
-                error_type = "SERVICE_ERROR"  # 默认
-                
-                if exception:
-                    exc_type = type(exception).__name__
-                    exc_msg = str(exception)
-                    
-                    # 1. 数据库唯一约束冲突
-                    if 'UniqueViolation' in exc_msg or 'CardinalityViolation' in exc_msg:
-                        error_type = "DB_UNIQUE_VIOLATION"
-                    # 2. 数据库字段长度超限
-                    elif 'StringDataRightTruncation' in exc_msg:
-                        error_type = "DB_FIELD_LENGTH_EXCEEDED"
-                    # 3. 其他数据库异常
-                    elif 'psycopg2' in exc_msg or 'sqlalchemy' in exc_msg.lower():
-                        error_type = "DB_ERROR"
-                    # 4. 其他异常
-                    else:
-                        error_type = f"SERVICE_{exc_type.upper()}"
-                else:
-                    # 没有异常对象，根据错误消息判断
-                    if '未生成任何 dim_definition' in error_message:
-                        error_type = "DIM_AI_PARSE_FAILED"
-                    elif '未生成任何 table_lineage' in error_message:
-                        error_type = "LINEAGE_TABLE_NOT_FOUND"
-                    elif '未生成任何 field_lineage' in error_message:
-                        error_type = "LINEAGE_FIELD_NOT_FOUND"
-                
-                create_failure_log(
-                    session=self.session,
-                    file_path=file_path,
-                    file_name=file_name,
-                    failure_reason=detailed_error,
-                    layer_type=layer_type,
-                    error_type=error_type,
-                    sql_content=sql_content  # ⚠️ 不存储 SQL 内容
-                )
-                
-                logger.info(f"[失败日志] 已记录 Service 失败: {file_name} - {error_type}")
-                
-        except Exception as e:
-            # 日志记录失败不应影响主流程
-            logger.error(f"[失败日志] 记录 Service 失败日志时出错: {str(e)}")
-
-    def _handle_parse_error(
-        self,
-        sql_file: str,
-        error_msg: str,
-        layer_type: str,
-        error_type: str,
-        sql_content: Optional[str] = None,
-        matched_pattern: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        统一处理解析错误（记录日志并返回错误结果）
-        
-        Args:
-            sql_file: SQL 文件路径
-            error_msg: 错误消息
-            layer_type: 层级类型
-            error_type: 错误类型
-            sql_content: SQL 内容
-            matched_pattern: 匹配到的模式
-            
-        Returns:
-            错误结果字典
-        """
-        logger.error(f"[AI解析] {error_msg}")
-        
-        # 记录失败日志
-        self._log_parse_failure(
-            file_path=sql_file,
-            failure_reason=error_msg,
-            layer_type=layer_type,
-            error_type=error_type,
-            sql_content=sql_content,
-            matched_pattern=matched_pattern
-        )
-        
-        return {"success": False, "message": error_msg}
-
-    def _parse_sql_with_ai(self, sql_content: str, sql_file: str = "", layer_type: str = "METRIC") -> Dict[str, Any]:
+    def _parse_sql_with_ai(self, sql_content: str, sql_file: str = "", layer_type: str = "METRIC", original_detected_layer: Optional[str] = None) -> Dict[str, Any]:
         """
         使用大模型解析SQL内容
 
@@ -732,11 +568,15 @@ class MetricsPlatformService:
             sql_content: SQL内容
             sql_file: SQL文件名（可选）
             layer_type: 数仓层级类型（DIM/DWD/METRIC）
+            original_detected_layer: 原始检测到的层级（用于修正AI判断错误）
 
         Returns:
             解析结果字典
         """
         try:
+            # ⚠️ 记录调用的提示词模板和层级类型
+            logger.info(f"[AI解析] 调用提示词模板: sql_analysis, layer_type={layer_type}, original_detected_layer={original_detected_layer}")
+            
             # 调用大模型解析SQL（传递层级类型）
             result = self.model_client.call_ai(
                 template_name="sql_analysis",
@@ -750,7 +590,8 @@ class MetricsPlatformService:
                 logger.error(f"[AI解析] {error_msg}")
                 logger.error(f"[AI解析] 文件: {sql_file}")
                 logger.error(f"[AI解析] SQL 内容前200字符: {sql_content[:200]}")
-                return self._handle_parse_error(
+                # ⚠️ 使用 ExceptionService 处理错误
+                return self.exception_service.handle_parse_error(
                     sql_file=sql_file,
                     error_msg=error_msg,
                     layer_type=layer_type,
@@ -765,13 +606,13 @@ class MetricsPlatformService:
             # 解析大模型返回的JSON
             try:
                 parsed_json = json.loads(result)
+                print(f"[AI解析] 解析结果: {parsed_json}")
             except json.JSONDecodeError as e:
                 error_msg = f"JSON解析失败：{str(e)}"
                 logger.error(error_msg)
                 logger.error(f"[AI解析] 文件: {sql_file}")
-                logger.error(f"[AI解析] AI 返回完整内容:\n{result}")
-                logger.error(f"[AI解析] SQL 内容前200字符: {sql_content[:200]}")
-                return self._handle_parse_error(
+                # ⚠️ 使用 ExceptionService 处理错误
+                return self.exception_service.handle_parse_error(
                     sql_file=sql_file,
                     error_msg=error_msg,
                     layer_type=layer_type,
@@ -785,6 +626,41 @@ class MetricsPlatformService:
             parsed_json['basic_info']['file_name'] = sql_file
             logger.debug(f"[AI解析] 设置 file_name: {sql_file}")
 
+            # ⚠️ 强制修正 warehouse_layer（不再使用 original_detected_layer）
+            # 根据当前流程设置合理的默认值
+            ai_layer = parsed_json.get('basic_info', {}).get('warehouse_layer', '').lower()
+            if layer_type == "WIDE":
+                # WIDE 流程（宽表/明细层），保持原始数仓层级（dwd/dws/ads）
+                # 如果 AI 没有正确识别，则从文件路径推断
+                if ai_layer not in ['dwd', 'dws', 'ads']:
+                    # 尝试从文件路径推断
+                    file_path_lower = sql_file.lower()
+                    if '/dwd/' in file_path_lower or '\\dwd\\' in file_path_lower:
+                        parsed_json['basic_info']['warehouse_layer'] = 'dwd'
+                        logger.info(f"[AI解析] 从路径推断 warehouse_layer 为 dwd")
+                    elif '/dws/' in file_path_lower or '\\dws\\' in file_path_lower:
+                        parsed_json['basic_info']['warehouse_layer'] = 'dws'
+                        logger.info(f"[AI解析] 从路径推断 warehouse_layer 为 dws")
+                    elif '/ads/' in file_path_lower or '\\ads\\' in file_path_lower:
+                        parsed_json['basic_info']['warehouse_layer'] = 'ads'
+                        logger.info(f"[AI解析] 从路径推断 warehouse_layer 为 ads")
+                    else:
+                        parsed_json['basic_info']['warehouse_layer'] = 'dwd'  # 默认
+                        logger.info(f"[AI解析] 默认设置 warehouse_layer 为 dwd")
+                else:
+                    logger.info(f"[AI解析] 保持AI判断的 warehouse_layer: {ai_layer}")
+            elif layer_type == "METRIC":
+                # METRIC 流程，保持 AI 的判断（dws 或 ads）
+                if ai_layer not in ['dws', 'ads']:
+                    parsed_json['basic_info']['warehouse_layer'] = 'dws'
+                    logger.info(f"[AI解析] 默认设置 warehouse_layer 为 dws (METRIC流程)")
+                else:
+                    logger.info(f"[AI解析] 保持AI判断的 warehouse_layer: {ai_layer}")
+            elif layer_type == "DIM":
+                # DIM 流程，设置为 dim
+                parsed_json['basic_info']['warehouse_layer'] = 'dim'
+                logger.info(f"[AI解析] 设置 warehouse_layer 为 dim (DIM流程)")
+
             # ⚠️ 保存原始 SQL 内容用于后续校验
             if 'basic_info' in parsed_json:
                 parsed_json['basic_info']['sql_content'] = sql_content
@@ -796,7 +672,8 @@ class MetricsPlatformService:
             }
 
         except json.JSONDecodeError as e:
-            return self._handle_parse_error(
+            # ⚠️ 使用 ExceptionService 处理错误
+            return self.exception_service.handle_parse_error(
                 sql_file=sql_file,
                 error_msg=f"JSON解析失败：{str(e)}",
                 layer_type=layer_type,
@@ -804,7 +681,8 @@ class MetricsPlatformService:
                 sql_content=sql_content
             )
         except Exception as e:
-            return self._handle_parse_error(
+            # ⚠️ 使用 ExceptionService 处理错误
+            return self.exception_service.handle_parse_error(
                 sql_file=sql_file,
                 error_msg=f"大模型解析失败：{str(e)}",
                 layer_type=layer_type,
@@ -812,4 +690,124 @@ class MetricsPlatformService:
                 sql_content=sql_content
             )
 
-
+    def _determine_processing_flow(self, input_path: Union[str, Path], is_directory: bool) -> str:
+        """
+        根据 SQL 内容确定处理流程（仅用于 DWS/ADS 层）
+        
+        规则：
+        - 有 GROUP BY → METRIC 流程（指标层，走 MetricsService）
+        - 无 GROUP BY → WIDE 流程（宽表/明细层血缘提取，走 LineageService）
+        
+        ⚠️ 注意：此方法只被 DWS/ADS 层调用，DWD 层直接走 LineageService
+        
+        Args:
+            input_path: 输入路径（文件路径或目录路径）
+            is_directory: 是否为目录模式
+            
+        Returns:
+            处理流程类型："METRIC" 或 "WIDE"
+        """
+        try:
+            # 获取SQL文件列表
+            path = Path(input_path)
+            sql_files = []
+            
+            if is_directory:
+                sql_files = list(path.glob("*.sql"))
+            else:
+                if path.suffix.lower() == '.sql':
+                    sql_files = [path]
+            
+            if not sql_files:
+                logger.warning(f"[流程判断] 未找到 SQL 文件，默认使用 METRIC 流程")
+                return "METRIC"
+            
+            # 检查每个SQL文件是否有 GROUP BY
+            has_group_by = False
+            for sql_file in sql_files:
+                try:
+                    with open(sql_file, 'r', encoding='utf-8') as f:
+                        sql_content = f.read()
+                    
+                    if self._check_has_group_by(sql_content):
+                        has_group_by = True
+                        logger.info(f"[流程判断] 文件 {sql_file.name} 包含 GROUP BY，使用 METRIC 流程")
+                        break
+                except Exception as e:
+                    logger.warning(f"[流程判断] 读取文件 {sql_file} 失败: {e}")
+                    continue
+            
+            # 根据是否有 GROUP BY 决定流程
+            if has_group_by:
+                return "METRIC"
+            else:
+                logger.info(f"[流程判断] 所有文件均无 GROUP BY，使用 WIDE 流程（宽表/明细层）")
+                return "WIDE"
+            
+        except Exception as e:
+            logger.warning(f"[流程判断] 检查失败: {e}，默认使用 METRIC 流程")
+            return "METRIC"
+    
+    def _validate_parse_completeness(
+        self,
+        parsed_results: List[Dict[str, Any]],
+        execution_result: Dict[str, Any],
+        layer_type: str
+    ) -> Optional[str]:
+        """
+        验证解析结果的完整性
+        
+        Args:
+            parsed_results: 解析结果列表
+            execution_result: 执行结果（包含table_stats）
+            layer_type: 层级类型
+            
+        Returns:
+            如果有问题返回警告消息，否则返回None
+        """
+        issues = []
+        
+        if not parsed_results:
+            return "没有解析结果"
+        
+        first_result = parsed_results[0]
+        if not first_result.get('success', False):
+            return "解析本身失败"
+        
+        parsed_data = first_result.get('parsed_data', {})
+        
+        # 根据不同层级设置不同的期望
+        if layer_type == "WIDE":
+            # WIDE层（宽表/明细层）应该有表血缘和字段血缘
+            table_stats = execution_result.get('table_stats', {})
+            
+            # ⚠️ 优先检查表血缘
+            table_lineage_count = table_stats.get('table_lineage', 0)
+            if table_lineage_count == 0:
+                issues.append("WIDE层未提取到任何表血缘")
+            
+            field_lineage_count = table_stats.get('field_lineage', 0)
+            if field_lineage_count == 0:
+                issues.append("WIDE层未提取到任何字段血缘")
+            
+            # 检查是否有基本的表信息
+            basic_info = parsed_data.get('basic_info', {})
+            if not basic_info.get('target_table'):
+                issues.append("未识别到目标表")
+        
+        elif layer_type == "METRIC":
+            # METRIC层应该有指标定义
+            metric_definitions = parsed_data.get('metric_definition', [])  # ⚠️ 修正：使用单数形式
+            if len(metric_definitions) == 0:
+                issues.append("指标层未生成任何指标定义")
+        
+        elif layer_type == "DIM":
+            # DIM层应该有维度定义
+            dim_definitions = parsed_data.get('dim_definition', [])  # ⚠️ 修正：使用单数形式
+            if len(dim_definitions) == 0:
+                issues.append("DIM层未生成任何维度定义")
+        
+        if issues:
+            return "; ".join(issues)
+        
+        return None
