@@ -151,7 +151,8 @@ class MetricsPlatformService:
             try:
                 if layer_type == "DIM":
                     logger.info("[流程] DIM 层：使用 DimService 处理")
-                    dim_result = self.dim_service.process(parsed_results)
+                    # ⚠️ 传递 layer_type 给 DimService，用于统一推断 source_level
+                    dim_result = self.dim_service.process(parsed_results, layer_type=layer_type)
                     
                     execution_result, insert_sqls, validation_result = self._build_execution_result(
                         dim_result, 'DIM层处理成功', 'DIM层跳过SQL校验'
@@ -170,7 +171,8 @@ class MetricsPlatformService:
                     
                 elif layer_type == "DWD":
                     logger.info("[流程] DWD 层：使用 LineageService 处理")
-                    lineage_result = self.lineage_service.process(parsed_results)
+                    # ⚠️ 传递 layer_type 给 LineageService，用于统一推断 source_level
+                    lineage_result = self.lineage_service.process(parsed_results, layer_type=layer_type)
                     
                     execution_result, insert_sqls, validation_result = self._build_execution_result(
                         lineage_result, 'DWD层处理成功', 'DWD层跳过SQL校验'
@@ -191,7 +193,8 @@ class MetricsPlatformService:
                     # ⚠️ DWS/ADS 层根据 processing_flow 分流
                     if processing_flow == "WIDE":
                         logger.info(f"[{layer_type} 层] 无 GROUP BY，使用 LineageService 处理")
-                        lineage_result = self.lineage_service.process(parsed_results)
+                        # ⚠️ 传递 layer_type 给 LineageService，用于统一推断 source_level
+                        lineage_result = self.lineage_service.process(parsed_results, layer_type=layer_type)
                         
                         execution_result, insert_sqls, validation_result = self._build_execution_result(
                             lineage_result, f'{layer_type}层(WIDE流程)处理成功', 'WIDE流程跳过SQL校验'
@@ -209,7 +212,8 @@ class MetricsPlatformService:
                             # 注意：这里只记录警告，不中断流程（因为血缘已成功写入）
                     else:  # processing_flow == "METRIC"
                         logger.info(f"[{layer_type} 层] 有 GROUP BY，使用 MetricsService 处理")
-                        metrics_result = self.metrics_service.process(parsed_results)
+                        # ⚠️ 传递 layer_type 给 MetricsService，用于统一推断 source_level
+                        metrics_result = self.metrics_service.process(parsed_results, layer_type=layer_type)
                         
                         execution_result, insert_sqls, validation_result = self._build_execution_result(
                             metrics_result, f'{layer_type}层(METRIC流程)处理成功', 'METRIC流程跳过SQL校验'
@@ -268,10 +272,23 @@ class MetricsPlatformService:
                 if resolved_count > 0:
                     logger.info(f"[流程结束] ✅ 已标记 {resolved_count} 条失败记录为已解决")
                 
-                # 输出简洁的流程完成日志（详细统计由各 Service 输出）
+                # ⚠️ 9. 输出详细的表写入统计
                 file_paths_count = len(file_result.get('results', [])) if file_result.get('success') else 0
                 file_name = Path(str(input_path)).name if not is_directory else f"{file_paths_count}个文件"
+                
+                logger.info(f"\n{'='*80}")
                 logger.info(f"✅ 流程完成 | {file_name}")
+                logger.info(f"{'='*80}")
+                
+                if table_stats:
+                    logger.info(f"💾 表写入统计（共 {len(table_stats)} 张表）:")
+                    for table_name, count in sorted(table_stats.items()):
+                        status = "✅" if count > 0 else "⚠️ 无数据"
+                        logger.info(f"   {status} {table_name:<35s}: {count:>4d} 条")
+                else:
+                    logger.warning("⚠️ 未获取到表写入统计信息")
+                
+                logger.info(f"{'='*80}\n")
                     
             except Exception as commit_error:
                 logger.error(f"[流程结束] ❌ 提交事务失败: {str(commit_error)}")

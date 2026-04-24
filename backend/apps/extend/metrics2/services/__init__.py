@@ -9,3 +9,4 @@ from apps.extend.metrics2.services.circular_dependency_service import CircularDe
 from apps.extend.metrics2.services.dim_service import DimService
 from apps.extend.metrics2.services.lineage_service import LineageService
 from apps.extend.metrics2.services.metrics_service import MetricsService
+from apps.extend.metrics2.services.table_metadata_service import TableMetadataService

@@ -35,13 +35,15 @@ class IdGenerator:
     def _load_max_id(self) -> int:
         """
         从数据库加载当前最大ID值
+        ⚠️ 从右往左截取6位数字，兼容任意前缀长度
 
         Returns:
             最大ID值，如果查询失败则返回0
         """
         try:
+            # ⚠️ 使用 RIGHT() 函数从右往左截取6位，兼容任意前缀
             result = self.session.execute(
-                text(f"SELECT MAX(CAST(SUBSTRING(id FROM 2) AS INTEGER)) FROM {self.table_name}")
+                text(f"SELECT MAX(CAST(RIGHT(id, 6) AS INTEGER)) FROM {self.table_name}")
             ).scalar()
             return int(result) if result else 0
         except Exception as e:

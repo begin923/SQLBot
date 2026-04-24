@@ -28,6 +28,10 @@ class MetricsService:
         self.metric_id_gen = IdGenerator(session, 'metric_definition', 'M')  # metric_definition 的主键是 id
         self.map_id_gen = IdGenerator(session, 'metric_source_mapping', 'S')  # ⚠️ metric_source_mapping 的 ID 前缀已改为 S
         
+        # ⚠️ 创建表元数据服务实例
+        from apps.extend.metrics2.services.table_metadata_service import TableMetadataService
+        self.table_metadata_service = TableMetadataService(session)
+        
         # ⚠️ 通过依赖注入获取 LineageService，避免重复创建实例
         if lineage_service is not None:
             self.lineage_service = lineage_service
@@ -37,12 +41,13 @@ class MetricsService:
             self.lineage_service = LineageService(session)
             logger.warning("[指标服务] 未传入 LineageService 实例，创建了新的实例（可能产生缓存隔离）")
     
-    def process(self, processed_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def process(self, processed_results: List[Dict[str, Any]], layer_type: str = "AUTO") -> Dict[str, Any]:
         """
         处理 METRIC 层指标数据
         
         Args:
             processed_results: 规则引擎处理后的结果列表
+            layer_type: 数仓层级类型（DWS/ADS），用于统一推断 source_level
             
         Returns:
             处理结果，包含成功状态、消息和表统计信息
@@ -63,8 +68,7 @@ class MetricsService:
             }
             
             # 遍历所有处理结果，收集指标数据
-            for processed_result in processed_results:
-                self._collect_metric_data(processed_result, table_data)
+            for processed_result in processed_results:                self._collect_metric_data(processed_result, table_data, layer_type)  # ⚠️ 传递 layer_type
             
             # ⚠️ 校验数据完整性（失败时抛出异常）
             validation_result = self._validate_data_integrity(table_data)
@@ -73,6 +77,10 @@ class MetricsService:
             
             # 执行数据库插入（不提交事务，由主流程统一提交）
             execution_result = self._execute_insert(table_data)
+            
+            # ⚠️ 在所有主要数据写入成功后，再处理表元数据
+            if processed_results:
+                self.table_metadata_service.process_table_metadata(processed_results[0], "指标服务", layer_type)  # ⚠️ 传递 layer_type
             
             return {
                 'success': True,
@@ -142,13 +150,14 @@ class MetricsService:
             'message': '数据完整性校验通过'
         }
     
-    def _collect_metric_data(self, processed_result: Dict[str, Any], table_data: Dict[str, List]):
+    def _collect_metric_data(self, processed_result: Dict[str, Any], table_data: Dict[str, List], layer_type: str = "AUTO"):
         """
         收集 METRIC 层指标数据（总控方法）
             
         Args:
             processed_result: 单个文件的处理结果
             table_data: 表数据收集字典
+            layer_type: 数仓层级类型（DWS/ADS），用于统一推断 source_level
         """
         try:
             parsed_data = processed_result.get('parsed_data', {})
@@ -158,16 +167,19 @@ class MetricsService:
             # 1. 使用 LineageService 收集表级和字段级血缘
             self._collect_lineage_via_service(processed_result, table_data)
                 
-            # 2. 收集指标定义和源映射
+            # 2. 收集指标定义（独立，不依赖其他数据）
             self._collect_metric_definitions(parsed_data, table_data)
                 
-            # 3. 收集复合指标关系
+            # 3. 收集指标源映射（依赖 metric_definition 的数据，通过 code 匹配获取 metric_id）
+            self._collect_all_source_mappings(parsed_data, table_data, layer_type)
+                
+            # 4. 收集复合指标关系
             self._collect_compound_relations(parsed_data, table_data)
                 
-            # ⚠️ 4. 收集指标-维度关联关系（metric_dim_rel）
+            # ⚠️ 5. 收集指标-维度关联关系（metric_dim_rel）
             self._collect_metric_dim_rel(table_data)
                 
-            # 5. 关联指标和字段血缘
+            # 6. 关联指标和字段血缘
             self._collect_metric_field_lineage_rel(table_data)
                 
             logger.info(f"[指标服务] 收集完成 - "
@@ -208,31 +220,31 @@ class MetricsService:
         logger.debug(f"[指标服务] 从 LineageService 获取 - 表血缘: {len(lineage_table_data['table_lineage'])}, "
                     f"字段血缘: {len(lineage_table_data['field_lineage'])}")
     
-    def _collect_metric_definitions(self, parsed_data: Dict[str, Any], table_data: Dict[str, List], now=None):
+    def _collect_metric_definitions(self, parsed_data: Dict[str, Any], table_data: Dict[str, List]):
         """
-        收集指标定义和源映射
+        收集指标定义（独立，不依赖其他数据）
             
         Args:
             parsed_data: AI 解析后的数据
             table_data: 表数据收集字典
-            now: 当前时间（UTC+8）
         """
         ai_metric_definitions = parsed_data.get('metric_definition', [])
         ai_source_mappings = parsed_data.get('metric_source_mapping', [])
         
-        # ⚠️ 去重 - 基于 metric_en (code)
-        seen_codes = set()
-        unique_metric_defs = []
+        # ⚠️ 去重 - 基于 metric_en (code)，使用字典自动去重
+        unique_metrics_dict = {}
         duplicate_count = 0
         
         for metric_def in ai_metric_definitions:
             metric_en = metric_def.get('metric_en', '')
-            if metric_en and metric_en not in seen_codes:
-                seen_codes.add(metric_en)
-                unique_metric_defs.append(metric_def)
-            elif metric_en:
-                duplicate_count += 1
-                logger.warning(f"[指标服务] ⚠️ AI 输出中发现重复指标: {metric_en}")
+            if metric_en:
+                if metric_en not in unique_metrics_dict:
+                    unique_metrics_dict[metric_en] = metric_def
+                else:
+                    duplicate_count += 1
+                    logger.warning(f"[指标服务] ⚠️ AI 输出中发现重复指标: {metric_en}")
+        
+        unique_metric_defs = list(unique_metrics_dict.values())
         
         if duplicate_count > 0:
             logger.info(f"[指标服务] ⚠️ AI 输出中去重: 原始 {len(ai_metric_definitions)} 条, 去重后 {len(unique_metric_defs)} 条, 跳过 {duplicate_count} 条重复")
@@ -248,8 +260,6 @@ class MetricsService:
             metric_en = metric_def.get('metric_en', '')
             metric_type_raw = metric_def.get('metric_type', 'atomic')
             biz_domain = metric_def.get('biz_domain', '')
-            cal_logic = metric_def.get('cal_logic', '')
-            unit = metric_def.get('unit')
             status = metric_def.get('status', 1)
                 
             # 转换 metric_type 为大写
@@ -269,69 +279,85 @@ class MetricsService:
             # 记录映射关系
             metric_en_to_id[metric_en] = metric_id
                 
-            # 收集 metric_definition 数据
+            # 收集 metric_definition 数据（⚠️ 已删除 cal_logic 和 unit）
             table_data['metric_definition'].append({
-                'id': metric_id,  # ⚠️ 改为 id
-                'name': metric_name,  # ⚠️ 改为 name
-                'code': metric_en,  # ⚠️ 改为 code（AI 返回的 metric_en）
+                'id': metric_id,
+                'name': metric_name,
+                'code': metric_en,
                 'metric_type': metric_type,
                 'biz_domain': biz_domain,
-                'cal_logic': cal_logic,
-                'unit': unit or '',
                 'status': status,
-                'create_time': get_now_utc8(),  # ⚠️ 直接使用工具函数
+                'create_time': get_now_utc8(),
                 'modify_time': get_now_utc8()
             })
-        
-        # ⚠️ 批量收集所有指标的源映射（一次性查询）
-        self._collect_all_source_mappings(ai_source_mappings, metric_en_to_id, table_data)
-        
-    def _collect_all_source_mappings(self, ai_source_mappings: List[Dict], 
-                                     metric_en_to_id: Dict[str, str],
-                                     table_data: Dict[str, List]):
+    
+    def _collect_all_source_mappings(self, parsed_data: Dict[str, Any], table_data: Dict[str, List], layer_type: str = "AUTO"):
         """
-        批量收集所有指标的源映射（一次性查询）
+        批量收集所有指标的源映射（依赖 metric_definition 的数据）
+        
+        核心逻辑：
+        1. 从 table_data['metric_definition'] 中获取已收集的指标定义（内存优先）
+        2. 通过 metric_column 匹配 metric_definition.code，获取 metric_id
+        3. 构建 metric_source_mapping 数据，打通业务-技术链路
             
         Args:
-            ai_source_mappings: AI 返回的源映射列表
-            metric_en_to_id: {metric_en: metric_id} 映射
-            table_data: 表数据收集字典
+            parsed_data: AI 解析后的数据
+            table_data: 表数据收集字典（包含已收集的 metric_definition）
+            layer_type: 数仓层级类型（DWS/ADS），用于统一推断 source_level
         """
+        ai_source_mappings = parsed_data.get('metric_source_mapping', [])
+        
         if not ai_source_mappings:
             return
         
-        # ⚠️ 去重 - 基于 (metric_id, db_table, metric_column)
-        seen_keys = set()
-        unique_mappings = []
+        # ⚠️ 第一步：从内存中获取已收集的 metric_definition，构建 code -> id 映射（优先使用当前批次数据）
+        code_to_id = {}
+        for metric_def in table_data['metric_definition']:
+            code = metric_def.get('code', '')
+            metric_id = metric_def.get('id', '')
+            if code and metric_id:
+                code_to_id[code] = metric_id
+        
+        if not code_to_id:
+            logger.warning("[指标服务-源映射] ⚠️ 未找到任何指标定义，无法建立源映射")
+            return
+        
+        logger.debug(f"[指标服务-源映射] 从内存中找到 {len(code_to_id)} 个指标定义")
+        # ⚠️ 第二步：去重 - 基于 (metric_id, db_table, metric_column)，使用字典自动去重
+        unique_mappings_dict = {}
         duplicate_count = 0
         
         for mapping in ai_source_mappings:
             metric_column = mapping.get('metric_column', '')
-            if not metric_column or metric_column not in metric_en_to_id:
+            if not metric_column or metric_column not in code_to_id:
                 continue
             
-            metric_id = metric_en_to_id[metric_column]
+            metric_id = code_to_id[metric_column]
             db_table = mapping.get('db_table', '')
             key = (metric_id, db_table, metric_column or '')
             
-            if key not in seen_keys:
-                seen_keys.add(key)
-                unique_mappings.append(mapping)
+            if key not in unique_mappings_dict:
+                unique_mappings_dict[key] = mapping
             else:
                 duplicate_count += 1
                 logger.warning(f"[指标服务] ⚠️ AI 输出中发现重复源映射: {key}")
         
+        unique_mappings = list(unique_mappings_dict.values())
+        
         if duplicate_count > 0:
             logger.info(f"[指标服务] ⚠️ 源映射去重: 原始 {len(ai_source_mappings)} 条, 去重后 {len(unique_mappings)} 条, 跳过 {duplicate_count} 条重复")
         
-        # ⚠️ 第一步：按 metric_id 分组源映射（使用去重后的数据）
+        if not unique_mappings:
+            return
+        
+        # ⚠️ 第三步：按 metric_id 分组源映射（使用去重后的数据）
         mappings_by_metric = {}  # {metric_id: [mappings]}
         for mapping in unique_mappings:
             metric_column = mapping.get('metric_column', '')
-            if not metric_column or metric_column not in metric_en_to_id:
+            if not metric_column or metric_column not in code_to_id:
                 continue
             
-            metric_id = metric_en_to_id[metric_column]
+            metric_id = code_to_id[metric_column]
             if metric_id not in mappings_by_metric:
                 mappings_by_metric[metric_id] = []
             mappings_by_metric[metric_id].append(mapping)
@@ -378,33 +404,42 @@ class MetricsService:
                 datasource = mapping.get('datasource', '')
                 db_table = mapping.get('db_table', '')
                 metric_column = mapping.get('metric_column', '')
+                metric_name = mapping.get('metric_name', '')  # ⚠️ 新增：提取指标名称
+                biz_domain = mapping.get('biz_domain', '')  # ⚠️ 新增：提取业务域
                 filter_condition = mapping.get('filter_condition', '')
                 agg_func = mapping.get('agg_func', '')
                 priority = mapping.get('priority', 1)
                 is_valid = mapping.get('is_valid', 1)
-                source_level = mapping.get('source_level', 'AUTHORITY')
                 source_type = mapping.get('source_type', 'OFFLINE').upper()
                     
-                # 从批量查询结果中获取 map_id
+                # ⚠️ 从批量查询结果中获取 map_id
                 unique_key = (metric_id, db_table, metric_column or '')
                 if unique_key in all_existing_maps:
                     map_id = all_existing_maps[unique_key]
                 else:
                     map_id = self.map_id_gen.get_next_id()  # ⚠️ 使用 IdGenerator
+                
+                # ⚠️ 统一使用 MetricsPlatformService 推断的 layer_type 作为 source_level
+                # 保证全局一致性，不依赖 AI 返回的 source_level
+                inferred_source_level = layer_type.upper() if layer_type != "AUTO" else "AUTHORITY"
                     
                 table_data['metric_source_mapping'].append({
-                    'id': map_id,  # ⚠️ 改为 id
+                    'id': map_id,
                     'metric_id': metric_id,
                     'source_type': source_type,
                     'datasource': datasource,
                     'db_table': db_table,
                     'metric_column': metric_column,
+                    'metric_name': metric_name,  # ⚠️ 新增：保存指标名称
+                    'biz_domain': biz_domain,  # ⚠️ 新增：保存业务域
                     'filter_condition': filter_condition,
                     'agg_func': agg_func,
                     'priority': priority,
                     'is_valid': is_valid,
-                    'source_level': source_level,
-                    'create_time': get_now_utc8(),  # ⚠️ 直接使用工具函数
+                    'source_level': inferred_source_level,
+                    'cal_logic': mapping.get('cal_logic', ''),  # ⚠️ 从 AI 返回中提取
+                    'unit': mapping.get('unit') or '',  # ⚠️ 从 AI 返回中提取
+                    'create_time': get_now_utc8(),
                     'modify_time': get_now_utc8()
                 })
         
@@ -423,9 +458,8 @@ class MetricsService:
         if not ai_compound_rels:
             return
         
-        # ⚠️ 第一步：去重 - 基于 (main_metric_en, sub_metric_en)
-        seen_keys = set()
-        unique_compound_rels = []
+        # ⚠️ 第一步：去重 - 基于 (main_metric_en, sub_metric_en)，使用字典自动去重
+        unique_compound_dict = {}
         duplicate_count = 0
         
         for rel in ai_compound_rels:
@@ -444,12 +478,13 @@ class MetricsService:
                 sub_metric_en = sub_field.split('.')[-1] if '.' in sub_field else sub_field
                 key = (main_metric_en, sub_metric_en)
                 
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    unique_compound_rels.append(rel)
+                if key not in unique_compound_dict:
+                    unique_compound_dict[key] = rel
                 else:
                     duplicate_count += 1
                     logger.warning(f"[指标服务] ⚠️ AI 输出中发现重复复合关系: {key}")
+        
+        unique_compound_rels = list(unique_compound_dict.values())
         
         if duplicate_count > 0:
             logger.info(f"[指标服务] ⚠️ 复合关系去重: 原始 {len(ai_compound_rels)} 条, 去重后 {len(unique_compound_rels)} 条, 跳过 {duplicate_count} 条重复")
@@ -614,15 +649,13 @@ class MetricsService:
         # 添加到 table_data['metric_definition']
         if table_data is not None:
             table_data['metric_definition'].append({
-                'id': new_metric_id,  # ⚠️ 改为 id
-                'name': display_name,  # ⚠️ 改为 name
-                'code': metric_en,  # ⚠️ 改为 code（AI 返回的 metric_en）
+                'id': new_metric_id,
+                'name': display_name,
+                'code': metric_en,
                 'metric_type': 'COMPOUND',
                 'biz_domain': '',
-                'cal_logic': '',
-                'unit': '',
                 'status': 1,
-                'create_time': get_now_utc8(),  # ⚠️ 直接使用工具函数
+                'create_time': get_now_utc8(),
                 'modify_time': get_now_utc8()
             })
         
@@ -753,7 +786,7 @@ class MetricsService:
             # 定义各表的配置
             table_configs = {
                 'metric_definition': {
-                    'columns': ['id', 'name', 'code', 'metric_type', 'biz_domain', 'cal_logic', 'unit', 'status', 'create_time', 'modify_time'],
+                    'columns': ['id', 'name', 'code', 'metric_type', 'biz_domain', 'status', 'create_time', 'modify_time'],  # ⚠️ 已删除 cal_logic, unit
                     'conflict_target': '(code)'
                 },
                 'metric_dim_rel': {
@@ -761,7 +794,7 @@ class MetricsService:
                     'conflict_target': '(metric_id, dim_id)'
                 },
                 'metric_source_mapping': {
-                    'columns': ['id', 'metric_id', 'source_type', 'datasource', 'db_table', 'metric_column', 'filter_condition', 'agg_func', 'priority', 'is_valid', 'source_level', 'create_time', 'modify_time'],  # ⚠️ map_id 改为 id
+                    'columns': ['id', 'metric_id', 'source_type', 'datasource', 'db_table', 'metric_column', 'metric_name', 'biz_domain', 'filter_condition', 'agg_func', 'priority', 'is_valid', 'source_level', 'cal_logic', 'unit', 'create_time', 'modify_time'],  # ⚠️ 新增 metric_name, biz_domain, cal_logic, unit
                     'conflict_target': '(metric_id, db_table, metric_column)'
                 },
                 'metric_compound_rel': {

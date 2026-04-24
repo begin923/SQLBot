@@ -42,14 +42,19 @@ class LineageService:
         self.table_lineage_id_gen = IdGenerator(session, 'table_lineage', 'T')
         self.field_lineage_id_gen = IdGenerator(session, 'field_lineage', 'F')
         
+        # ⚠️ 创建表元数据服务实例
+        from apps.extend.metrics2.services.table_metadata_service import TableMetadataService
+        self.table_metadata_service = TableMetadataService(session)
+        
         logger.info("[LineageService] 实例已创建（使用全局缓存）")
     
-    def process(self, processed_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def process(self, processed_results: List[Dict[str, Any]], layer_type: str = "AUTO") -> Dict[str, Any]:
         """
         处理 DWD 层血缘数据
         
         Args:
             processed_results: 规则引擎处理后的结果列表
+            layer_type: 数仓层级类型（DWD/DWS/ADS），用于统一推断 source_level
             
         Returns:
             执行结果 {'success': bool, 'message': str, 'table_stats': dict}
@@ -83,6 +88,10 @@ class LineageService:
             
             # 执行数据库插入
             execution_result = self._execute_insert(table_data)
+            
+            # ⚠️ 在所有主要数据写入成功后，再处理表元数据
+            if processed_results:
+                self.table_metadata_service.process_table_metadata(processed_results[0], "血缘服务", layer_type)
             
             logger.info(f"[血缘服务] ✅ 处理完成 - 表血缘: {len(table_data['table_lineage'])}, 字段血缘: {len(table_data['field_lineage'])}")
             

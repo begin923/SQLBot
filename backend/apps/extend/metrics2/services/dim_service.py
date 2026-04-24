@@ -37,13 +37,18 @@ class DimService:
         self.session = session
         # ⚠️ 使用 IdGenerator 替代手动计数器
         self.dim_id_gen = IdGenerator(session, 'dim_definition', 'D')
+        
+        # ⚠️ 创建表元数据服务实例
+        from apps.extend.metrics2.services.table_metadata_service import TableMetadataService
+        self.table_metadata_service = TableMetadataService(session)
     
-    def process(self, processed_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def process(self, processed_results: List[Dict[str, Any]], layer_type: str = "AUTO") -> Dict[str, Any]:
         """
         处理 DIM 层维度数据
         
         Args:
             processed_results: 规则引擎处理后的结果列表
+            layer_type: 数仓层级类型（DIM），用于统一推断 source_level
             
         Returns:
             执行结果 {'success': bool, 'message': str, 'table_stats': dict}
@@ -52,6 +57,10 @@ class DimService:
             Exception: 当数据处理失败时抛出异常，由主流程统一回滚
         """
         try:
+            # ⚠️ 处理表元数据（从第一个解析结果中提取）
+            if processed_results:
+                self.table_metadata_service.process_table_metadata(processed_results[0], "DIM服务", layer_type)
+            
             # ⚠️ 批次级别统一时间戳，确保同一批次内所有记录时间一致
             batch_time = get_now_utc8()
             

@@ -16,11 +16,16 @@ class MetricSourceMapping(SQLModel, table=True):
     datasource: str = Field(sa_column=Column(VARCHAR(64), nullable=False, comment='数据源标识：hive/clickhouse/mysql'))
     db_table: str = Field(sa_column=Column(VARCHAR(128), nullable=False, comment='物理库表名（格式：库名.表名，如dwd.dwd_pig_breed_event_di）'))
     metric_column: Optional[str] = Field(sa_column=Column(VARCHAR(64), default=None, comment='指标字段名（原子指标直接使用的字段，复合指标无需填写）'))
+    metric_name: Optional[str] = Field(sa_column=Column(VARCHAR(128), default=None, comment='指标中文名称'))
     filter_condition: Optional[str] = Field(sa_column=Column(TEXT, default=None, comment='筛选条件（WHERE后内容，如"event_type=''配种'' AND is_valid=1"）'))
     agg_func: Optional[str] = Field(sa_column=Column(VARCHAR(32), default=None, comment='聚合函数：COUNT/SUM/AVG/MAX，原子指标必填，复合指标无需填写'))
     priority: int = Field(sa_column=Column(TINYINT, nullable=False, comment='优先级：1最高，依次递减（1=权威源，2=备用源，3=废弃源）'))
     is_valid: int = Field(sa_column=Column(TINYINT, nullable=False, default=1, comment='是否启用：1启用/0禁用'))
     source_level: str = Field(sa_column=Column(VARCHAR(16), nullable=False, comment='源等级：AUTHORITY（权威）/STANDBY（备用）/DISCARD（废弃）'))
+    biz_domain: Optional[str] = Field(sa_column=Column(VARCHAR(32), default=None, comment='业务域：养殖繁殖/养殖饲喂/养殖防疫'))
+    cal_logic: Optional[str] = Field(sa_column=Column(TEXT, default=None, comment='口径计算逻辑（纯业务描述，如"单胎次内有效配种事件总次数"）'))
+    unit: Optional[str] = Field(sa_column=Column(VARCHAR(16), default=None, comment='指标单位（如次、率、头）'))
+    embedding_vector: Optional[str] = Field(default=None, sa_column=Column(TEXT, nullable=True, comment='向量嵌入'))
     create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, server_default=func.now(), comment='创建时间'))
     modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, server_default=func.now(), onupdate=func.now(), comment='修改时间'))
 
@@ -43,5 +48,8 @@ class MetricSourceMappingInfo(SQLModel):
     priority: Optional[int] = None
     is_valid: Optional[bool] = True
     source_level: Optional[str] = None
+    biz_domain: Optional[str] = None
+    cal_logic: Optional[str] = None
+    unit: Optional[str] = None
     create_time: Optional[datetime] = None
     modify_time: Optional[datetime] = None

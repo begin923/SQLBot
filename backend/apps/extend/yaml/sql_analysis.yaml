@@ -21,8 +21,7 @@ dim_layer:
       "basic_info": {
         "file_name": "文件名",
         "target_table": "目标维度表(库.表)",
-        "table_desc": "维度表中文名",
-        "warehouse_layer": "dim"
+        "table_desc": "维度表中文名"
       },
       "fields": [
         {
@@ -38,8 +37,7 @@ dim_layer:
     {
       "basic_info": {
         "file_name": "由代码自动注入",
-        "target_table": "目标维度表(库.表)",
-        "warehouse_layer": "dim"
+        "target_table": "目标维度表(库.表)"
       },
       "fields": [],
       "error": "SQL 中存在 SELECT * 或通配符（如 a.*），无法准确解析字段。请修改 SQL，将所有通配符展开为明确的字段列表。",
@@ -82,8 +80,7 @@ dim_layer:
       "basic_info": {
         "file_name": "dim_anc_breed.sql",
         "target_table": "yz_datawarehouse_dim.dim_anc_breed",
-        "table_desc": "品种维度表",
-        "warehouse_layer": "dim"
+        "table_desc": "品种维度表"
       },
       "fields": [
         {
@@ -144,8 +141,7 @@ dwd_layer:
       "basic_info": {
         "file_name": "由代码自动注入",
         "target_table": "目标表(库.表)",
-        "table_desc": "表中文名",
-        "warehouse_layer": "dwd/dws/ads"
+        "table_desc": "表中文名"
       },
       "table_lineage": [
         {
@@ -211,8 +207,7 @@ dwd_layer:
       "basic_info": {
         "file_name": "/path/to/ads_user_gmv.sql",
         "target_table": "yz_datawarehouse_ads.ads_user_gmv",
-        "table_desc": "用户GMV指标表",
-        "warehouse_layer": "ads"
+        "table_desc": "用户GMV指标表"
       },
       "table_lineage": [
         {
@@ -317,8 +312,7 @@ dws_ads_layer:
       "basic_info": {
         "file_name": "由代码自动注入",
         "target_table": "目标表(库.表)",
-        "table_desc": "表中文名",
-        "warehouse_layer": "dws/ads"
+        "table_desc": "表中文名"
       },
       "table_lineage": [
         {
@@ -348,8 +342,6 @@ dws_ads_layer:
           "metric_en": "指标英文编码",
           "metric_type": "atomic/derived/composite",
           "biz_domain": "业务域",
-          "cal_logic": "无别名计算逻辑",
-          "unit": "单位(无则null)",
           "status": 1
         }
       ],
@@ -365,14 +357,17 @@ dws_ads_layer:
       "metric_source_mapping": [
         {
           "source_type": "offline/real-time",
-          "datasource": "hive/clickhouse",
-          "db_table": "完整物理表名",
+          "datasource": "doris",
+          "db_table": "insert 的完整物理表名",
           "metric_column": "指标字段名",
+          "metric_name": "指标中文",
           "filter_condition": "过滤条件(无则空串)",
           "agg_func": "聚合函数(sum/count/avg，无则空串)",
           "priority": 1,
           "is_valid": 1,
-          "source_level": "DWD/DWS/ADS"
+          "biz_domain": "业务域",
+          "cal_logic": "无别名计算逻辑",
+          "unit": "单位(无则null)"
         }
       ]
     }
@@ -396,8 +391,7 @@ dws_ads_layer:
       "basic_info": {
         "file_name": "/path/to/dws_collect_semen_stat.sql",
         "target_table": "dws.dws_collect_semen_stat",
-        "table_desc": "采精统计汇总表",
-        "warehouse_layer": "dws"
+        "table_desc": "采精统计汇总表"
       },
       "table_lineage": [
         {
@@ -487,8 +481,6 @@ dws_ads_layer:
           "metric_en": "collect_semen_num",
           "metric_type": "derived",
           "biz_domain": "育种",
-          "cal_logic": "sum(datawarehouse_dwd.dwd_aibreeding_collect_semen_plan.collect_semen_num)",
-          "unit": null,
           "status": 1
         },
         {
@@ -496,8 +488,6 @@ dws_ads_layer:
           "metric_en": "valid_collect_num",
           "metric_type": "derived",
           "biz_domain": "育种",
-          "cal_logic": "sum(datawarehouse_dwd.dwd_aibreeding_collect_semen_plan.valid_collect_num)",
-          "unit": null,
           "status": 1
         },
         {
@@ -505,8 +495,6 @@ dws_ads_layer:
           "metric_en": "qualified_rate",
           "metric_type": "composite",
           "biz_domain": "育种",
-          "cal_logic": "sum(datawarehouse_dwd.dwd_aibreeding_collect_semen_plan.collect_semen_num) / sum(datawarehouse_dwd.dwd_aibreeding_collect_semen_plan.valid_collect_num)",
-          "unit": "%",
           "status": 1
         }
       ],
@@ -522,36 +510,45 @@ dws_ads_layer:
       "metric_source_mapping": [
         {
           "source_type": "offline",
-          "datasource": "hive",
-          "db_table": "datawarehouse_dwd.dwd_aibreeding_collect_semen_plan",
+          "datasource": "doris",
+          "db_table": "dws.dws_collect_semen_statn",
           "metric_column": "collect_semen_num",
+          "metric_name": "采集精液数",
           "filter_condition": "",
           "agg_func": "sum",
           "priority": 1,
           "is_valid": 1,
-          "source_level": "DWD"
+          "biz_domain": "育种",
+          "cal_logic": "sum(datawarehouse_dwd.dwd_aibreeding_collect_semen_plan.collect_semen_num)",
+          "unit": null
         },
         {
           "source_type": "offline",
           "datasource": "hive",
-          "db_table": "datawarehouse_dwd.dwd_aibreeding_collect_semen_plan",
+          "db_table": "dws.dws_collect_semen_statn",
           "metric_column": "valid_collect_num",
+          "metric_name": "有效采精数",
           "filter_condition": "",
           "agg_func": "sum",
           "priority": 1,
           "is_valid": 1,
-          "source_level": "DWD"
+          "biz_domain": "育种",
+          "cal_logic": "sum(datawarehouse_dwd.dwd_aibreeding_collect_semen_plan.valid_collect_num)",
+          "unit": null
         },
         {
           "source_type": "offline",
           "datasource": "hive",
-          "db_table": "datawarehouse_dwd.dwd_aibreeding_collect_semen_plan",
+          "db_table": "dws.dws_collect_semen_statn",
           "metric_column": "qualified_rate",
+          "metric_name": "合格采精率",
           "filter_condition": "",
           "agg_func": "sum/sum",
           "priority": 1,
           "is_valid": 1,
-          "source_level": "DWD"
+          "biz_domain": "育种",
+         "cal_logic": "sum(datawarehouse_dwd.dwd_aibreeding_collect_semen_plan.collect_semen_num) / sum(datawarehouse_dwd.dwd_aibreeding_collect_semen_plan.valid_collect_num)",
+         "unit": "%"
         }
       ]
     }
