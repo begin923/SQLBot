@@ -23,7 +23,7 @@ class DimService:
     职责：
     1. 从 AI 解析的 fields 中提取维度定义
     2. 生成 dim_id
-    3. 收集 dim_definition 和 dim_field_mapping
+    3. 收集 dim_definition 和 dim_field_lineage
     4. 执行数据库插入
     """
     
@@ -37,6 +37,7 @@ class DimService:
         self.session = session
         # ⚠️ 使用 IdGenerator 替代手动计数器
         self.dim_id_gen = IdGenerator(session, 'dim_definition', 'D')
+        self.dim_field_lineage_id_gen = IdGenerator(session, 'dim_field_lineage', 'DFL')  # ⚠️ 新增
         
         # ⚠️ 创建表元数据服务实例
         from apps.extend.metrics2.services.table_metadata_service import TableMetadataService
@@ -57,17 +58,13 @@ class DimService:
             Exception: 当数据处理失败时抛出异常，由主流程统一回滚
         """
         try:
-            # ⚠️ 处理表元数据（从第一个解析结果中提取）
-            if processed_results:
-                self.table_metadata_service.process_table_metadata(processed_results[0], "DIM服务", layer_type)
-            
             # ⚠️ 批次级别统一时间戳，确保同一批次内所有记录时间一致
             batch_time = get_now_utc8()
             
             # 初始化表数据收集字典
             table_data = {
                 'dim_definition': [],
-                'dim_field_mapping': []
+                'dim_field_lineage': []
             }
             
             # 遍历所有处理结果，收集维度数据
@@ -76,7 +73,6 @@ class DimService:
                     logger.warning(f"[DIM服务] 跳过失败的结果 #{idx}")
                     continue
                 
-                logger.debug(f"[DIM服务] 处理结果 #{idx}")
                 self._collect_dim_data(processed_result, table_data, batch_time)
             
             # 校验数据完整性
@@ -85,15 +81,21 @@ class DimService:
                 logger.error(error_msg)
                 raise ValueError(error_msg)  # ⚠️ 抛出异常
             
-            if not table_data['dim_field_mapping']:
-                error_msg = "❌ DIM 层未生成任何 dim_field_mapping 数据"
+            if not table_data['dim_field_lineage']:
+                error_msg = "❌ DIM 层未生成任何 dim_field_lineage 数据"
                 logger.error(error_msg)
                 raise ValueError(error_msg)  # ⚠️ 抛出异常
             
             # 执行数据库插入（不提交事务，由主流程统一提交）
             execution_result = self._execute_insert(table_data)
             
-            logger.info(f"[DIM服务] ✅ 处理完成 - 维度数: {len(table_data['dim_definition'])}")
+            # ⚠️ 在所有主要数据写入成功后，再处理表元数据
+            if processed_results:
+                self.table_metadata_service.process_table_metadata(processed_results[0], "DIM服务", layer_type)
+                # 将 table_metadata 计入统计
+                execution_result['table_stats']['table_metadata'] = 1
+            
+            logger.info(f"[DIM服务] ✅ 处理完成 - 维度数: {len(table_data['dim_definition'])}, 字段映射数: {len(table_data['dim_field_lineage'])}")
             
             return {
                 'success': True,
@@ -107,7 +109,6 @@ class DimService:
         except Exception as e:
             error_msg = f"[DIM服务] 处理失败: {str(e)}"
             logger.error(error_msg, exc_info=True)
-            # ⚠️ 不再回滚，由主流程统一处理
             raise  # ⚠️ 重新抛出异常
     
     def _collect_dim_data(self, processed_result: Dict[str, Any], table_data: Dict[str, List], batch_time: datetime = None):
@@ -140,7 +141,7 @@ class DimService:
             now = batch_time if batch_time else get_now_utc8()  # ⚠️ 使用批次时间或实时获取
             self._process_fields(fields, target_table, existing_dims, now, table_data)
             
-            logger.info(f"[DIM服务] 收集完成 - dim_definition: {len(table_data['dim_definition'])} 条, dim_field_mapping: {len(table_data['dim_field_mapping'])} 条")
+            logger.info(f"[DIM服务] 收集完成 - dim_definition: {len(table_data['dim_definition'])} 条, dim_field_lineage: {len(table_data['dim_field_lineage'])} 条")
             
         except Exception as e:
             logger.error(f"[DIM服务] 收集数据失败: {str(e)}", exc_info=True)
@@ -205,8 +206,12 @@ class DimService:
             
             logger.debug(f"[DIM服务] 收集 dim_definition: {dim_id} - {field_name} ({field_en})")
             
-            # 同时收集 dim_field_mapping（指向同一个 dim_id）
-            table_data['dim_field_mapping'].append({
+            # 生成 dim_field_lineage 的 id（使用 IdGenerator）
+            field_lineage_id = self.dim_field_lineage_id_gen.get_next_id()
+            
+            # 同时收集 dim_field_lineage（指向同一个 dim_id）
+            table_data['dim_field_lineage'].append({
+                'id': field_lineage_id,
                 'dim_id': dim_id,
                 'db_table': target_table,
                 'field': field_en,
@@ -253,8 +258,8 @@ class DimService:
                     'columns': ['id', 'name', 'code', 'type', 'is_valid', 'create_time', 'modify_time'],
                     'conflict_target': '(code)'
                 },
-                'dim_field_mapping': {
-                    'columns': ['db_table', 'field', 'dim_id', 'field_name', 'create_time', 'modify_time'],
+                'dim_field_lineage': {
+                    'columns': ['id', 'db_table', 'field', 'dim_id', 'field_name', 'create_time', 'modify_time'],
                     'conflict_target': '(db_table, field)'
                 }
             }
@@ -268,16 +273,16 @@ class DimService:
                 if sql:
                     self.session.execute(text(sql))
                     table_stats['dim_definition'] = len(table_data['dim_definition'])
-                    logger.info(f"[DIM服务] 批量插入 dim_definition: {len(table_data['dim_definition'])} 条")
+                    logger.info(f"[DIM服务] 💾 批量插入 dim_definition: {len(table_data['dim_definition'])} 条")
             
-            # ⚠️ 批量插入 dim_field_mapping（使用 SqlGenerator）
-            if table_data['dim_field_mapping']:
-                config = table_configs['dim_field_mapping']
-                sql = SqlGenerator.generate_batch_upsert('dim_field_mapping', config, table_data['dim_field_mapping'])
+            # ⚠️ 批量插入 dim_field_lineage（使用 SqlGenerator）
+            if table_data['dim_field_lineage']:
+                config = table_configs['dim_field_lineage']
+                sql = SqlGenerator.generate_batch_upsert('dim_field_lineage', config, table_data['dim_field_lineage'])
                 if sql:
                     self.session.execute(text(sql))
-                    table_stats['dim_field_mapping'] = len(table_data['dim_field_mapping'])
-                    logger.info(f"[DIM服务] 批量插入 dim_field_mapping: {len(table_data['dim_field_mapping'])} 条")
+                    table_stats['dim_field_lineage'] = len(table_data['dim_field_lineage'])
+                    logger.info(f"[DIM服务] 💾 批量插入 dim_field_lineage: {len(table_data['dim_field_lineage'])} 条")
             
             # ⚠️ 不再提交事务，由主流程统一提交
             logger.info("[DIM服务] 数据已准备就绪，等待主流程提交")

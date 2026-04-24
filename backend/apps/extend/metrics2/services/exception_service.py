@@ -73,7 +73,7 @@ class ExceptionService:
                 matched_pattern=matched_pattern
             )
             
-            logger.info(f"[失败日志] 已记录解析失败: {file_name} - {error_type}")
+            logger.warning(f"[失败日志] 已记录解析失败: {file_name} - {error_type}")
             return True
             
         except Exception as e:
@@ -139,7 +139,7 @@ class ExceptionService:
                 )
                 
                 recorded_count += 1
-                logger.info(f"[失败日志] 已记录 Service 失败: {file_name} - {error_type}")
+                logger.warning(f"[失败日志] 已记录 Service 失败: {file_name} - {error_type}")
             
             return recorded_count
                 
@@ -293,7 +293,7 @@ class ExceptionService:
         matched_pattern: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        统一处理解析错误（记录日志并返回错误结果）
+        统一处理解析错误（记录到数据库并返回错误结果）
         
         Args:
             sql_file: SQL 文件路径
@@ -306,9 +306,7 @@ class ExceptionService:
         Returns:
             错误结果字典
         """
-        logger.error(f"[AI解析] {error_msg}")
-        
-        # 记录失败日志
+        # 记录失败日志到数据库（不打印日志，由调用方控制）
         self.log_parse_failure(
             file_path=sql_file,
             failure_reason=error_msg,

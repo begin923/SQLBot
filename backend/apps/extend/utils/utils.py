@@ -177,10 +177,13 @@ class DBUtils:
     """数据库工具类"""
 
     @staticmethod
-    def create_local_session():
+    def create_local_session(echo_sql: bool = False):
         """
         创建一个独立的数据库会话（用于本地测试或后台任务）
         不依赖 SessionDep，直接从.env 文件读取配置
+
+        Args:
+            echo_sql: 是否输出 SQL 日志（默认 False）
 
         Returns:
             session: SQLAlchemy 会话对象
@@ -203,8 +206,8 @@ class DBUtils:
 
         database_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 
-        # 创建引擎和会话
-        engine = create_engine(database_url)
+        # 创建引擎和会话（默认关闭 SQL 日志输出）
+        engine = create_engine(database_url, echo=echo_sql)
         SessionLocal = sessionmaker(bind=engine)
         session = SessionLocal()
 

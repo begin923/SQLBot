@@ -72,7 +72,6 @@ class LineageService:
                     logger.warning(f"[血缘服务] 跳过失败的结果 #{idx}")
                     continue
                 
-                logger.debug(f"[血缘服务] 处理结果 #{idx}")
                 self.collect_lineage(processed_result, table_data)
             
             # 校验数据完整性
@@ -92,14 +91,10 @@ class LineageService:
             # ⚠️ 在所有主要数据写入成功后，再处理表元数据
             if processed_results:
                 self.table_metadata_service.process_table_metadata(processed_results[0], "血缘服务", layer_type)
+                # 将 table_metadata 计入统计
+                execution_result['table_stats']['table_metadata'] = 1
             
             logger.info(f"[血缘服务] ✅ 处理完成 - 表血缘: {len(table_data['table_lineage'])}, 字段血缘: {len(table_data['field_lineage'])}")
-            
-            return {
-                'success': True,
-                'message': f"WIDE层处理成功，写入 {len(table_data['table_lineage'])} 条表血缘, {len(table_data['field_lineage'])} 条字段血缘",
-                'table_stats': execution_result.get('table_stats', {})
-            }
             
         except ValueError:
             # ⚠️ 业务逻辑错误，直接向上抛出
@@ -162,7 +157,7 @@ class LineageService:
             table_data: 表数据收集字典
         """
         ai_table_lineage = parsed_data.get('table_lineage', [])
-        logger.info(f"[血缘服务] AI 输出 table_lineage 数量: {len(ai_table_lineage)}")
+        logger.debug(f"[血缘服务] AI 输出 table_lineage 数量: {len(ai_table_lineage)}")
         
         # ⚠️ 第一步：去重 - 基于 (source_table, target_table)
         seen_keys = set()
@@ -185,7 +180,7 @@ class LineageService:
                 logger.warning(f"[血缘服务] ⚠️ AI 输出中发现重复表血缘: {key}")
         
         if duplicate_count > 0:
-            logger.info(f"[血缘服务] ⚠️ AI 输出中去重: 原始 {len(ai_table_lineage)} 条, 去重后 {len(unique_table_lineage)} 条, 跳过 {duplicate_count} 条重复")
+            logger.warning(f"[血缘服务] ⚠️ AI 输出中去重: 原始 {len(ai_table_lineage)} 条, 去重后 {len(unique_table_lineage)} 条, 跳过 {duplicate_count} 条重复")
         
         # ⚠️ 第二步：收集所有源表和目标表（使用去重后的数据）
         all_source_tables = []
@@ -238,18 +233,6 @@ class LineageService:
                 lineage_id = existing_table_lineage[key]
                 skipped_count += 1
                 logger.debug(f"[血缘服务] 表血缘已存在，跳过插入: {source_table} -> {tgt_table} (ID: {lineage_id})")
-                
-                table_data['table_lineage'].append({
-                    'id': lineage_id,
-                    'source_table': source_table,
-                    'source_table_name': tl.get('source_table_name', ''),
-                    'target_table': tgt_table,
-                    'target_table_name': tl.get('target_table_name', ''),
-                    'create_time': get_now_utc8(),  # ⚠️ 直接使用工具函数
-                    'modify_time': get_now_utc8(),
-                    'is_exists': True  # ⚠️ 标记为已存在，_execute_insert 会过滤
-                })
-                continue
             
             # ⚠️ 生成新的 lineage_id（使用 IdGenerator），并确保不与批次内已有 ID 冲突
             max_retries = 10
@@ -269,19 +252,8 @@ class LineageService:
             
             new_count += 1
             logger.debug(f"[血缘服务] 生成新表血缘ID: {source_table} -> {tgt_table} (ID: {lineage_id})")
-            
-            table_data['table_lineage'].append({
-                'id': lineage_id,
-                'source_table': source_table,
-                'source_table_name': tl.get('source_table_name', ''),
-                'target_table': tgt_table,
-                'target_table_name': tl.get('target_table_name', ''),
-                'create_time': get_now_utc8(),  # ⚠️ 直接使用工具函数
-                'modify_time': get_now_utc8(),
-                'is_exists': False  # ⚠️ 标记为新记录
-            })
         
-        logger.info(f"[血缘服务] table_lineage 收集完成: 新增 {new_count} 条, 复用 {skipped_count} 条已存在记录")
+        logger.info(f"[血缘服务] 📊 表血缘收集完成: 新增 {new_count} 条, 复用 {skipped_count} 条已存在记录")
     
     def _dedup_and_normalize_field_lineage(
         self, 
@@ -320,8 +292,7 @@ class LineageService:
                 logger.debug(f"[血缘服务] ⚠️ AI 输出中发现重复字段血缘: {dedup_key}")
         
         if duplicate_before_count > 0:
-            logger.info(f"[血缘服务] ⚠️ AI 输出中去重: 原始 {len(ai_field_lineage)} 条, 去重后 {len(unique_field_lineage)} 条, 跳过 {duplicate_before_count} 条重复")
-            logger.info(f"[血缘服务] 跳过重复字段血缘: {seen_keys}")
+            logger.warning(f"[血缘服务] ⚠️ AI 输出中去重: 原始 {len(ai_field_lineage)} 条, 去重后 {len(unique_field_lineage)} 条, 跳过 {duplicate_before_count} 条重复")
         
         # ⚠️ 第二步：空值填充 - 处理 source_table 和 source_field 为空的情况
         normalized_field_lineage = []
@@ -373,7 +344,7 @@ class LineageService:
                 normalized_fl['target_table'] = tgt_table
                 normalized_field_lineage.append(normalized_fl)
         
-        logger.info(f"[血缘服务] 字段血缘数据规范化完成: {len(normalized_field_lineage)} 条")
+        logger.debug(f"[血缘服务] 字段血缘数据规范化完成: {len(normalized_field_lineage)} 条")
         return normalized_field_lineage
     
     def _collect_field_lineage(self, parsed_data: Dict[str, Any], target_table: str, table_data: Dict[str, List]):
@@ -386,7 +357,7 @@ class LineageService:
             table_data: 表数据收集字典
         """
         ai_field_lineage = parsed_data.get('field_lineage', [])
-        logger.info(f"[血缘服务] AI 输出 field_lineage 数量: {len(ai_field_lineage)}")
+        logger.debug(f"[血缘服务] AI 输出 field_lineage 数量: {len(ai_field_lineage)}")
         
         # ⚠️ 去重和空值填充
         normalized_field_lineage = self._dedup_and_normalize_field_lineage(ai_field_lineage, target_table)
@@ -420,7 +391,7 @@ class LineageService:
                     
             # ⚠️ 从 table_data['table_lineage'] 中查找对应的 lineage_id
             logger.debug(f"[血缘服务] 🔍 查找表血缘: source_table='{source_table}', target_table='{tgt_table}'")
-                    
+                                
             # ⚠️ 直接遍历 table_data['table_lineage'] 查找匹配的记录（source_table 已经是单个表）
             table_lineage_id = ''
             for tl in table_data['table_lineage']:
@@ -428,8 +399,8 @@ class LineageService:
                     table_lineage_id = tl['id']  # ⚠️ 改为 id
                     logger.debug(f"[血缘服务]   ✅ 找到匹配: {source_table} -> {tgt_table} (ID: {table_lineage_id})")
                     break
-                    
-            # ⚠️ 只跳过"找不到表血缘"的情况
+                                
+            # ⚠️ 只跳过“找不到表血缘”的情况
             if not table_lineage_id:
                 continue  # ⚠️ 跳过这条记录
         
@@ -470,7 +441,7 @@ class LineageService:
                 'modify_time': get_now_utc8()   # ⚠️ 直接使用工具函数
             })
         
-        logger.info(f"[血缘服务] field_lineage 收集完成: {len(table_data['field_lineage'])} 条")
+        logger.info(f"[血缘服务] 📊 字段血缘收集完成: {len(table_data['field_lineage'])} 条")
     
     def _extract_target_table_from_sql(self, sql_content: str) -> str:
         """
@@ -595,10 +566,10 @@ class LineageService:
                         )
                     
                     table_stats['table_lineage'] = inserted_count
-                    logger.info(f"[血缘服务] 批量插入 table_lineage: {inserted_count} 条新增, {skipped_count} 条已存在跳过")
+                    logger.info(f"[血缘服务] 💾 批量插入 table_lineage: {inserted_count} 条新增, {skipped_count} 条已存在跳过")
             else:
                 table_stats['table_lineage'] = 0
-                logger.info(f"[血缘服务] 无需插入 table_lineage（所有记录均已存在）")
+                logger.debug(f"[血缘服务] 无需插入 table_lineage（所有记录均已存在）")
             
             # 批量插入 field_lineage（使用 SqlGenerator）
             if table_data['field_lineage']:
@@ -607,7 +578,7 @@ class LineageService:
                 if sql:
                     self.session.execute(text(sql))
                     table_stats['field_lineage'] = len(table_data['field_lineage'])
-                    logger.info(f"[血缘服务] 批量插入 field_lineage: {len(table_data['field_lineage'])} 条")
+                    logger.info(f"[血缘服务] 💾 批量插入 field_lineage: {len(table_data['field_lineage'])} 条")
             
             # ⚠️ 不再提交事务，由主流程统一提交
             logger.info("[血缘服务] 数据已准备就绪，等待主流程提交")
