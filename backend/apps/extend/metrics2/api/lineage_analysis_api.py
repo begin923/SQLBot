@@ -173,7 +173,7 @@ def validate_field_api(
     session: SessionDep = None
 ):
     """校验字段是否存在于血缘映射中"""
-    from apps.extend.metrics2.curd import validate_field_exists
+    from apps.extend.metrics2.crud import validate_field_exists
     
     is_valid = validate_field_exists(session, db_table, metric_column)
     

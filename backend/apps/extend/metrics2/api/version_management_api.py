@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from typing import Optional
 
 from common.core.deps import SessionDep
-from apps.extend.metrics2.curd import (
+from apps.extend.metrics2.crud import (
     create_metric_version,
     get_metric_version_by_id,
     get_metric_versions_by_metric_id,

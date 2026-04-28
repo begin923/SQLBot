@@ -54,14 +54,13 @@ class ModelClient:
             logger.warning(f"⚠️  [ModelClient] AI 配置缺失 - API Key: {'✅' if self.api_key else '❌'}, Base URL: {'✅' if self.base_url else '❌'}")
             self.client = None
 
-    def call_ai(self, template_name: str, sql_content: str, sql_file: str = "", layer_type: str = "METRIC") -> str:
+    def call_ai(self, template_name: str, sql_content: str, layer_type: str = "METRIC") -> str:
         """
         调用 AI 大模型，返回 MD 格式
 
         Args:
             template_name: 模板名称
             sql_content: SQL 内容
-            sql_file: SQL 文件名
             layer_type: 数仓层级类型（DIM/DWD/METRIC），用于选择不同的提示词
 
         Returns:
@@ -128,50 +127,9 @@ class ModelClient:
             return result
 
         except Exception as e:
-            # 获取详细的错误位置信息
-            exc_type, exc_obj, exc_tb = sys.exc_info()
-            file_name = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-            line_number = exc_tb.tb_lineno
-            function_name = exc_tb.tb_frame.f_code.co_name
-            module_name = exc_tb.tb_frame.f_globals.get('__name__', 'unknown')
-            
-            # 构建详细错误日志
-            error_msg = f"""
-{'='*80}
-❌ [AI] AI 调用失败
-{'='*80}
-📍 错误位置：
-   • 模块：{module_name}
-   • 文件：{file_name}
-   • 函数：{function_name}
-   • 行号：{line_number}
-
-🔍 调用上下文：
-   • 模板名称：{template_name}
-   • SQL 内容长度：{len(sql_content)} 字符
-   • SQL 文件名：{sql_file or 'N/A'}
-
-⚠️  客户端状态：
-   • API Key：{'✅ 已设置' if self.api_key else '❌ 未设置'}
-   • Base URL：{'✅ 已设置' if self.base_url else '❌ 未设置'}
-   • Model：{self.model or '❌ 未设置'}
-   • Client：{'✅ 已初始化' if self.client else '❌ None'}
-
-💥 异常信息：
-   • 类型：{type(e).__name__}
-   • 消息：{str(e)}
-
-📋 完整堆栈跟踪：
-{traceback.format_exc()}
-{'='*80}
-"""
-            
             # 输出到日志和控制台
-            logger.error(error_msg)
-            print(error_msg)
-            
+            logger.error(str(e))
             raise
-
 
 class DBUtils:
     """数据库工具类"""
@@ -208,8 +166,11 @@ class DBUtils:
 
         # 创建引擎和会话（默认关闭 SQL 日志输出）
         engine = create_engine(database_url, echo=echo_sql)
-        SessionLocal = sessionmaker(bind=engine)
+        SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, expire_on_commit=False)
         session = SessionLocal()
+        
+        # ⚠️ 显式开始事务，确保 rollback 能正常工作
+        session.begin()
 
         return session
 

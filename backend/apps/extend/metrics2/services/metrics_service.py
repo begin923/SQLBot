@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 # ⚠️ 导入工具类
+from apps.extend.metrics2.services.metadata_service import metadataService
 from apps.extend.metrics2.utils.id_generator import IdGenerator
 from apps.extend.metrics2.utils.batch_query import BatchQueryHelper
 from apps.extend.metrics2.utils.sql_generator import SqlGenerator
@@ -15,22 +16,38 @@ logger = logging.getLogger("MetricsService")
 class MetricsService:
     """指标服务 - 专门处理 METRIC 层的指标数据"""
     
-    def __init__(self, session: Session, lineage_service=None):
+    # ⚠️ 定义关键表配置（包含所有需要的表）
+    ALL_TABLES = [
+        'metric_definition',      # 关键表
+        'metric_source_mapping',  # 关键表
+        'field_lineage',          # 关键表
+        'table_lineage',          # 关键表
+        'metric_dim_rel',         # 可选表
+        'metric_compound_rel',    # 可选表
+        'metric_lineage',         # 可选表
+        'table_metadata'          # ⚠️ 新增：表元数据
+    ]
+    
+    # ⚠️ 关键表配置（用于校验）
+    CRITICAL_TABLES = ['metric_definition', 'metric_source_mapping', 'field_lineage', 'table_lineage','table_metadata']
+    
+    def __init__(self, session: Session, lineage_service=None, check_service=None):
         """
         初始化指标服务
         
         Args:
             session: 数据库会话
             lineage_service: 血缘服务实例（可选，用于复用缓存）
+            check_service: 校验服务实例（可选）
         """
         self.session = session
+        self.check_service = check_service  # ⚠️ 注入 CheckService
         # ⚠️ 使用 IdGenerator 替代手动计数器
         self.metric_id_gen = IdGenerator(session, 'metric_definition', 'M')  # metric_definition 的主键是 id
         self.map_id_gen = IdGenerator(session, 'metric_source_mapping', 'S')  # ⚠️ metric_source_mapping 的 ID 前缀已改为 S
         
         # ⚠️ 创建表元数据服务实例
-        from apps.extend.metrics2.services.table_metadata_service import TableMetadataService
-        self.table_metadata_service = TableMetadataService(session)
+        self.metadata_service = metadataService(session)
         
         # ⚠️ 通过依赖注入获取 LineageService，避免重复创建实例
         if lineage_service is not None:
@@ -41,13 +58,14 @@ class MetricsService:
             self.lineage_service = LineageService(session)
             logger.warning("[指标服务] 未传入 LineageService 实例，创建了新的实例（可能产生缓存隔离）")
     
-    def process(self, processed_results: List[Dict[str, Any]], layer_type: str = "AUTO") -> Dict[str, Any]:
+    def process(self, processed_results: List[Dict[str, Any]], layer_type: str = "AUTO", metric_cache: Dict[str, str] = None) -> Dict[str, Any]:
         """
         处理 METRIC 层指标数据
         
         Args:
             processed_results: 规则引擎处理后的结果列表
             layer_type: 数仓层级类型（DWS/ADS），用于统一推断 source_level
+            metric_cache: 指标缓存 {code: metric_id}，保证同一批次中相同 code 使用相同 ID
             
         Returns:
             处理结果，包含成功状态、消息和表统计信息
@@ -56,36 +74,34 @@ class MetricsService:
             Exception: 当数据处理失败时抛出异常，由主流程统一回滚
         """
         try:
-            # 初始化表数据收集字典
-            table_data = {
-                'metric_definition': [],
-                'metric_dim_rel': [],
-                'metric_source_mapping': [],
-                'metric_compound_rel': [],
-                'table_lineage': [],
-                'field_lineage': [],
-                'metric_lineage': []
-            }
+            # ⚠️ 根据 ALL_TABLES 动态初始化表数据收集字典
+            table_data = {table_name: [] for table_name in self.ALL_TABLES}
+            
+            # ⚠️ 初始化或获取缓存
+            if metric_cache is None:
+                metric_cache = {}
             
             # 遍历所有处理结果，收集指标数据
-            for processed_result in processed_results:                self._collect_metric_data(processed_result, table_data, layer_type)  # ⚠️ 传递 layer_type
-            
-            # ⚠️ 校验数据完整性（失败时抛出异常）
-            validation_result = self._validate_data_integrity(table_data)
-            if not validation_result['success']:
-                raise ValueError(validation_result['message'])  # ⚠️ 抛出异常
-            
-            # 执行数据库插入（不提交事务，由主流程统一提交）
-            execution_result = self._execute_insert(table_data)
-            
-            # ⚠️ 在所有主要数据写入成功后，再处理表元数据
-            if processed_results:
-                self.table_metadata_service.process_table_metadata(processed_results[0], "指标服务", layer_type)  # ⚠️ 传递 layer_type
+            for processed_result in processed_results:
+                self._collect_metric_data(processed_result, table_data, layer_type, metric_cache)  # ⚠️ 传递 metric_cache
+                self.metadata_service.collect_table_metadata(processed_result, table_data, layer_type)
+
+            # ⚠️ 校验数据完整性（调用 CheckService）
+            if self.check_service:
+                validation_result = self.check_service.check_data_integrity(
+                    table_data=table_data,
+                    critical_tables=self.CRITICAL_TABLES  # ⚠️ 传入关键表列表
+                )
+                
+                if not validation_result['success']:
+                    logger.error(validation_result['message'])
+                    raise ValueError(validation_result['message'])  # ⚠️ 抛出异常
             
             return {
                 'success': True,
-                'message': f"METRIC层处理成功，写入 {len(table_data['metric_definition'])} 个指标",
-                'table_stats': execution_result.get('table_stats', {})
+                'message': f"METRIC层数据收集成功",
+                'table_data': table_data,  # ⚠️ 返回原始数据，由主流程统一批量插入
+                'processed_results': processed_results  # ⚠️ 返回原始结果
             }
             
         except ValueError:
@@ -150,7 +166,7 @@ class MetricsService:
             'message': '数据完整性校验通过'
         }
     
-    def _collect_metric_data(self, processed_result: Dict[str, Any], table_data: Dict[str, List], layer_type: str = "AUTO"):
+    def _collect_metric_data(self, processed_result: Dict[str, Any], table_data: Dict[str, List], layer_type: str = "AUTO", metric_cache: Dict[str, str] = None):
         """
         收集 METRIC 层指标数据（总控方法）
             
@@ -158,6 +174,7 @@ class MetricsService:
             processed_result: 单个文件的处理结果
             table_data: 表数据收集字典
             layer_type: 数仓层级类型（DWS/ADS），用于统一推断 source_level
+            metric_cache: 全局缓存 {code: metric_id}，保证同一批次中相同 code 使用相同 ID
         """
         try:
             parsed_data = processed_result.get('parsed_data', {})
@@ -168,7 +185,7 @@ class MetricsService:
             self._collect_lineage_via_service(processed_result, table_data)
                 
             # 2. 收集指标定义（独立，不依赖其他数据）
-            self._collect_metric_definitions(parsed_data, table_data)
+            self._collect_metric_definitions(parsed_data, table_data, metric_cache)
                 
             # 3. 收集指标源映射（依赖 metric_definition 的数据，通过 code 匹配获取 metric_id）
             self._collect_all_source_mappings(parsed_data, table_data, layer_type)
@@ -182,14 +199,9 @@ class MetricsService:
             # 6. 关联指标和字段血缘
             self._collect_metric_field_lineage_rel(table_data)
                 
-            logger.info(f"[指标服务] 收集完成 - "
-                       f"指标: {len(table_data['metric_definition'])}, "
-                       f"源映射: {len(table_data['metric_source_mapping'])}, "
-                       f"复合关系: {len(table_data['metric_compound_rel'])}, "
-                       f"维度关联: {len(table_data['metric_dim_rel'])}, "
-                       f"表血缘: {len(table_data['table_lineage'])}, "
-                       f"字段血缘: {len(table_data['field_lineage'])}, "
-                       f"指标血缘: {len(table_data['metric_lineage'])}")
+            # ⚠️ 详细输出每张表的数据量
+            table_stats = ', '.join([f"{table_name}: {len(records)} 条" for table_name, records in table_data.items()])
+            logger.info(f"[指标服务] ✅ 数据收集成功 - {table_stats}")
                 
         except Exception as e:
             logger.error(f"[指标服务] 收集数据失败: {str(e)}")
@@ -220,13 +232,14 @@ class MetricsService:
         logger.debug(f"[指标服务] 从 LineageService 获取 - 表血缘: {len(lineage_table_data['table_lineage'])}, "
                     f"字段血缘: {len(lineage_table_data['field_lineage'])}")
     
-    def _collect_metric_definitions(self, parsed_data: Dict[str, Any], table_data: Dict[str, List]):
+    def _collect_metric_definitions(self, parsed_data: Dict[str, Any], table_data: Dict[str, List], metric_cache: Dict[str, str] = None):
         """
         收集指标定义（独立，不依赖其他数据）
             
         Args:
             parsed_data: AI 解析后的数据
             table_data: 表数据收集字典
+            metric_cache: 全局缓存 {code: metric_id}，保证同一批次中相同 code 使用相同 ID
         """
         ai_metric_definitions = parsed_data.get('metric_definition', [])
         ai_source_mappings = parsed_data.get('metric_source_mapping', [])
@@ -249,7 +262,11 @@ class MetricsService:
         if duplicate_count > 0:
             logger.info(f"[指标服务] ⚠️ AI 输出中去重: 原始 {len(ai_metric_definitions)} 条, 去重后 {len(unique_metric_defs)} 条, 跳过 {duplicate_count} 条重复")
         
-        # ⚠️ 批量查询已存在的 metric_id（使用去重后的数据）
+        # ⚠️ 初始化缓存
+        if metric_cache is None:
+            metric_cache = {}
+        
+        # ⚠️ 批量查询已存在的 metric_id（从数据库）
         existing_metrics = self._batch_get_metric_ids(unique_metric_defs)
         
         # ⚠️ 构建 metric_en 到 metric_id 的映射（包括新生成的）
@@ -270,11 +287,27 @@ class MetricsService:
             }
             metric_type = metric_type_map.get(metric_type_raw.lower(), 'ATOMIC')
                 
-            # ⚠️ 从批量查询结果中获取 metric_id
-            if metric_en in existing_metrics:
+            # ⚠️ 优先级：全局缓存 > 数据库查询 > 新生成
+            metric_id = None
+            
+            # 1. 先检查全局缓存（同一批次内复用）
+            if metric_en in metric_cache:
+                metric_id = metric_cache[metric_en]
+                logger.debug(f"[指标服务] 从全局缓存复用 metric_id: {metric_id} for {metric_en}")
+            
+            # 2. 再检查数据库（跨批次复用）
+            elif metric_en in existing_metrics:
                 metric_id = existing_metrics[metric_en]
+                logger.debug(f"[指标服务] 从数据库复用 metric_id: {metric_id} for {metric_en}")
+                # ⚠️ 写入全局缓存，供后续文件使用
+                metric_cache[metric_en] = metric_id
+            
+            # 3. 都不存在，生成新的 metric_id
             else:
                 metric_id = self.metric_id_gen.get_next_id()  # ⚠️ 使用 IdGenerator
+                logger.debug(f"[指标服务] 生成新 metric_id: {metric_id} for {metric_en}")
+                # ⚠️ 写入全局缓存
+                metric_cache[metric_en] = metric_id
             
             # 记录映射关系
             metric_en_to_id[metric_en] = metric_id
@@ -776,71 +809,3 @@ class MetricsService:
                 lineage_count += 1
         
         logger.info(f"[指标服务-metric_lineage] ✅ 收集完成: {lineage_count} 条记录")
-    
-
-    def _execute_insert(self, table_data: Dict[str, List]) -> Dict[str, Any]:
-        """执行数据库插入操作（使用 SqlGenerator）"""
-        table_stats = {}
-        
-        try:
-            # 定义各表的配置
-            table_configs = {
-                'metric_definition': {
-                    'columns': ['id', 'name', 'code', 'metric_type', 'biz_domain', 'status', 'create_time', 'modify_time'],  # ⚠️ 已删除 cal_logic, unit
-                    'conflict_target': '(code)'
-                },
-                'metric_dim_rel': {
-                    'columns': ['metric_id', 'dim_id', 'is_required', 'create_time', 'modify_time'],
-                    'conflict_target': '(metric_id, dim_id)'
-                },
-                'metric_source_mapping': {
-                    'columns': ['id', 'metric_id', 'source_type', 'datasource', 'db_table', 'metric_column', 'metric_name', 'biz_domain', 'filter_condition', 'agg_func', 'priority', 'is_valid', 'source_level', 'cal_logic', 'unit', 'create_time', 'modify_time'],  # ⚠️ 新增 metric_name, biz_domain, cal_logic, unit
-                    'conflict_target': '(metric_id, db_table, metric_column)'
-                },
-                'metric_compound_rel': {
-                    'columns': ['metric_id', 'sub_metric_id', 'cal_operator', 'sort', 'create_time', 'modify_time'],
-                    'conflict_target': '(metric_id, sub_metric_id)'
-                },
-                'table_lineage': {
-                    'columns': ['id', 'source_table', 'source_table_name', 'target_table', 'target_table_name', 'create_time', 'modify_time'],
-                    'conflict_target': '(id)'
-                },
-                'field_lineage': {
-                    'columns': ['id', 'table_lineage_id', 'source_table', 'source_table_name', 'source_field', 'source_field_name', 'target_table', 'target_table_name', 'target_field', 'target_field_name', 'target_field_mark', 'dim_id', 'formula', 'create_time', 'modify_time'],
-                    'conflict_target': '(source_table, source_field, target_table, target_field)'
-                },
-                'metric_lineage': {
-                    'columns': ['metric_id', 'field_lineage_id', 'create_time', 'modify_time'],
-                    'conflict_target': '(metric_id, field_lineage_id)'
-                }
-            }
-            
-            # ⚠️ 批量插入各表数据（使用 SqlGenerator）
-            for table_name, data_list in table_data.items():
-                if not data_list:
-                    continue
-                
-                config = table_configs.get(table_name)
-                if not config:
-                    logger.warning(f"[指标服务] 未知的表名: {table_name}")
-                    continue
-                
-                # ⚠️ 使用 SqlGenerator 生成 SQL
-                sql = SqlGenerator.generate_batch_upsert(table_name, config, data_list)
-                if sql:
-                    self.session.execute(text(sql))
-                    table_stats[table_name] = len(data_list)
-                    logger.info(f"[指标服务] 批量插入 {table_name}: {len(data_list)} 条")
-            
-            # ⚠️ 不再提交事务，由主流程统一提交
-            logger.info(f"[指标服务] ✅ 处理完成 - 共写入 {sum(table_stats.values())} 条记录，等待主流程提交")
-            
-            return {
-                'success': True,
-                'table_stats': table_stats
-            }
-            
-        except Exception as e:
-            logger.error(f"[指标服务] 执行插入失败: {str(e)}", exc_info=True)
-            # ⚠️ 不再返回失败字典，直接抛出异常由主流程统一回滚
-            raise

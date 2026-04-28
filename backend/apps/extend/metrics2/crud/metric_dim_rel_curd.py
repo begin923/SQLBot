@@ -47,7 +47,7 @@ def create_metric_dim_rel(session: Session, info: MetricDimRelInfo):
     session.flush()
     session.refresh(metric_dim_rel)
 
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return metric_dim_rel.id
 
@@ -146,7 +146,7 @@ def update_metric_dim_rel(session: Session, info: MetricDimRelInfo):
     )
 
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return info.id
 
@@ -161,7 +161,7 @@ def delete_metric_dim_rel(session: Session, ids: List[int]):
     """
     stmt = delete(MetricDimRel).where(MetricDimRel.id.in_(ids))
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
 
 def get_metric_dim_rel_by_id(session: Session, id: int) -> Optional[MetricDimRelInfo]:

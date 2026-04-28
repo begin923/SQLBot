@@ -49,7 +49,7 @@ def create_field_lineage(session: Session, info: FieldLineageInfo):
     session.add(lineage)
     session.flush()
     session.refresh(lineage)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return lineage.lineage_id
 
@@ -102,7 +102,7 @@ def delete_field_lineage(session: Session, lineage_ids: List[str]):
     """删除字段级血缘记录"""
     stmt = delete(FieldLineage).where(FieldLineage.lineage_id.in_(lineage_ids))
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
 
 def get_field_lineage_by_id(session: Session, lineage_id: str) -> Optional[FieldLineageInfo]:

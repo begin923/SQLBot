@@ -34,7 +34,7 @@ def create_table_lineage(session: Session, info: TableLineageInfo):
     session.add(lineage)
     session.flush()
     session.refresh(lineage)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return lineage.lineage_id
 
@@ -86,7 +86,7 @@ def delete_table_lineage(session: Session, lineage_ids: List[str]):
     """删除表级血缘记录"""
     stmt = delete(TableLineage).where(TableLineage.lineage_id.in_(lineage_ids))
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
 
 def get_table_lineage_by_id(session: Session, lineage_id: str) -> Optional[TableLineageInfo]:

@@ -1,7 +1,7 @@
 from typing import List, Optional
 from fastapi import APIRouter, Query
 
-from apps.extend.metrics2.curd.metric_dim_rel_curd import (
+from apps.extend.metrics2.crud.metric_dim_rel_curd import (
     create_metric_dim_rel,
     batch_create_metric_dim_rel,
     update_metric_dim_rel,

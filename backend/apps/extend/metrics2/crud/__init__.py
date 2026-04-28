@@ -1,4 +1,4 @@
-from apps.extend.metrics2.curd.metric_definition_curd import (
+from apps.extend.metrics2.crud.metric_definition_curd import (
     create_metric_definition,
     batch_create_metric_definition,
     get_metric_definition_by_id,
@@ -6,7 +6,7 @@ from apps.extend.metrics2.curd.metric_definition_curd import (
     delete_metric_definition
 )
 
-from apps.extend.metrics2.curd.metric_dim_rel_curd import (
+from apps.extend.metrics2.crud.metric_dim_rel_curd import (
     create_metric_dim_rel,
     batch_create_metric_dim_rel,
     get_metric_dim_rel_by_id,
@@ -17,7 +17,7 @@ from apps.extend.metrics2.curd.metric_dim_rel_curd import (
     delete_metric_dim_rel
 )
 
-from apps.extend.metrics2.curd.metric_source_mapping_curd import (
+from apps.extend.metrics2.crud.metric_source_mapping_curd import (
     create_metric_source_mapping,
     batch_create_metric_source_mapping,
     get_metric_source_mapping_by_id,
@@ -28,7 +28,7 @@ from apps.extend.metrics2.curd.metric_source_mapping_curd import (
     delete_metric_source_mapping
 )
 
-from apps.extend.metrics2.curd.metric_compound_rel_curd import (
+from apps.extend.metrics2.crud.metric_compound_rel_curd import (
     create_metric_compound_rel,
     batch_create_metric_compound_rel,
     get_metric_compound_rel_by_id,
@@ -39,7 +39,7 @@ from apps.extend.metrics2.curd.metric_compound_rel_curd import (
     delete_metric_compound_rel
 )
 
-from apps.extend.metrics2.curd.dim_definition_curd import (
+from apps.extend.metrics2.crud.dim_definition_curd import (
     create_dim_dict,
     batch_create_dim_dict,
     get_dim_dict_by_id,
@@ -51,7 +51,7 @@ from apps.extend.metrics2.curd.dim_definition_curd import (
 )
 
 # 版本管理层
-from apps.extend.metrics2.curd.metric_version_curd import (
+from apps.extend.metrics2.crud.metric_version_curd import (
     create_metric_version,
     batch_create_metric_version,
     get_metric_version_by_id,
@@ -64,7 +64,7 @@ from apps.extend.metrics2.curd.metric_version_curd import (
     get_all_metric_version
 )
 
-from apps.extend.metrics2.curd.dim_version_curd import (
+from apps.extend.metrics2.crud.dim_version_curd import (
     create_dim_version,
     batch_create_dim_version,
     get_dim_version_by_id,
@@ -77,7 +77,7 @@ from apps.extend.metrics2.curd.dim_version_curd import (
 )
 
 # 双血缘层
-from apps.extend.metrics2.curd.table_lineage_curd import (
+from apps.extend.metrics2.crud.table_lineage_curd import (
     create_table_lineage,
     batch_create_table_lineage,
     get_table_lineage_by_id,
@@ -87,7 +87,7 @@ from apps.extend.metrics2.curd.table_lineage_curd import (
     get_all_table_lineage
 )
 
-from apps.extend.metrics2.curd.field_lineage_curd import (
+from apps.extend.metrics2.crud.field_lineage_curd import (
     create_field_lineage,
     batch_create_field_lineage,
     get_field_lineage_by_id,
@@ -98,7 +98,7 @@ from apps.extend.metrics2.curd.field_lineage_curd import (
     get_all_field_lineage
 )
 
-from apps.extend.metrics2.curd.metric_lineage_curd import (
+from apps.extend.metrics2.crud.metric_lineage_curd import (
     create_metric_lineage,
     batch_create_metric_lineage,
     get_metric_lineage_by_id,
@@ -107,7 +107,7 @@ from apps.extend.metrics2.curd.metric_lineage_curd import (
     get_all_metric_lineage
 )
 
-from apps.extend.metrics2.curd.dim_field_lineage_curd import (
+from apps.extend.metrics2.crud.dim_field_lineage_curd import (
     create_dim_field_lineage,
     batch_create_dim_field_lineage,
     get_dim_field_lineage_by_id,

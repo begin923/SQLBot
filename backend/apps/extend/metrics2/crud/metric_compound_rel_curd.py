@@ -51,7 +51,7 @@ def create_metric_compound_rel(session: Session, info: MetricCompoundRelInfo):
     session.flush()
     session.refresh(metric_compound_rel)
 
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return metric_compound_rel.id
 
@@ -151,7 +151,7 @@ def update_metric_compound_rel(session: Session, info: MetricCompoundRelInfo):
     )
 
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return info.id
 
@@ -166,7 +166,7 @@ def delete_metric_compound_rel(session: Session, ids: List[int]):
     """
     stmt = delete(MetricCompoundRel).where(MetricCompoundRel.id.in_(ids))
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
 
 def get_metric_compound_rel_by_id(session: Session, id: int) -> Optional[MetricCompoundRelInfo]:

@@ -1,7 +1,7 @@
 from typing import List, Optional
 from fastapi import APIRouter, Query
 
-from apps.extend.metrics2.curd.dim_definition_curd import (
+from apps.extend.metrics2.crud.dim_definition_curd import (
     create_dim_dict,
     batch_create_dim_dict,
     update_dim_dict,

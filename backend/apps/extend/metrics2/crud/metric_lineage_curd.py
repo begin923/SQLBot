@@ -33,7 +33,7 @@ def create_metric_lineage(session: Session, info: MetricLineageInfo):
     session.add(lineage)
     session.flush()
     session.refresh(lineage)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return lineage.id
 
@@ -85,7 +85,7 @@ def delete_metric_lineage(session: Session, ids: List[int]):
     """删除指标血缘记录"""
     stmt = delete(MetricLineage).where(MetricLineage.id.in_(ids))
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
 
 def get_metric_lineage_by_id(session: Session, id: int) -> Optional[MetricLineageInfo]:

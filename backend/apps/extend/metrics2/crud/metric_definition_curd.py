@@ -58,7 +58,7 @@ def create_metric_definition(session: Session, info: MetricDefinitionInfo):
     session.flush()
     session.refresh(metric_def)
 
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return metric_def.metric_id
 
@@ -161,7 +161,7 @@ def update_metric_definition(session: Session, info: MetricDefinitionInfo):
     )
 
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return info.metric_id
 
@@ -176,7 +176,7 @@ def delete_metric_definition(session: Session, metric_ids: List[str]):
     """
     stmt = delete(MetricDefinition).where(MetricDefinition.metric_id.in_(metric_ids))
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
 
 def get_metric_definition_by_id(session: Session, metric_id: str) -> Optional[MetricDefinitionInfo]:

@@ -2,11 +2,16 @@
 SQL 解析成功记录 CURD 操作
 """
 from datetime import datetime
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Dict, Any
 import json
+import logging
+
+from sqlalchemy.dialects.postgresql import insert
 from sqlmodel import Session, select
 
 from apps.extend.metrics2.models.sql_parse_success_log_model import SqlParseSuccessLog
+
+logger = logging.getLogger(__name__)
 
 
 def create_or_update_success_log(
@@ -19,7 +24,7 @@ def create_or_update_success_log(
     processing_duration: Optional[float] = None
 ) -> SqlParseSuccessLog:
     """
-    创建或更新成功记录（UPSERT）
+    创建或更新成功记录（UPSERT）- 单条记录
     
     Args:
         session: 数据库会话
@@ -33,12 +38,10 @@ def create_or_update_success_log(
     Returns:
         创建或更新的记录
     """
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
-    
     # 准备数据
     now = datetime.utcnow()
     data = {
-        'file_path': file_path,
+        'file_path': str(file_path),  # ⚠️ 确保转换为字符串
         'file_name': file_name,
         'layer_type': layer_type,
         'target_table': target_table,
@@ -50,7 +53,7 @@ def create_or_update_success_log(
     }
     
     # 使用 PostgreSQL 的 UPSERT 语法
-    stmt = pg_insert(SqlParseSuccessLog).values(**data)
+    stmt = insert(SqlParseSuccessLog).values(**data)
     
     # 如果冲突（file_path 已存在），则更新相关字段
     update_dict = {
@@ -68,7 +71,7 @@ def create_or_update_success_log(
     )
     
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 不调用 session.commit()，由调用方在事务中统一管理
     
     # 查询并返回最新记录
     statement = select(SqlParseSuccessLog).where(
@@ -78,6 +81,85 @@ def create_or_update_success_log(
     log = result.scalars().one()
     
     return log
+
+
+def batch_create_or_update_success_logs(
+    session: Session,
+    success_logs: List[Dict[str, Any]]
+) -> int:
+    """
+    批量创建或更新成功记录（UPSERT）
+    
+    Args:
+        session: 数据库会话
+        success_logs: 成功日志列表，每个元素包含：
+            - file_path: 文件路径
+            - file_name: 文件名
+            - layer_type: 层级类型
+            - target_table: 目标表名（可选）
+            - table_stats: 表统计信息（可选）
+            - processing_duration: 处理耗时（可选）
+    
+    Returns:
+        成功插入/更新的记录数量
+    """
+    if not success_logs:
+        return 0
+    
+    try:
+        now = datetime.utcnow()
+        
+        # 构建批量数据
+        values_list = []
+        for log_data in success_logs:
+            file_path = log_data.get('file_path', '')
+            if not file_path:
+                continue
+            
+            values_list.append({
+                'file_path': str(file_path),
+                'file_name': log_data.get('file_name', ''),
+                'layer_type': log_data.get('layer_type', 'UNKNOWN'),
+                'target_table': log_data.get('target_table'),
+                'table_stats': json.dumps(log_data.get('table_stats')) if log_data.get('table_stats') else None,
+                'parse_time': now,
+                'processing_duration': log_data.get('processing_duration'),
+                'create_time': now,
+                'modify_time': now
+            })
+        
+        if not values_list:
+            return 0
+        
+        # 使用 PostgreSQL 的批量 UPSERT 语法
+        stmt = insert(SqlParseSuccessLog).values(values_list)
+        
+        # 如果冲突（file_path 已存在），则更新相关字段
+        update_dict = {
+            'layer_type': stmt.excluded.layer_type,
+            'target_table': stmt.excluded.target_table,
+            'table_stats': stmt.excluded.table_stats,
+            'parse_time': stmt.excluded.parse_time,
+            'processing_duration': stmt.excluded.processing_duration,
+            'modify_time': now
+        }
+        
+        stmt = stmt.on_conflict_do_update(
+            index_elements=['file_path'],
+            set_=update_dict
+        )
+        
+        result = session.execute(stmt)
+        # ⚠️ 不调用 session.commit()，由调用方在事务中统一管理
+        
+        inserted_count = len(values_list)
+        logger.info(f"[成功日志] 批量插入 {inserted_count} 条成功记录")
+        
+        return inserted_count
+    
+    except Exception as e:
+        logger.error(f"[成功日志] 批量插入失败: {str(e)}")
+        raise
 
 
 def get_success_log(session: Session, file_path: str) -> Optional[SqlParseSuccessLog]:
@@ -161,7 +243,7 @@ def delete_success_log(session: Session, file_path: str) -> bool:
     
     if log:
         session.delete(log)
-        session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
         return True
     
     return False

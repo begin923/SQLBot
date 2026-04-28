@@ -24,7 +24,7 @@ class SqlParseSuccessLog(SQLModel, table=True):
     modify_time: datetime = Field(default_factory=datetime.utcnow, description="记录最后更新时间")
     
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "file_path": "/path/to/dim_accounting_period.sql",
                 "file_name": "dim_accounting_period.sql",

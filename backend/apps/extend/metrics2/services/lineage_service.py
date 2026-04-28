@@ -7,6 +7,7 @@ from typing import Dict, List, Any, Tuple
 from sqlalchemy import text
 
 # ⚠️ 导入工具类
+from apps.extend.metrics2.services.metadata_service import metadataService
 from apps.extend.metrics2.utils.id_generator import IdGenerator
 from apps.extend.metrics2.utils.batch_query import BatchQueryHelper
 from apps.extend.metrics2.utils.sql_generator import SqlGenerator
@@ -27,14 +28,19 @@ class LineageService:
     4. 执行数据库插入
     """
     
-    def __init__(self, session):
+    # ⚠️ 定义关键表配置
+    CRITICAL_TABLES = ['table_lineage', 'field_lineage','table_metadata']
+    
+    def __init__(self, session, check_service=None):
         """
         初始化血缘服务
         
         Args:
             session: 数据库会话
+            check_service: 校验服务实例（可选）
         """
         self.session = session
+        self.check_service = check_service  # ⚠️ 注入 CheckService
         # ⚠️ 使用全局缓存（单例模式）
         self.cache = LineageCache()
         
@@ -43,12 +49,11 @@ class LineageService:
         self.field_lineage_id_gen = IdGenerator(session, 'field_lineage', 'F')
         
         # ⚠️ 创建表元数据服务实例
-        from apps.extend.metrics2.services.table_metadata_service import TableMetadataService
-        self.table_metadata_service = TableMetadataService(session)
+        self.metadata_service = metadataService(session)
         
         logger.info("[LineageService] 实例已创建（使用全局缓存）")
     
-    def process(self, processed_results: List[Dict[str, Any]], layer_type: str = "AUTO") -> Dict[str, Any]:
+    def process(self, processed_results: List[Dict[str, Any]], layer_type) -> Dict[str, Any]:
         """
         处理 DWD 层血缘数据
         
@@ -60,11 +65,8 @@ class LineageService:
             执行结果 {'success': bool, 'message': str, 'table_stats': dict}
         """
         try:
-            # 初始化表数据收集字典
-            table_data = {
-                'table_lineage': [],
-                'field_lineage': []
-            }
+            # ⚠️ 根据 CRITICAL_TABLES 动态初始化表数据收集字典
+            table_data = {table_name: [] for table_name in self.CRITICAL_TABLES}
             
             # 遍历所有处理结果，收集血缘数据
             for idx, processed_result in enumerate(processed_results, 1):
@@ -73,28 +75,30 @@ class LineageService:
                     continue
                 
                 self.collect_lineage(processed_result, table_data)
+                self.metadata_service.collect_table_metadata(processed_result, table_data, layer_type)
+
             
-            # 校验数据完整性
-            if not table_data['table_lineage']:
-                error_msg = "❌ WIDE 层（宽表/明细层）未生成任何 table_lineage 数据"
-                logger.error(error_msg)
-                raise ValueError(error_msg)  # ⚠️ 抛出异常
+            # ⚠️ 校验数据完整性（调用 CheckService）
+            if self.check_service:
+                validation_result = self.check_service.check_data_integrity(
+                    table_data=table_data,
+                    critical_tables=self.CRITICAL_TABLES  # ⚠️ 传入关键表列表
+                )
+                
+                if not validation_result['success']:
+                    logger.error(validation_result['message'])
+                    raise ValueError(validation_result['message'])  # ⚠️ 抛出异常
             
-            if not table_data['field_lineage']:
-                error_msg = "❌ WIDE 层（宽表/明细层）未生成任何 field_lineage 数据"
-                logger.error(error_msg)
-                raise ValueError(error_msg)  # ⚠️ 抛出异常
+            # ⚠️ 详细输出每张表的数据量
+            table_stats = ', '.join([f"{table_name}: {len(records)} 条" for table_name, records in table_data.items()])
+            logger.info(f"[血缘服务] ✅ 数据收集成功 - {table_stats}")
             
-            # 执行数据库插入
-            execution_result = self._execute_insert(table_data)
-            
-            # ⚠️ 在所有主要数据写入成功后，再处理表元数据
-            if processed_results:
-                self.table_metadata_service.process_table_metadata(processed_results[0], "血缘服务", layer_type)
-                # 将 table_metadata 计入统计
-                execution_result['table_stats']['table_metadata'] = 1
-            
-            logger.info(f"[血缘服务] ✅ 处理完成 - 表血缘: {len(table_data['table_lineage'])}, 字段血缘: {len(table_data['field_lineage'])}")
+            return {
+                'success': True,
+                'message': f"{layer_type}层数据收集成功",
+                'table_data': table_data,  # ⚠️ 返回原始数据，由主流程统一批量插入
+                'processed_results': processed_results  # ⚠️ 返回原始结果，供主流程处理 table_metadata
+            }
             
         except ValueError:
             # ⚠️ 业务逻辑错误，直接向上抛出
@@ -211,7 +215,7 @@ class LineageService:
             )
             logger.debug(f"[血缘服务] 数据库中已存在 {len(existing_table_lineage)} 条表血缘记录")
         
-        # ⚠️ 第四步：为所有表对生成或复用 lineage_id（包括已存在的）
+        # ⚠️ 第四步：为所有表对生成或复用 lineage_id（包括已存在的），并添加到 table_data
         new_count = 0
         skipped_count = 0
         
@@ -220,7 +224,9 @@ class LineageService:
         
         for tl in unique_table_lineage:
             source_table = tl.get('source_table', '')
+            source_table_name = tl.get('source_table_name', '')  # ⚠️ 新增
             tgt_table = tl.get('target_table', target_table)
+            target_table_name = tl.get('target_table_name', '')  # ⚠️ 新增
             
             if not source_table:
                 continue
@@ -233,25 +239,36 @@ class LineageService:
                 lineage_id = existing_table_lineage[key]
                 skipped_count += 1
                 logger.debug(f"[血缘服务] 表血缘已存在，跳过插入: {source_table} -> {tgt_table} (ID: {lineage_id})")
+            else:
+                # ⚠️ 生成新的 lineage_id（使用 IdGenerator），并确保不与批次内已有 ID 冲突
+                max_retries = 10
+                lineage_id = None
+                for retry in range(max_retries):
+                    candidate_id = self.table_lineage_id_gen.get_next_id()
+                    if candidate_id not in seen_ids:
+                        lineage_id = candidate_id
+                        seen_ids.add(lineage_id)
+                        break
+                    else:
+                        logger.warning(f"[血缘服务] ⚠️ ID {candidate_id} 已在批次中使用，重新生成...")
+                
+                if not lineage_id:
+                    logger.error(f"[血缘服务] ❌ 无法生成唯一的 lineage_id，已达到最大重试次数 {max_retries}")
+                    raise Exception(f"无法生成唯一的 lineage_id")
+                
+                new_count += 1
+                logger.debug(f"[血缘服务] 生成新表血缘ID: {source_table} -> {tgt_table} (ID: {lineage_id})")
             
-            # ⚠️ 生成新的 lineage_id（使用 IdGenerator），并确保不与批次内已有 ID 冲突
-            max_retries = 10
-            lineage_id = None
-            for retry in range(max_retries):
-                candidate_id = self.table_lineage_id_gen.get_next_id()
-                if candidate_id not in seen_ids:
-                    lineage_id = candidate_id
-                    seen_ids.add(lineage_id)
-                    break
-                else:
-                    logger.warning(f"[血缘服务] ⚠️ ID {candidate_id} 已在批次中使用，重新生成...")
-            
-            if not lineage_id:
-                logger.error(f"[血缘服务] ❌ 无法生成唯一的 lineage_id，已达到最大重试次数 {max_retries}")
-                raise Exception(f"无法生成唯一的 lineage_id")
-            
-            new_count += 1
-            logger.debug(f"[血缘服务] 生成新表血缘ID: {source_table} -> {tgt_table} (ID: {lineage_id})")
+            # ⚠️ 关键修复：将表血缘数据添加到 table_data
+            table_data['table_lineage'].append({
+                'id': lineage_id,
+                'source_table': source_table,
+                'source_table_name': source_table_name,
+                'target_table': tgt_table,
+                'target_table_name': target_table_name,
+                'create_time': get_now_utc8(),
+                'modify_time': get_now_utc8()
+            })
         
         logger.info(f"[血缘服务] 📊 表血缘收集完成: 新增 {new_count} 条, 复用 {skipped_count} 条已存在记录")
     
@@ -519,90 +536,3 @@ class LineageService:
                 table_lineage_ids.append(exact_match_id)
         
         return table_lineage_ids
-    
-    def _execute_insert(self, table_data: Dict[str, List]) -> Dict[str, Any]:
-        """
-        执行数据库插入操作（使用 SqlGenerator）
-        
-        Args:
-            table_data: 表数据收集字典
-            
-        Returns:
-            执行结果
-        """
-        try:
-            # 定义各表的配置
-            table_configs = {
-                'table_lineage': {
-                    'columns': ['id', 'source_table', 'source_table_name', 'target_table', 'target_table_name', 'create_time', 'modify_time'],
-                    'conflict_target': '(source_table, target_table)'
-                },
-                'field_lineage': {
-                    'columns': ['id', 'table_lineage_id', 'source_table', 'source_table_name', 'source_field', 'source_field_name', 'target_table', 'target_table_name', 'target_field', 'target_field_name', 'target_field_mark', 'dim_id', 'formula', 'create_time', 'modify_time'],
-                    'conflict_target': '(source_table, source_field, target_table, target_field)'
-                }
-            }
-            
-            table_stats = {}
-            
-            # 批量插入 table_lineage（使用 SqlGenerator）
-            # ⚠️ 过滤掉 is_exists=True 的记录（已存在于数据库）
-            new_table_lineage = [item for item in table_data['table_lineage'] if not item.get('is_exists', False)]
-            
-            if new_table_lineage:
-                config = table_configs['table_lineage']
-                sql = SqlGenerator.generate_batch_upsert('table_lineage', config, new_table_lineage)
-                if sql:
-                    result = self.session.execute(text(sql))
-                    inserted_count = result.rowcount if result.rowcount is not None else len(new_table_lineage)
-                    skipped_count = len(new_table_lineage) - inserted_count
-                    
-                    # ⚠️ 更新缓存：将新插入的记录添加到缓存
-                    for item in new_table_lineage:
-                        self.cache.add_table_lineage(
-                            item['source_table'],
-                            item['target_table'],
-                            item['id']
-                        )
-                    
-                    table_stats['table_lineage'] = inserted_count
-                    logger.info(f"[血缘服务] 💾 批量插入 table_lineage: {inserted_count} 条新增, {skipped_count} 条已存在跳过")
-            else:
-                table_stats['table_lineage'] = 0
-                logger.debug(f"[血缘服务] 无需插入 table_lineage（所有记录均已存在）")
-            
-            # 批量插入 field_lineage（使用 SqlGenerator）
-            if table_data['field_lineage']:
-                config = table_configs['field_lineage']
-                sql = SqlGenerator.generate_batch_upsert('field_lineage', config, table_data['field_lineage'])
-                if sql:
-                    self.session.execute(text(sql))
-                    table_stats['field_lineage'] = len(table_data['field_lineage'])
-                    logger.info(f"[血缘服务] 💾 批量插入 field_lineage: {len(table_data['field_lineage'])} 条")
-            
-            # ⚠️ 不再提交事务，由主流程统一提交
-            logger.info("[血缘服务] 数据已准备就绪，等待主流程提交")
-            
-            return {
-                'success': True,
-                'table_stats': table_stats
-            }
-            
-        except Exception as e:
-            # ⚠️ 不再回滚，由主流程统一处理
-            error_type = type(e).__name__
-            error_str = str(e)
-            
-            if 'StringDataRightTruncation' in error_str:
-                error_msg = f"[血缘服务] 处理失败: 字段长度超限 (VARCHAR(500))"
-            elif 'UniqueViolation' in error_str or 'CardinalityViolation' in error_str:
-                error_msg = f"[血缘服务] 处理失败: 唯一约束冲突"
-            elif 'PendingRollback' in error_str:
-                error_msg = f"[血缘服务] 处理失败: 事务状态异常"
-            elif 'StatementError' in error_str or 'InvalidRequestError' in error_str:
-                error_msg = f"[血缘服务] 处理失败: SQL参数错误 ({error_type})"
-            else:
-                error_msg = f"[血缘服务] 处理失败: {error_type}"
-            
-            logger.error(error_msg)
-            raise

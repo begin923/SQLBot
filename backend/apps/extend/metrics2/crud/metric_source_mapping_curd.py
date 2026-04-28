@@ -61,7 +61,7 @@ def create_metric_source_mapping(session: Session, info: MetricSourceMappingInfo
     session.flush()
     session.refresh(metric_source_mapping)
 
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return metric_source_mapping.map_id
 
@@ -167,7 +167,7 @@ def update_metric_source_mapping(session: Session, info: MetricSourceMappingInfo
     )
 
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return info.map_id
 
@@ -182,7 +182,7 @@ def delete_metric_source_mapping(session: Session, map_ids: List[str]):
     """
     stmt = delete(MetricSourceMapping).where(MetricSourceMapping.map_id.in_(map_ids))
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
 
 def get_metric_source_mapping_by_id(session: Session, map_id: str) -> Optional[MetricSourceMappingInfo]:

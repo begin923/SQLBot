@@ -52,7 +52,7 @@ def create_dim_version(session: Session, info: DimVersionInfo):
     session.add(version)
     session.flush()
     session.refresh(version)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return version.version_id
 
@@ -99,7 +99,7 @@ def update_dim_version(session: Session, info: DimVersionInfo):
     )
 
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return info.version_id
 
@@ -108,7 +108,7 @@ def delete_dim_version(session: Session, version_ids: List[str]):
     """删除维度版本记录"""
     stmt = delete(DimVersion).where(DimVersion.version_id.in_(version_ids))
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
 
 def get_dim_version_by_id(session: Session, version_id: str) -> Optional[DimVersionInfo]:

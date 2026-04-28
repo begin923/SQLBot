@@ -27,7 +27,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from apps.extend.metrics2.services import MetricsPlatformService
+from apps.extend.metrics2.services import orchestrationService
 from apps.extend.utils.utils import DBUtils
 import traceback
 import time
@@ -165,7 +165,7 @@ def test_single_file():
     
     try:
         # 创建服务实例
-        platform_service = MetricsPlatformService(session)
+        platform_service = orchestrationService(session)
         
         # ⚠️ 步骤1：使用AUTO模式，让主程序自动识别和处理
         print(f"\n🔍 步骤1: 使用AUTO模式...")

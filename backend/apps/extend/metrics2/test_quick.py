@@ -9,7 +9,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from apps.extend.metrics2.services import MetricsPlatformService
+from apps.extend.metrics2.services import orchestrationService
 from apps.extend.utils.utils import DBUtils
 
 if __name__ == "__main__":
@@ -19,8 +19,8 @@ if __name__ == "__main__":
     
     session = DBUtils.create_local_session()
     try:
-        platform_service = MetricsPlatformService(session)
-        result = platform_service.process_sql_files(
+        platform_service = orchestrationService(session)
+        result = platform_service.process(
             input_path=sql_file
         )
         

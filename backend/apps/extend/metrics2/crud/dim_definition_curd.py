@@ -48,7 +48,7 @@ def create_dim_dict(session: Session, info: DimDictInfo):
     session.flush()
     session.refresh(dim_dict)
 
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return dim_dict.dim_id
 
@@ -147,7 +147,7 @@ def update_dim_dict(session: Session, info: DimDictInfo):
     )
 
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return info.dim_id
 
@@ -162,7 +162,7 @@ def delete_dim_dict(session: Session, dim_ids: List[str]):
     """
     stmt = delete(DimDict).where(DimDict.dim_id.in_(dim_ids))
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
 
 def get_dim_dict_by_id(session: Session, dim_id: str) -> Optional[DimDictInfo]:

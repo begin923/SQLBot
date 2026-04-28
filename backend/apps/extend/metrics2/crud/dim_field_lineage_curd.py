@@ -40,7 +40,7 @@ def create_dim_field_lineage(session: Session, info: DimFieldLineageInfo):
         if info.field_name:
             exists_query.field_name = info.field_name.strip()
         session.flush()
-        session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
         return exists_query.id  # 返回已有ID
     else:
         # 插入新记录（需要生成ID）
@@ -58,7 +58,7 @@ def create_dim_field_lineage(session: Session, info: DimFieldLineageInfo):
         
         session.add(lineage)
         session.flush()
-        session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
         return new_id
 
 
@@ -132,7 +132,7 @@ def delete_dim_field_lineage(session: Session, ids: List[str]):
     """
     stmt = delete(DimFieldLineage).where(DimFieldLineage.id.in_(ids))
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
 
 def get_dim_field_lineage_by_id(session: Session, id: str) -> Optional[DimFieldLineageInfo]:

@@ -1,7 +1,7 @@
 from typing import List, Optional
 from fastapi import APIRouter, Query
 
-from apps.extend.metrics2.curd.metric_definition_curd import (
+from apps.extend.metrics2.crud.metric_definition_curd import (
     create_metric_definition,
     batch_create_metric_definition,
     update_metric_definition,

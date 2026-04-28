@@ -1,7 +1,7 @@
 from typing import List, Optional
 from fastapi import APIRouter, Query
 
-from apps.extend.metrics2.curd.metric_source_mapping_curd import (
+from apps.extend.metrics2.crud.metric_source_mapping_curd import (
     create_metric_source_mapping,
     batch_create_metric_source_mapping,
     update_metric_source_mapping,

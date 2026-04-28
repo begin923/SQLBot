@@ -3,7 +3,6 @@ from typing import Optional
 from sqlalchemy import func, Text
 from sqlmodel import SQLModel, Field, Column, VARCHAR, DATETIME
 
-
 class FieldLineage(SQLModel, table=True):
     """字段级血缘表 - 校验核心（含维度标记）"""
     __tablename__ = "field_lineage"
@@ -11,9 +10,9 @@ class FieldLineage(SQLModel, table=True):
     id: str = Field(sa_column=Column(VARCHAR(32), primary_key=True, comment='字段血缘ID(F000001)'))
     table_lineage_id: str = Field(sa_column=Column(VARCHAR(500), nullable=False, comment='关联的表血缘ID（多个用逗号分隔）'))
     source_table: str = Field(sa_column=Column(VARCHAR(500), nullable=False, comment='上游源表（多个用逗号分隔）'))
-    source_field: str = Field(sa_column=Column(VARCHAR(500), nullable=False, comment='上游源字段'))
+    source_field: str = Field(sa_column=Column(Text(), nullable=False, comment='上游源字段'))
     target_table: str = Field(sa_column=Column(VARCHAR(128), nullable=False, comment='下游目标表'))
-    target_field: str = Field(sa_column=Column(VARCHAR(500), nullable=False, comment='下游目标字段'))
+    target_field: str = Field(sa_column=Column(Text(), nullable=False, comment='下游目标字段'))
     target_field_mark: str = Field(default='normal', sa_column=Column(VARCHAR(16), nullable=False, server_default='normal', comment='目标字段标记：public_dim/private_dim/metric/normal'))
     dim_id: Optional[str] = Field(default=None, sa_column=Column(VARCHAR(32), nullable=True, comment='公共维度绑定ID'))
     formula: Optional[str] = Field(default=None, sa_column=Column(Text(), nullable=True, comment='字段计算公式/表达式（支持长SQL）'))

@@ -56,7 +56,7 @@ def create_metric_version(session: Session, info: MetricVersionInfo):
     session.add(version)
     session.flush()
     session.refresh(version)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return version.version_id
 
@@ -133,7 +133,7 @@ def update_metric_version(session: Session, info: MetricVersionInfo):
     )
 
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
     return info.version_id
 
@@ -148,7 +148,7 @@ def delete_metric_version(session: Session, version_ids: List[str]):
     """
     stmt = delete(MetricVersion).where(MetricVersion.version_id.in_(version_ids))
     session.execute(stmt)
-    session.commit()
+    # ⚠️ 事务提交/回滚由调用方统一管理
 
 
 def get_metric_version_by_id(session: Session, version_id: str) -> Optional[MetricVersionInfo]:

@@ -4,13 +4,12 @@
 
 import logging
 from typing import Dict, List, Any
-from datetime import datetime
-from sqlalchemy import text
 
 # ⚠️ 导入工具类
+from apps.extend.metrics2.services.check_service import CheckService
+from apps.extend.metrics2.services.metadata_service import metadataService
 from apps.extend.metrics2.utils.id_generator import IdGenerator
 from apps.extend.metrics2.utils.batch_query import BatchQueryHelper
-from apps.extend.metrics2.utils.sql_generator import SqlGenerator
 from apps.extend.metrics2.utils.timezone_helper import get_now_utc8
 
 logger = logging.getLogger(__name__)
@@ -27,29 +26,32 @@ class DimService:
     4. 执行数据库插入
     """
     
-    def __init__(self, session):
+    # ⚠️ 定义关键表配置
+    CRITICAL_TABLES = ['dim_definition', 'dim_field_lineage','table_metadata']
+    
+    def __init__(self, session, check_service:CheckService):
         """
         初始化维度服务
         
         Args:
             session: 数据库会话
+            check_service: 校验服务实例（可选）
         """
         self.session = session
+        self.check_service = check_service  # ⚠️ 注入 CheckService
+        self.metadata_service = metadataService(session)  # ⚠️ 注入 metadataService
         # ⚠️ 使用 IdGenerator 替代手动计数器
-        self.dim_id_gen = IdGenerator(session, 'dim_definition', 'D')
+        self.dim_definition_id_gen = IdGenerator(session, 'dim_definition', 'D')
         self.dim_field_lineage_id_gen = IdGenerator(session, 'dim_field_lineage', 'DFL')  # ⚠️ 新增
-        
-        # ⚠️ 创建表元数据服务实例
-        from apps.extend.metrics2.services.table_metadata_service import TableMetadataService
-        self.table_metadata_service = TableMetadataService(session)
     
-    def process(self, processed_results: List[Dict[str, Any]], layer_type: str = "AUTO") -> Dict[str, Any]:
+    def process(self, processed_results: List[Dict[str, Any]], layer_type: str, dim_cache: Dict[str, str] = None) -> Dict[str, Any]:
         """
         处理 DIM 层维度数据
         
         Args:
             processed_results: 规则引擎处理后的结果列表
             layer_type: 数仓层级类型（DIM），用于统一推断 source_level
+            dim_cache: 维度缓存 {code: dim_id}，保证同一批次中相同 code 使用相同 ID
             
         Returns:
             执行结果 {'success': bool, 'message': str, 'table_stats': dict}
@@ -58,14 +60,12 @@ class DimService:
             Exception: 当数据处理失败时抛出异常，由主流程统一回滚
         """
         try:
-            # ⚠️ 批次级别统一时间戳，确保同一批次内所有记录时间一致
-            batch_time = get_now_utc8()
+            # ⚠️ 根据 CRITICAL_TABLES 动态初始化表数据收集字典
+            table_data = {table_name: [] for table_name in self.CRITICAL_TABLES}
             
-            # 初始化表数据收集字典
-            table_data = {
-                'dim_definition': [],
-                'dim_field_lineage': []
-            }
+            # ⚠️ 初始化或获取缓存
+            if dim_cache is None:
+                dim_cache = {}
             
             # 遍历所有处理结果，收集维度数据
             for idx, processed_result in enumerate(processed_results, 1):
@@ -73,34 +73,27 @@ class DimService:
                     logger.warning(f"[DIM服务] 跳过失败的结果 #{idx}")
                     continue
                 
-                self._collect_dim_data(processed_result, table_data, batch_time)
+                self._collect_dim_data(processed_result, table_data, dim_cache)
+                self.metadata_service.collect_table_metadata(processed_result, table_data, layer_type)
             
-            # 校验数据完整性
-            if not table_data['dim_definition']:
-                error_msg = "❌ DIM 层未生成任何 dim_definition 数据"
-                logger.error(error_msg)
-                raise ValueError(error_msg)  # ⚠️ 抛出异常
+            # ⚠️ 校验数据完整性（调用 CheckService）
+            check_result = self.check_service.check_data_integrity(
+                table_data=table_data,
+                critical_tables=self.CRITICAL_TABLES  # ⚠️ 传入关键表列表
+            )
+                
+            if not check_result['success']:
+                logger.error(check_result['message'])
+                raise ValueError(check_result['message'])  # ⚠️ 抛出异常
             
-            if not table_data['dim_field_lineage']:
-                error_msg = "❌ DIM 层未生成任何 dim_field_lineage 数据"
-                logger.error(error_msg)
-                raise ValueError(error_msg)  # ⚠️ 抛出异常
-            
-            # 执行数据库插入（不提交事务，由主流程统一提交）
-            execution_result = self._execute_insert(table_data)
-            
-            # ⚠️ 在所有主要数据写入成功后，再处理表元数据
-            if processed_results:
-                self.table_metadata_service.process_table_metadata(processed_results[0], "DIM服务", layer_type)
-                # 将 table_metadata 计入统计
-                execution_result['table_stats']['table_metadata'] = 1
-            
-            logger.info(f"[DIM服务] ✅ 处理完成 - 维度数: {len(table_data['dim_definition'])}, 字段映射数: {len(table_data['dim_field_lineage'])}")
+            # ⚠️ 详细输出每张表的数据量
+            table_stats = ', '.join([f"{table_name}: {len(records)} 条" for table_name, records in table_data.items()])
+            logger.info(f"[DIM服务] ✅ 数据收集成功 - {table_stats}")
             
             return {
                 'success': True,
-                'message': f"DIM层处理成功，写入 {len(table_data['dim_definition'])} 个维度",
-                'table_stats': execution_result.get('table_stats', {})
+                'message': f"DIM层数据收集成功",
+                'table_data': table_data  # ⚠️ 返回原始数据，由主流程统一批量插入
             }
             
         except ValueError:
@@ -111,14 +104,14 @@ class DimService:
             logger.error(error_msg, exc_info=True)
             raise  # ⚠️ 重新抛出异常
     
-    def _collect_dim_data(self, processed_result: Dict[str, Any], table_data: Dict[str, List], batch_time: datetime = None):
+    def _collect_dim_data(self, processed_result: Dict[str, Any], table_data: Dict[str, List], dim_cache: Dict[str, str] = None):
         """
-        收集 DIM 层维度数据（总控方法）
+        收集 DIM 层维度数据
         
         Args:
             processed_result: 单个文件的处理结果
             table_data: 表数据收集字典
-            batch_time: 批次统一时间戳（可选，不提供则实时获取）
+            dim_cache: 全局缓存 {code: dim_id}，保证同一批次中相同 code 使用相同 ID
         """
         try:
             parsed_data = processed_result.get('parsed_data', {})
@@ -134,12 +127,70 @@ class DimService:
                 logger.error(f"[DIM服务] ❌ target_table 为空")
                 return
             
-            # 1. 批量查询已存在的 dim_id
+            # ⚠️ 初始化缓存
+            if dim_cache is None:
+                dim_cache = {}
+            
+            # 1. 批量查询已存在的 dim_id（从数据库）
             existing_dims = self._batch_query_existing_dims(fields)
             
             # 2. 处理每个字段，生成维度定义和字段映射
-            now = batch_time if batch_time else get_now_utc8()  # ⚠️ 使用批次时间或实时获取
-            self._process_fields(fields, target_table, existing_dims, now, table_data)
+            for field in fields:
+                field_name = field.get('field_name', '')  # 维度字段中文名称 -> dim_name
+                field_en = field.get('field', '')          # 维度字段英文名称 -> dim_code（⚠️ AI 返回的是 field，不是 field_en）
+                dim_type = field.get('dim_type', '其他')   # 维度类型
+                
+                if not field_en:  # dim_code 不能为空
+                    continue
+                
+                # ⚠️ 优先级：全局缓存 > 数据库查询 > 新生成
+                dim_id = None
+                
+                # 1. 先检查全局缓存（同一批次内复用）
+                if field_en in dim_cache:
+                    dim_id = dim_cache[field_en]
+                    logger.debug(f"[DIM服务] 从全局缓存复用 dim_id: {dim_id} for {field_en}")
+                
+                # 2. 再检查数据库（跨批次复用）
+                elif field_en in existing_dims:
+                    dim_id = existing_dims[field_en]
+                    logger.debug(f"[DIM服务] 从数据库复用 dim_id: {dim_id} for {field_en}")
+                    # ⚠️ 写入全局缓存，供后续文件使用
+                    dim_cache[field_en] = dim_id
+                
+                # 3. 都不存在，生成新的 dim_id
+                else:
+                    dim_id = self.dim_definition_id_gen.get_next_id()
+                    logger.debug(f"[DIM服务] 生成新 dim_id: {dim_id} for {field_en}")
+                    # ⚠️ 写入全局缓存
+                    dim_cache[field_en] = dim_id
+                
+                # 收集 dim_definition
+                table_data['dim_definition'].append({
+                    'id': dim_id,
+                    'name': field_name,
+                    'code': field_en,
+                    'type': dim_type,
+                    'is_valid': 1,
+                    'create_time': get_now_utc8(),
+                    'modify_time': get_now_utc8()
+                })
+                
+                logger.debug(f"[DIM服务] 收集 dim_definition: {dim_id} - {field_name} ({field_en})")
+                
+                # 生成 dim_field_lineage 的 id（使用 IdGenerator）
+                field_lineage_id = self.dim_field_lineage_id_gen.get_next_id()
+                
+                # 同时收集 dim_field_lineage（指向同一个 dim_id）
+                table_data['dim_field_lineage'].append({
+                    'id': field_lineage_id,
+                    'dim_id': dim_id,  # ⚠️ 确保使用正确的 dim_id
+                    'db_table': target_table,
+                    'field': field_en,
+                    'field_name': field_name,
+                    'create_time': get_now_utc8(),
+                    'modify_time': get_now_utc8()
+                })
             
             logger.info(f"[DIM服务] 收集完成 - dim_definition: {len(table_data['dim_definition'])} 条, dim_field_lineage: {len(table_data['dim_field_lineage'])} 条")
             
@@ -168,131 +219,3 @@ class DimService:
         existing_dims = BatchQueryHelper.query_existing_dim_ids(self.session, all_dim_codes)
         logger.debug(f"[DIM服务] 批量查询到 {len(existing_dims)} 个已有维度")
         return existing_dims
-    
-    def _process_fields(self, fields: List[Dict], target_table: str, 
-                       existing_dims: Dict[str, str], now: datetime,
-                       table_data: Dict[str, List]):
-        """
-        处理字段列表，生成维度定义和字段映射
-        
-        Args:
-            fields: 字段列表
-            target_table: 目标表名
-            existing_dims: 已存在的维度 {dim_code: dim_id}
-            now: 当前时间
-            table_data: 表数据收集字典
-        """
-        for field in fields:
-            field_name = field.get('field_name', '')  # 维度字段中文名称 -> dim_name
-            field_en = field.get('field', '')          # 维度字段英文名称 -> dim_code（⚠️ AI 返回的是 field，不是 field_en）
-            dim_type = field.get('dim_type', '其他')   # 维度类型
-            
-            if not field_en:  # dim_code 不能为空
-                continue
-            
-            # 从批量查询结果中获取 dim_id
-            dim_id = self._get_or_create_dim_id(field_en, existing_dims)
-            
-            # 收集 dim_definition
-            table_data['dim_definition'].append({
-                'id': dim_id,
-                'name': field_name,
-                'code': field_en,
-                'type': dim_type,
-                'is_valid': 1,
-                'create_time': now,
-                'modify_time': now
-            })
-            
-            logger.debug(f"[DIM服务] 收集 dim_definition: {dim_id} - {field_name} ({field_en})")
-            
-            # 生成 dim_field_lineage 的 id（使用 IdGenerator）
-            field_lineage_id = self.dim_field_lineage_id_gen.get_next_id()
-            
-            # 同时收集 dim_field_lineage（指向同一个 dim_id）
-            table_data['dim_field_lineage'].append({
-                'id': field_lineage_id,
-                'dim_id': dim_id,
-                'db_table': target_table,
-                'field': field_en,
-                'field_name': field_name,
-                'create_time': now,
-                'modify_time': now
-            })
-    
-    def _get_or_create_dim_id(self, dim_code: str, existing_dims: Dict[str, str]) -> str:
-        """
-        获取或创建 dim_id
-        
-        Args:
-            dim_code: 维度编码
-            existing_dims: 已存在的维度 {dim_code: dim_id}
-            
-        Returns:
-            dim_id
-        """
-        if dim_code in existing_dims:
-            dim_id = existing_dims[dim_code]
-            logger.debug(f"[DIM服务] 复用已有 dim_id: {dim_id} for {dim_code}")
-        else:
-            # 生成新的 dim_id（使用 IdGenerator）
-            dim_id = self.dim_id_gen.get_next_id()
-            logger.debug(f"[DIM服务] 生成新 dim_id: {dim_id} for {dim_code}")
-        
-        return dim_id
-    
-    def _execute_insert(self, table_data: Dict[str, List]) -> Dict[str, Any]:
-        """
-        执行数据库插入操作（使用 SqlGenerator）
-        
-        Args:
-            table_data: 表数据收集字典
-            
-        Returns:
-            执行结果
-        """
-        try:
-            # 定义各表的配置
-            table_configs = {
-                'dim_definition': {
-                    'columns': ['id', 'name', 'code', 'type', 'is_valid', 'create_time', 'modify_time'],
-                    'conflict_target': '(code)'
-                },
-                'dim_field_lineage': {
-                    'columns': ['id', 'db_table', 'field', 'dim_id', 'field_name', 'create_time', 'modify_time'],
-                    'conflict_target': '(db_table, field)'
-                }
-            }
-            
-            table_stats = {}
-            
-            # 批量插入 dim_definition（使用 SqlGenerator）
-            if table_data['dim_definition']:
-                config = table_configs['dim_definition']
-                sql = SqlGenerator.generate_batch_upsert('dim_definition', config, table_data['dim_definition'])
-                if sql:
-                    self.session.execute(text(sql))
-                    table_stats['dim_definition'] = len(table_data['dim_definition'])
-                    logger.info(f"[DIM服务] 💾 批量插入 dim_definition: {len(table_data['dim_definition'])} 条")
-            
-            # ⚠️ 批量插入 dim_field_lineage（使用 SqlGenerator）
-            if table_data['dim_field_lineage']:
-                config = table_configs['dim_field_lineage']
-                sql = SqlGenerator.generate_batch_upsert('dim_field_lineage', config, table_data['dim_field_lineage'])
-                if sql:
-                    self.session.execute(text(sql))
-                    table_stats['dim_field_lineage'] = len(table_data['dim_field_lineage'])
-                    logger.info(f"[DIM服务] 💾 批量插入 dim_field_lineage: {len(table_data['dim_field_lineage'])} 条")
-            
-            # ⚠️ 不再提交事务，由主流程统一提交
-            logger.info("[DIM服务] 数据已准备就绪，等待主流程提交")
-            
-            return {
-                'success': True,
-                'table_stats': table_stats
-            }
-            
-        except Exception as e:
-            logger.error(f"[DIM服务] 数据库插入失败: {str(e)}", exc_info=True)
-            # ⚠️ 不再自行回滚，由主流程统一处理
-            raise

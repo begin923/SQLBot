@@ -13,6 +13,7 @@ class TableMetadata(SQLModel, table=True):
     source_level: Optional[str] = Field(default=None, sa_column=Column(VARCHAR(32), nullable=True, comment='ADS/DWS/DWD 分层'))
     biz_domain: Optional[str] = Field(default=None, sa_column=Column(VARCHAR(64), nullable=True, comment='业务域'))
     table_comment: Optional[str] = Field(default=None, sa_column=Column(VARCHAR(512), nullable=True, comment='表注释'))
+    file_path: Optional[str] = Field(default=None, sa_column=Column(VARCHAR(512), nullable=True, comment='SQL文件路径'))  # ⚠️ 新增字段
     create_time: Optional[datetime] = Field(sa_column=Column(DATETIME, server_default=func.now(), comment='创建时间'))
     modify_time: Optional[datetime] = Field(sa_column=Column(DATETIME, server_default=func.now(), onupdate=func.now(), comment='修改时间'))
 
@@ -24,5 +25,6 @@ class TableMetadataInfo(SQLModel):
     source_level: Optional[str] = None
     biz_domain: Optional[str] = None
     table_comment: Optional[str] = None
+    file_path: Optional[str] = None  # ⚠️ 新增字段
     create_time: Optional[datetime] = None
     modify_time: Optional[datetime] = None

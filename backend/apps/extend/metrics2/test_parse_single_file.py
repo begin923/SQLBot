@@ -7,7 +7,6 @@
 3. 运行此脚本
 """
 
-import logging
 import os
 import sys
 
@@ -16,7 +15,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from apps.extend.metrics2.services import MetricsPlatformService
+from apps.extend.metrics2.services import orchestrationService
 from apps.extend.utils.utils import DBUtils
 import time
 
@@ -24,54 +23,67 @@ import time
 if __name__ == "__main__":
     # ==================== 配置区域 ====================
     # 测试单个文件
-    FILE_PATH = r"D:\codes\yingzi-data-datawarehouse-release\source\sql\doris\fpf\hour\dim"
-    
-    # 测试整个目录（取消注释使用）
-    # FILE_PATH = r"D:\codes\yingzi-data-datawarehouse-release\source\sql\doris\fpf\hour\dws"
-    # ================================================
-    
-    print(f"📄 路径: {FILE_PATH}\n")
-    
-    session = DBUtils.create_local_session()
-    try:
-        # 创建服务实例
-        platform_service = MetricsPlatformService(session)
-        
-        # 调用 Service 层的处理方法（自动判断文件/目录，自动识别层级类型）
-        start_time = time.time()
-        result = platform_service.process_sql_files(
-            input_path=FILE_PATH
-        )
-        processing_duration = time.time() - start_time
-        
-        # 打印结果
-        print("\n" + "=" * 80)
-        print("📊 测试总结")
-        print("=" * 80)
-        print(f"⏱️  总耗时: {processing_duration:.2f}秒")
-        
-        if result.get('success'):
-            file_result = result.get('file_result', {})
-            total_files = file_result.get('total_files', 0)
-            processed_files = file_result.get('processed_files', 0)
-            failed_files = file_result.get('failed_files', 0)
-            
-            print(f"   - 总文件数: {total_files}")
-            print(f"   - 成功: {processed_files}")
-            print(f"   - 失败: {failed_files}")
-            
-            if failed_files > 0:
-                print(f"\n⚠️  以下文件测试失败:")
-                for file_data in file_result.get('results', []):
-                    if not file_data.get('success'):
-                        file_name = os.path.basename(file_data.get('file_path', ''))
-                        print(f"   ❌ {file_name}: {file_data.get('message', '未知错误')}")
-            else:
-                print("\n🎉 所有文件测试通过！")
-        else:
-            print(f"❌ 测试失败：{result.get('message', '未知错误')}")
-    
-    except Exception as e:
-        print(f"\n❌ 测试异常：{str(e)}")
-    finally:
-        session.close()
+    # FILE_PATHS = [r"D:\codes\yingzi-data-datawarehouse-release\source\sql\doris\fpf\hour\dwd\dwd_aibreeding_collect_semen_plan.sql"]
+    # dws_fpf_porker_forage_record_group
+
+    FILE_PATHS = [
+        r"D:\codes\yingzi-data-datawarehouse-release\source\sql\doris\fpf\hour\dwd",
+        r"D:\codes\yingzi-data-datawarehouse-release\source\sql\doris\fpf\hour\dws",
+        r"D:\codes\yingzi-data-datawarehouse-release\source\sql\doris\fpf\hour\ads"]
+
+    for FILE_PATH in FILE_PATHS:
+        print(f"📄 路径: {FILE_PATH}\n")
+        try:
+            session = DBUtils.create_local_session()
+            # 创建服务实例
+            platform_service = orchestrationService(session)
+
+            # 调用 Service 层的处理方法（自动判断文件/目录，自动识别层级类型）
+            start_time = time.time()
+            result = platform_service.process(
+                input_path=FILE_PATH
+            )
+            processing_duration = time.time() - start_time
+
+            # 打印结果
+            print("\n" + "=" * 80)
+            print("📊 测试结果汇总")
+            print("=" * 80)
+            print(f"⏱️  总耗时: {processing_duration:.2f}秒")
+            print(f"📁 文件总数: {result.get('total_count', 0)}")
+            print(f"✅ 成功数量: {result.get('success_count', 0)}")
+            print(f"❌ 失败数量: {result.get('failed_count', 0)}")
+
+            # 显示成功文件列表
+            success_files = result.get('success_files', [])
+            if success_files:
+                print(f"\n✅ 成功文件 ({len(success_files)}个):")
+                for i, file_name in enumerate(success_files, 1):
+                    print(f"   {i}. {file_name}")
+
+            # 显示失败文件列表
+            failed_files = result.get('failed_files', [])
+            if failed_files:
+                print(f"\n❌ 失败文件 ({len(failed_files)}个):")
+                for i, file_name in enumerate(failed_files, 1):
+                    print(f"   {i}. {file_name}")
+
+            # 显示详细结果（可选）
+            print("\n" + "=" * 80)
+            print("📋 详细结果（JSON格式）")
+            print("=" * 80)
+            import json
+            # 只打印摘要信息，不打印完整的 results 数组
+            summary_result = {
+                'success': result.get('success'),
+                'total_count': result.get('total_count'),
+                'success_count': result.get('success_count'),
+                'failed_count': result.get('failed_count'),
+                'message': result.get('message')
+            }
+            print(json.dumps(summary_result, indent=2, ensure_ascii=False))
+
+        except Exception as e:
+            print(f"\n❌ 测试异常：{str(e)}")
+        finally:
+            session.close()
