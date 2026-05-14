@@ -23,15 +23,31 @@ def upgrade():
     唯一键：(source_table, target_table)
     确保相同的表血缘关系不会重复插入
     """
+    from sqlalchemy import text
     
-    # 添加唯一约束
-    op.create_unique_constraint(
-        'uk_source_target_table',
-        'table_lineage',
-        ['source_table', 'target_table']
-    )
+    # 检查约束是否已存在
+    conn = op.get_bind()
     
-    print("✅ 已为 table_lineage 表添加唯一约束: uk_source_target_table (source_table, target_table)")
+    # 查询 PostgreSQL 系统表检查约束是否存在
+    check_sql = text("""
+        SELECT COUNT(*) 
+        FROM pg_constraint 
+        WHERE conname = 'uk_source_target_table' 
+        AND conrelid = 'table_lineage'::regclass
+    """)
+    
+    result = conn.execute(check_sql).scalar()
+    
+    if result == 0:
+        # 添加唯一约束
+        op.create_unique_constraint(
+            'uk_source_target_table',
+            'table_lineage',
+            ['source_table', 'target_table']
+        )
+        print("✅ 已为 table_lineage 表添加唯一约束: uk_source_target_table (source_table, target_table)")
+    else:
+        print("⚠️ 唯一约束 uk_source_target_table 已存在，跳过")
 
 
 def downgrade():

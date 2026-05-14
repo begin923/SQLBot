@@ -40,8 +40,10 @@ from apps.datasource.models.datasource import CoreDatasource, CoreTable
 from apps.db.db import exec_sql, get_version, check_connection, get_fields
 from apps.extend.chat_manager.services.chat_service import ChatService
 from apps.extend.drilldown.drill_agg_rule_engine import DrillAggRuleEngine
+from apps.extend.metrics.curd.column_metadata import ColumnMetadataService
 from apps.extend.metrics.curd.metric_lineage import search_metric_dimensions
 from apps.extend.metrics.curd.metric_metadata import get_metric_metadata_by_names
+from apps.extend.metrics.curd.metric_source_mapping import MetricSourceMappingCRUD
 
 from apps.extend.sql_engine.sql_validator import SQLValidator
 from apps.system.crud.assistant import AssistantOutDs, AssistantOutDsFactory, get_assistant_ds
@@ -172,7 +174,11 @@ class LLMService:
         # 初始化 SQL 校验引擎（用于 ADS/DWS 层校验和自动修复）
         self.sql_validator = SQLValidator(llm=self.llm)
         self.chat_service = ChatService(llm=self.llm)
-        self.rule_engine = DrillAggRuleEngine()
+
+        self.metric_source_mapping = MetricSourceMappingCRUD(session)
+
+        self.column_metadata_service = ColumnMetadataService(session)
+
         
     def _batch_add_tables_to_ds(self, session, table_names: List[str]):
         """
@@ -1123,33 +1129,50 @@ class LLMService:
                     raise "没有可查询维度"
                 else:
                     # 查询指标元数据，获取指标元数据信息
-                    metric_info_list = get_metric_metadata_by_names(_session, metrics)
+                    metric_info_list = self.metric_source_mapping.search_metrics(metrics)
                     SQLBotLogUtil.info(f"metric_info_list:{metric_info_list}")
 
                     # 提取表名列表
                     table_name_list = []
                     dim_kv = []
-                    # for metric in metric_info_list:
+
+                    # TODO 发现多个指标，弹窗给前端，让用户选择某个指标
 
                     # 先实现单一指标
                     metric = metric_info_list[0]
-                    calc_logic = ''
+                    calc_logic = metric.agg_func
                     # 判断是否缺失维度
-                    results, all_matched = search_metric_dimensions(_session, dimensions,embedding_model , metric.table_name)
+                    search_texts = [
+                        {
+                            "table_name": metric.db_table,
+                            "column_comments": dimensions
+                        }
+                    ]
+                    print(f"search_texts:{search_texts}")
+                    results = self.column_metadata_service.search_columns(search_texts)
+                    all_matched = results['found']
+                    columns = results['columns']
                     if all_matched:
                         SQLBotLogUtil.info(f"维度满足，直接使用当前表")
-                        table_name_list.append(metric.table_name)
-                        for dim in results:
-                            dim_kv.append(f"{dim.dim_name}:{dim.dim_column}")
+                        table_name_list.append(metric.db_table)
+                        for dim in columns:
+                            dim_kv.append(f"{dim.column_comment}:{dim.column_name}")
                     else:
-                        results, all_matched = search_metric_dimensions(_session, dimensions, embedding_model,
-                                                                        metric.upstream_table)
+                        search_texts = [
+                            {
+                                "table_name": metric.upstream_table,
+                                "column_comments": dimensions
+                            }
+                        ]
+                        results = self.column_metadata_service.search_columns(search_texts)
+                        all_matched = results['found']
+                        columns = results['columns']
                         if all_matched:
                             SQLBotLogUtil.info(f"维度不满足，直接使用上游表")
                             table_name_list.append(metric.upstream_table)
                             calc_logic = metric.calc_logic
-                            for dim in results:
-                                dim_kv.append(f"{dim.dim_name}:{dim.dim_column}")
+                            for dim in columns:
+                                dim_kv.append(f"{dim.column_comment}:{dim.column_name}")
                         else:
                             raise "维度无法继续下钻"
 

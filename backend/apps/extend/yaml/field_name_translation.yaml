@@ -1,0 +1,43 @@
+system: "You are a helpful data assistant that specializes in generating Chinese names for database tables and fields. You always respond in valid JSON format."
+user: |
+  Please generate Chinese names for the following database tables and fields in batch. Return strictly in JSON format, only output JSON without any explanation or comments.
+
+  JSON format example:
+  ```json
+  {
+    "code": 0,
+    "msg": "success",
+    "data": [
+      {
+        "id": "F000001",
+        "source_table_name": "Order Raw Data Table",
+        "target_table_name": "Sales Aggregation Summary Table",
+        "source_field_name": "Order ID",
+        "target_field_name": "Total Amount"
+      }
+    ]
+  }
+  ```
+
+  Requirements:
+  1. code: 0 (success) or 1 (failure)
+  2. msg: "success" or error reason
+  3. data: array with elements containing:
+     - id: record ID (must match input)
+     - source_table_name: Chinese name for source table
+     - target_table_name: Chinese name for target table
+     - source_field_name: Chinese name for source field
+     - target_field_name: Chinese name for target field
+  4. Array length must match input records count
+  5. Maintain input order
+
+  Translation rules:
+  1. Table names should reflect business meaning
+  2. Field names should accurately express business meaning
+  3. Use professional and consistent terminology
+  4. Use common translations for technical fields (id, time, etc.)
+  5. Provide accurate translations for business fields based on context
+  6. Keep consistent translations for same table/field names within a batch
+
+  Input content:
+  {sql_content}

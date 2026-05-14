@@ -11,7 +11,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = '058'
-down_revision = '5755c0b95839'  # 053_update_chat.py
+down_revision = '057'  # 057_create_metric_lineage2.py
 branch_labels = None
 depends_on = None
 

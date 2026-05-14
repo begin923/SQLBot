@@ -24,8 +24,9 @@ from common.utils.utils import SQLBotLogUtil
 
 
 def run_migrations():
+    """执行数据库迁移（只执行到 053 版本）"""
     alembic_cfg = Config("alembic.ini")
-    command.upgrade(alembic_cfg, "head")
+    command.upgrade(alembic_cfg, "5755c0b95839")
 
 
 def init_terminology_embedding_data():

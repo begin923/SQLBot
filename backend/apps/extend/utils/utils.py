@@ -54,7 +54,7 @@ class ModelClient:
             logger.warning(f"⚠️  [ModelClient] AI 配置缺失 - API Key: {'✅' if self.api_key else '❌'}, Base URL: {'✅' if self.base_url else '❌'}")
             self.client = None
 
-    def call_ai(self, template_name: str, sql_content: str, layer_type: str = "METRIC") -> str:
+    def call_ai(self, template_name: str, sql_content: str, layer_type: str = None) -> str:
         """
         调用 AI 大模型，返回 MD 格式
 
@@ -85,12 +85,17 @@ class ModelClient:
                 layer_config = prompt_config.get('dwd_layer', {})
                 system_prompt = layer_config.get('system', '')
                 user_prompt_template = layer_config.get('user', '')
-                        
-            else:
+
+            elif layer_type in ("METRIC", "DWS", "ADS"):
                 # METRIC/DWS/ADS 层（默认）：使用 dws_ads_layer.system + dws_ads_layer.user
                 layer_config = prompt_config.get('dws_ads_layer', {})
                 system_prompt = layer_config.get('system', '')
                 user_prompt_template = layer_config.get('user', '')
+
+            else:
+                logger.warning(f"⚠️  [ModelClient] 找不到任何可处理的层级类型：{layer_type}")
+                system_prompt = prompt_config.get('system', '')
+                user_prompt_template = prompt_config.get('user', '')
 
             if not user_prompt_template:
                 raise ValueError("找不到任何可用的提示词模板")
