@@ -198,6 +198,40 @@ class LLMService:
             ).all()
             existing_table_names = {table.table_name for table in existing_tables}
                 
+            # 过滤出需要添加的表
+            tables_to_add = [name for name in table_names if name not in existing_table_names]
+            
+            if tables_to_add:
+                SQLBotLogUtil.info(f"需要添加的表: {tables_to_add}")
+                # 调用原有的添加逻辑（这里简化处理，实际应该调用完整的添加流程）
+                from apps.datasource.embedding.ds_embedding import get_ds_embedding
+                get_ds_embedding(session, self.ds, tables_to_add)
+        except Exception as e:
+            SQLBotLogUtil.error(f"批量添加表失败: {str(e)}")
+    
+    def _get_metric_name(self, metric_code: str) -> str:
+        """
+        将指标编码转换为中文名称
+        
+        Args:
+            metric_code: 指标编码，如 'sale_amount'
+            
+        Returns:
+            str: 指标中文名称，如 '销售额'。如果找不到则返回编码本身
+        """
+        try:
+            # 查询指标元数据
+            metric_info_list = self.metric_source_mapping.search_metrics([metric_code])
+            if metric_info_list and len(metric_info_list) > 0:
+                return metric_info_list[0].metric_name
+            else:
+                # 如果找不到，返回编码本身
+                SQLBotLogUtil.warning(f"未找到指标编码 {metric_code} 的中文名称，使用编码代替")
+                return metric_code
+        except Exception as e:
+            SQLBotLogUtil.error(f"获取指标名称失败: {str(e)}")
+            return metric_code
+                
             # 使用 set 去重：先转换为 set 去重，再过滤出新表
             unique_table_names = set(table_names) if table_names else set()
             new_table_names = [name for name in unique_table_names if name not in existing_table_names]
@@ -233,6 +267,29 @@ class LLMService:
             SQLBotLogUtil.error(f"批量添加表失败：{e}")
             import traceback
             traceback.print_exc()
+    
+    def _get_metric_name(self, metric_code: str) -> str:
+        """
+        将指标编码转换为中文名称
+        
+        Args:
+            metric_code: 指标编码，如 'sale_amount'
+            
+        Returns:
+            str: 指标中文名称，如 '销售额'。如果找不到则返回编码本身
+        """
+        try:
+            # 查询指标元数据
+            metric_info_list = self.metric_source_mapping.search_metrics([metric_code])
+            if metric_info_list and len(metric_info_list) > 0:
+                return metric_info_list[0].metric_name
+            else:
+                # 如果找不到，返回编码本身
+                SQLBotLogUtil.warning(f"未找到指标编码 {metric_code} 的中文名称，使用编码代替")
+                return metric_code
+        except Exception as e:
+            SQLBotLogUtil.error(f"获取指标名称失败: {str(e)}")
+            return metric_code
 
     @classmethod
     async def create(cls, *args, **kwargs):
@@ -1103,102 +1160,79 @@ class LLMService:
                 full_sql_text, sql = self.static_sql_handler.exe_static_sql(_session, in_chat , self.ds,self.provided_sql,self.record.id)
                 chart_type = self.get_chart_type_from_sql_answer(full_sql_text)
             else:
-                # 从用户问题中提取指标名称和用户意图（整合规则引擎）
-                """
-                1、用户问题 → 判断【指标】【维度】是否明确
-                2、分支1：指标+维度明确
-                   → 查询指标体系 → 优先取ADS层表
-                   → ADS不满足（无表/缺维度）→ 取DWS层表
-                3、分支2：指标/维度不明确
-                   → 查询chat_state历史对话指标+维度
-                   → 若chat_state有数据 → 复用历史走ADS→DWS
-                   → 若chat_state无数据 → 直接反问用户：请明确需要查询的指标和维度
-                4、执行SQL前，通过指标体系校验表是否为ADS/DWS（前置拦截）
-                5、校验通过则执行，不通过直接拦截上报异常
-                """
-
-                extract_res_dict = self.chat_service.extract_metric_and_dim_from_question(session=_session,
-                                                                                          question=self.chat_question.question,
-                                                                                          chat_id=self.chat_question.chat_id)
-                metrics = extract_res_dict.get('metrics', [])
-                dimensions = extract_res_dict.get('dimensions', [])
-                if not metrics and len(metrics) == 0:
-                    SQLBotLogUtil.info("当前用户问题没有可查询指标，开始查找聊天状态数据")
-                    raise "没有可查询指标"
-                elif not dimensions and len(dimensions) == 0:
-                    raise "没有可查询维度"
-                else:
-                    # 查询指标元数据，获取指标元数据信息
-                    metric_info_list = self.metric_source_mapping.search_metrics(metrics)
-                    SQLBotLogUtil.info(f"metric_info_list:{metric_info_list}")
-
-                    # 提取表名列表
-                    table_name_list = []
-                    dim_kv = []
-
-                    # TODO 发现多个指标，弹窗给前端，让用户选择某个指标
-
-                    # 先实现单一指标
-                    metric = metric_info_list[0]
-                    calc_logic = metric.agg_func
-                    # 判断是否缺失维度
-                    search_texts = [
-                        {
-                            "table_name": metric.db_table,
-                            "column_comments": dimensions
-                        }
-                    ]
-                    print(f"search_texts:{search_texts}")
-                    results = self.column_metadata_service.search_columns(search_texts)
-                    all_matched = results['found']
-                    columns = results['columns']
-                    if all_matched:
-                        SQLBotLogUtil.info(f"维度满足，直接使用当前表")
-                        table_name_list.append(metric.db_table)
-                        for dim in columns:
-                            dim_kv.append(f"{dim.column_comment}:{dim.column_name}")
-                    else:
-                        search_texts = [
-                            {
-                                "table_name": metric.upstream_table,
-                                "column_comments": dimensions
-                            }
-                        ]
-                        results = self.column_metadata_service.search_columns(search_texts)
-                        all_matched = results['found']
-                        columns = results['columns']
-                        if all_matched:
-                            SQLBotLogUtil.info(f"维度不满足，直接使用上游表")
-                            table_name_list.append(metric.upstream_table)
-                            calc_logic = metric.calc_logic
-                            for dim in columns:
-                                dim_kv.append(f"{dim.column_comment}:{dim.column_name}")
-                        else:
-                            raise "维度无法继续下钻"
-
-                    if dim_kv and len(dim_kv) > 0:
-                        extract_res_dict['dimension_reference'] = dim_kv
-
-                    # 批量添加指标表到数据源（避免重复触发 embedding）
-                    if table_name_list:
-                        self._batch_add_tables_to_ds(_session, table_name_list)
-
-                    # 获取最新 schema
-                    table_schemes = get_table_schema(session=_session,
-                                                     current_user=self.current_user, ds=self.ds,
-                                                     question=self.chat_question.question,
-                                                     table_name_list=table_name_list)
-
+                # ═══════════════════════════════════════
+                # 使用 Function Calling 处理用户问题
+                # ═══════════════════════════════════════
+                from apps.extend.tools import ToolRegistry
+                
+                SQLBotLogUtil.info("开始使用 Function Calling 处理用户问题")
+                
+                try:
+                    # === 阶段1：LLM 规划层（Function Calling）===
+                    
+                    # Step 1: 提取指标和维度
+                    SQLBotLogUtil.info("Step 1: 调用 extract_metrics_and_dimensions")
+                    extraction_result = ToolRegistry.call_tool(
+                        "extract_metrics_and_dimensions",
+                        session=_session,
+                        chat_service=self.chat_service,
+                        question=self.chat_question.question,
+                        chat_id=self.chat_question.chat_id
+                    )
+                    SQLBotLogUtil.info(f"提取结果: metrics={extraction_result['metrics']}, dimensions={extraction_result['dimensions']}")
+                    
+                    # Step 2: 选择最佳表
+                    SQLBotLogUtil.info("Step 2: 调用 select_best_table")
+                    table_result = ToolRegistry.call_tool(
+                        "select_best_table",
+                        metric_source_mapping=self.metric_source_mapping,
+                        column_metadata_service=self.column_metadata_service,
+                        metric_code=extraction_result['metrics'][0],  # 单一指标
+                        dimensions=extraction_result['dimensions']
+                    )
+                    SQLBotLogUtil.info(f"选表结果: table_name={table_result['table_name']}, calc_logic={table_result['calc_logic']}")
+                    
+                    # Step 3: 构建查询语句
+                    SQLBotLogUtil.info("Step 3: 调用 build_query")
+                    query_result = ToolRegistry.call_tool(
+                        "build_query",
+                        dimensions=extraction_result['dimensions'],
+                        dim_kv=table_result['dim_kv'],
+                        date_filter=extraction_result['filters'],
+                        metric_name=self._get_metric_name(extraction_result['metrics'][0]),
+                        calc_logic=table_result['calc_logic']
+                    )
+                    SQLBotLogUtil.info(f"查询语句: {query_result['user_query']}")
+                    
+                    # === 阶段2：系统执行层（自动执行）===
+                    
+                    # Step 4: 批量添加表到数据源
+                    SQLBotLogUtil.info("Step 4: 批量添加表到数据源")
+                    self._batch_add_tables_to_ds(_session, [table_result['table_name']])
+                    
+                    # Step 5: 获取表结构
+                    SQLBotLogUtil.info("Step 5: 获取表结构")
+                    table_schemes = get_table_schema(
+                        session=_session,
+                        current_user=self.current_user,
+                        ds=self.ds,
+                        question=query_result['user_query'],
+                        table_name_list=[table_result['table_name']]
+                    )
                     self.chat_question.db_schema = table_schemes
-
-                    # 重置用户问题：将提取结果转为字符串
-                    date_filter = extract_res_dict.get('filters',[])
-                    user_query = f"按{','.join(dimensions)}分组，分组参考字段：{','.join(dim_kv)}，查询{'和'.join(date_filter)}的{metric.metric_name}，{metric.metric_name}计算逻辑为{calc_logic}"
-                    print(f"user_query:{user_query}")
-                    self.chat_question.question = user_query
-
-                    # 刷新 sql_message，使用最新的 db_schema
+                    
+                    # Step 6: 更新用户问题并刷新消息
+                    SQLBotLogUtil.info("Step 6: 更新用户问题")
+                    self.chat_question.question = query_result['user_query']
                     self.refresh_sql_messages_with_new_schema()
+                    
+                except ValueError as e:
+                    # Function Calling 过程中的错误
+                    SQLBotLogUtil.error(f"Function Calling 失败: {str(e)}")
+                    raise ValueError(str(e))
+                except Exception as e:
+                    SQLBotLogUtil.error(f"处理用户问题时发生未知错误: {str(e)}")
+                    raise
 
                 # 常规 LLM 生成
                 SQLBotLogUtil.info("Regular query, using LLM to generate SQL")
